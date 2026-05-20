@@ -13,11 +13,13 @@
 mod adapters;
 mod instance;
 mod model;
+mod persist;
 mod sandbox;
 mod session;
 mod tools;
 
 pub use adapters::{AnthropicModel, AuditedShell, OpenAiModel};
+pub use persist::{SessionStore, StoreError};
 pub use instance::{Instance, InstanceMsg};
 pub use model::{
     ChatMessage, ContentBlock, MockModel, Model, ModelError, ModelEvent, ModelRequest,

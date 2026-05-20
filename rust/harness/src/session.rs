@@ -24,6 +24,7 @@ use crate::instance::InstanceMsg;
 use crate::model::{
     ChatMessage, ContentBlock, Model, ModelEvent, ModelRequest, Role, ToolDef,
 };
+use crate::persist::SessionStore;
 use crate::sandbox::{SandboxError, ShellResult};
 use crate::tools::{Tool, ToolCtx, default_tools};
 
@@ -74,11 +75,26 @@ pub struct Session {
     pub name: String,
     pub history: Vec<ChatMessage>,
     pub harness: Arc<HarnessState>,
+    pub store: Option<Arc<dyn SessionStore>>,
 }
 
 impl Session {
     pub fn new(name: impl Into<String>, harness: Arc<HarnessState>) -> Self {
-        Self { name: name.into(), history: Vec::new(), harness }
+        Self { name: name.into(), history: Vec::new(), harness, store: None }
+    }
+
+    /// Attach a persistence store and load any previous history under
+    /// `self.name`. Call this before `spawn`-ing. Errors during load are
+    /// logged to stderr and ignored — a corrupt store shouldn't prevent
+    /// fresh conversations.
+    pub fn with_store(mut self, store: Arc<dyn SessionStore>) -> Self {
+        match store.load(&self.name) {
+            Ok(Some(h)) => self.history = h,
+            Ok(None) => {}
+            Err(e) => eprintln!("session store load failed for {}: {}", self.name, e),
+        }
+        self.store = Some(store);
+        self
     }
 }
 
@@ -235,6 +251,12 @@ impl Session {
         let structured = structured_output_tag
             .as_deref()
             .and_then(|tag| find_tag(response_text.as_bytes(), tag.as_bytes()).map(<[u8]>::to_vec));
+
+        if let Some(store) = &self.store
+            && let Err(e) = store.save(&self.name, &self.history)
+        {
+            eprintln!("session store save failed for {}: {}", self.name, e);
+        }
 
         Ok(PromptResult { text: response_text, structured, completed, turns })
     }
@@ -585,6 +607,66 @@ mod tests {
             })
             .unwrap();
         assert!(matches!(res, Err(SessionError::TurnLimitExceeded)));
+
+        session.join().unwrap();
+        instance.join().unwrap();
+    }
+
+    #[test]
+    fn store_loads_history_at_construction_and_saves_after_prompt() {
+        use crate::persist::test_store::InMemoryStore;
+
+        let store = Arc::new(InMemoryStore::new());
+        // Pre-seed: a prior conversation under name "resumed".
+        store
+            .save(
+                "resumed",
+                &[
+                    ChatMessage::user("hello?"),
+                    ChatMessage::assistant("earlier reply"),
+                ],
+            )
+            .unwrap();
+
+        let sandbox: Box<dyn crate::sandbox::Sandbox> =
+            Box::new(MockSandbox::new(vec![]));
+        let instance = spawn(Instance::new("inst", sandbox));
+        let model = Arc::new(MockModel::single(vec![
+            ModelEvent::TextDelta("new reply".into()),
+            ModelEvent::Stop { reason: Some("end_turn".into()) },
+        ]));
+        let h = Arc::new(HarnessState::new(
+            "h",
+            model.clone() as Arc<dyn Model>,
+            instance.addr.clone(),
+        ));
+        let session = spawn(Session::new("resumed", h).with_store(store.clone()));
+
+        // Verify the model sees the resumed history when we send a new turn.
+        let _ = session
+            .addr
+            .ask(|reply| SessionMsg::Prompt {
+                text: "follow up".into(),
+                structured_output_tag: None,
+                reply,
+            })
+            .unwrap()
+            .unwrap();
+
+        let seen = model.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        // Resumed user, resumed assistant, new user — 3 messages.
+        assert_eq!(seen[0].messages.len(), 3);
+        assert_eq!(
+            seen[0].messages[0].content,
+            vec![ContentBlock::Text("hello?".into())]
+        );
+
+        // Store saw a save call after the prompt.
+        assert!(*store.save_calls.lock().unwrap() >= 1);
+        let persisted = store.data.lock().unwrap().get("resumed").cloned().unwrap();
+        // resumed 2 + new user + new assistant = 4
+        assert_eq!(persisted.len(), 4);
 
         session.join().unwrap();
         instance.join().unwrap();
