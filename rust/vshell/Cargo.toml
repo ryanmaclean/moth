@@ -1,0 +1,9 @@
+[package]
+name = "vshell"
+version = "0.0.1"
+edition = "2024"
+publish = false
+description = "Tiny in-process POSIX shell subset. Std-only, zero dependencies."
+
+[lib]
+path = "src/lib.rs"

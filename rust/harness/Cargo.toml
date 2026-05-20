@@ -1,0 +1,13 @@
+[package]
+name = "harness"
+version = "0.0.1"
+edition = "2024"
+publish = false
+description = "Orchestration layer: Instance + Session actors, model + sandbox traits, iteration loop."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+actor = { path = "../actor" }
+wire = { path = "../wire" }
