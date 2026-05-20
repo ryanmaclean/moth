@@ -3,7 +3,7 @@ name = "vshell"
 version = "0.0.1"
 edition = "2024"
 publish = false
-description = "Tiny in-process POSIX shell subset. Std-only, zero dependencies."
+description = "Tiny in-process POSIX shell subset. Parse + dispatch in-process; spawn children for external binaries. Zero dependencies."
 
 [lib]
 path = "src/lib.rs"
