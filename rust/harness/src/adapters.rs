@@ -3,7 +3,9 @@
 //! `model.rs` / `sandbox.rs`; the adapters keep all the per-provider
 //! type mapping out of the orchestration layer.
 
-use crate::model::{ChatMessage, Model, ModelError, ModelEvent, ModelRequest, Role};
+use crate::model::{
+    ChatMessage, ContentBlock, Model, ModelError, ModelEvent, ModelRequest, Role,
+};
 use crate::sandbox::{Sandbox, SandboxError, ShellResult};
 
 pub struct AnthropicModel {
@@ -27,7 +29,15 @@ impl Model for AnthropicModel {
             max_tokens: req.max_tokens,
             messages: req.messages.into_iter().map(map_message).collect(),
             system: req.system,
-            tools: Vec::new(),
+            tools: req
+                .tools
+                .into_iter()
+                .map(|t| anthropic::Tool {
+                    name: t.name,
+                    description: t.description,
+                    input_schema: t.input_schema,
+                })
+                .collect(),
         };
         match self.client.stream(upstream) {
             Ok(stream) => Box::new(stream.filter_map(map_event)),
@@ -42,7 +52,19 @@ fn map_message(m: ChatMessage) -> anthropic::Message {
             Role::User => anthropic::Role::User,
             Role::Assistant => anthropic::Role::Assistant,
         },
-        content: m.content,
+        content: m.content.into_iter().map(map_block).collect(),
+    }
+}
+
+fn map_block(b: ContentBlock) -> anthropic::ContentBlock {
+    match b {
+        ContentBlock::Text(s) => anthropic::ContentBlock::Text(s),
+        ContentBlock::ToolUse { id, name, input } => {
+            anthropic::ContentBlock::ToolUse { id, name, input }
+        }
+        ContentBlock::ToolResult { tool_use_id, content, is_error } => {
+            anthropic::ContentBlock::ToolResult { tool_use_id, content, is_error }
+        }
     }
 }
 

@@ -10,10 +10,39 @@ pub enum Role {
     Assistant,
 }
 
+/// One block in a `ChatMessage::content` list. Mirrors Anthropic's content
+/// block shape so the adapter can pass blocks through with minimal mapping.
+/// `ToolUse::input` is a raw JSON value (e.g. `{"command":"ls"}`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContentBlock {
+    Text(String),
+    ToolUse { id: String, name: String, input: String },
+    ToolResult { tool_use_id: String, content: String, is_error: bool },
+}
+
 #[derive(Debug, Clone)]
 pub struct ChatMessage {
     pub role: Role,
-    pub content: String,
+    pub content: Vec<ContentBlock>,
+}
+
+impl ChatMessage {
+    pub fn user(text: impl Into<String>) -> Self {
+        Self { role: Role::User, content: vec![ContentBlock::Text(text.into())] }
+    }
+
+    pub fn assistant(text: impl Into<String>) -> Self {
+        Self { role: Role::Assistant, content: vec![ContentBlock::Text(text.into())] }
+    }
+}
+
+/// Tool definition exposed to the model. `input_schema` is a raw JSON object
+/// (not a JSON string); it's spliced into the request payload verbatim.
+#[derive(Debug, Clone)]
+pub struct ToolDef {
+    pub name: String,
+    pub description: String,
+    pub input_schema: String,
 }
 
 #[derive(Debug, Clone)]
@@ -21,6 +50,7 @@ pub struct ModelRequest {
     pub system: Option<String>,
     pub messages: Vec<ChatMessage>,
     pub max_tokens: u32,
+    pub tools: Vec<ToolDef>,
 }
 
 #[derive(Debug, Clone)]

@@ -7,7 +7,7 @@
 //! libcurl + OpenSSL via FFI is the only network dep. No async runtime.
 
 mod http;
-mod json;
+pub mod json;
 mod parse;
 
 use std::sync::mpsc::TryRecvError;
@@ -47,7 +47,26 @@ pub struct Request {
 
 pub struct Message {
     pub role: Role,
-    pub content: String,
+    pub content: Vec<ContentBlock>,
+}
+
+impl Message {
+    pub fn user_text(s: impl Into<String>) -> Self {
+        Self { role: Role::User, content: vec![ContentBlock::Text(s.into())] }
+    }
+
+    pub fn assistant_text(s: impl Into<String>) -> Self {
+        Self { role: Role::Assistant, content: vec![ContentBlock::Text(s.into())] }
+    }
+}
+
+/// One block in a `Message::content` list. `ToolUse::input` is a raw JSON
+/// value spliced into the wire payload verbatim; the caller is responsible
+/// for it being valid JSON (typically `{"command":"..."}` for the bash tool).
+pub enum ContentBlock {
+    Text(String),
+    ToolUse { id: String, name: String, input: String },
+    ToolResult { tool_use_id: String, content: String, is_error: bool },
 }
 
 #[derive(Clone, Copy)]
@@ -181,9 +200,9 @@ fn serialize_request(req: &Request) -> String {
             Role::User => "user",
             Role::Assistant => "assistant",
         });
-        s.push_str("\",\"content\":\"");
-        json::escape_into(&mut s, &m.content);
-        s.push_str("\"}");
+        s.push_str("\",\"content\":");
+        serialize_content(&mut s, &m.content);
+        s.push('}');
     }
     s.push(']');
     if let Some(sys) = &req.system {
@@ -212,6 +231,50 @@ fn serialize_request(req: &Request) -> String {
     s
 }
 
+fn serialize_content(s: &mut String, blocks: &[ContentBlock]) {
+    // Single text block stays as a plain string for readability and to match
+    // the canonical request shape most users will see. Anything else goes as
+    // an array of typed blocks.
+    if let [ContentBlock::Text(t)] = blocks {
+        s.push('"');
+        json::escape_into(s, t);
+        s.push('"');
+        return;
+    }
+    s.push('[');
+    for (i, b) in blocks.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        match b {
+            ContentBlock::Text(t) => {
+                s.push_str(r#"{"type":"text","text":""#);
+                json::escape_into(s, t);
+                s.push_str("\"}");
+            }
+            ContentBlock::ToolUse { id, name, input } => {
+                s.push_str(r#"{"type":"tool_use","id":""#);
+                json::escape_into(s, id);
+                s.push_str(r#"","name":""#);
+                json::escape_into(s, name);
+                s.push_str(r#"","input":"#);
+                s.push_str(input);
+                s.push('}');
+            }
+            ContentBlock::ToolResult { tool_use_id, content, is_error } => {
+                s.push_str(r#"{"type":"tool_result","tool_use_id":""#);
+                json::escape_into(s, tool_use_id);
+                s.push_str(r#"","content":""#);
+                json::escape_into(s, content);
+                s.push_str(r#"","is_error":"#);
+                s.push_str(if *is_error { "true" } else { "false" });
+                s.push('}');
+            }
+        }
+    }
+    s.push(']');
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,7 +284,7 @@ mod tests {
         let req = Request {
             model: "claude-opus-4-7".into(),
             max_tokens: 64,
-            messages: vec![Message { role: Role::User, content: "hi".into() }],
+            messages: vec![Message::user_text("hi")],
             system: None,
             tools: vec![],
         };
@@ -237,10 +300,7 @@ mod tests {
         let req = Request {
             model: "claude-opus-4-7".into(),
             max_tokens: 1,
-            messages: vec![Message {
-                role: Role::Assistant,
-                content: "ok\nthen".into(),
-            }],
+            messages: vec![Message::assistant_text("ok\nthen")],
             system: Some("be terse".into()),
             tools: vec![Tool {
                 name: "get_weather".into(),
@@ -257,14 +317,54 @@ mod tests {
     }
 
     #[test]
-    fn serialize_escapes_dangerous_chars() {
+    fn serialize_tool_use_assistant_message() {
+        let req = Request {
+            model: "m".into(),
+            max_tokens: 1,
+            messages: vec![Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::Text("ok let me look".into()),
+                    ContentBlock::ToolUse {
+                        id: "toolu_1".into(),
+                        name: "bash".into(),
+                        input: r#"{"command":"ls"}"#.into(),
+                    },
+                ],
+            }],
+            system: None,
+            tools: vec![],
+        };
+        let body = serialize_request(&req);
+        assert!(body.contains(r#""content":[{"type":"text","text":"ok let me look"},{"type":"tool_use","id":"toolu_1","name":"bash","input":{"command":"ls"}}]"#));
+    }
+
+    #[test]
+    fn serialize_tool_result_user_message() {
         let req = Request {
             model: "m".into(),
             max_tokens: 1,
             messages: vec![Message {
                 role: Role::User,
-                content: "a\"b\\c".into(),
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "toolu_1".into(),
+                    content: "file1\nfile2\n".into(),
+                    is_error: false,
+                }],
             }],
+            system: None,
+            tools: vec![],
+        };
+        let body = serialize_request(&req);
+        assert!(body.contains(r#""content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"file1\nfile2\n","is_error":false}]"#));
+    }
+
+    #[test]
+    fn serialize_escapes_dangerous_chars() {
+        let req = Request {
+            model: "m".into(),
+            max_tokens: 1,
+            messages: vec![Message::user_text("a\"b\\c")],
             system: None,
             tools: vec![],
         };

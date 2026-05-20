@@ -19,9 +19,10 @@ mod session;
 pub use adapters::{AnthropicModel, AuditedShell};
 pub use instance::{Instance, InstanceMsg};
 pub use model::{
-    ChatMessage, MockModel, Model, ModelError, ModelEvent, ModelRequest, Role,
+    ChatMessage, ContentBlock, MockModel, Model, ModelError, ModelEvent, ModelRequest,
+    Role, ToolDef,
 };
 pub use sandbox::{MockSandbox, Sandbox, SandboxError, ShellResult};
 pub use session::{
-    HarnessState, PromptResult, Session, SessionError, SessionMsg,
+    bash_tool, HarnessState, PromptResult, Session, SessionError, SessionMsg,
 };
