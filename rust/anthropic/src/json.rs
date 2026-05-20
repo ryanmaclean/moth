@@ -54,10 +54,6 @@ impl Json {
             _ => None,
         }
     }
-
-    pub fn is_null(&self) -> bool {
-        matches!(self, Json::Null)
-    }
 }
 
 pub fn parse(input: &[u8]) -> Result<Json, Error> {
@@ -365,7 +361,7 @@ mod tests {
     #[test]
     fn parse_null_and_bool() {
         let v = parse(br#"{"a":null,"b":true,"c":false}"#).unwrap();
-        assert!(v.get("a").unwrap().is_null());
+        assert_eq!(v.get("a"), Some(&Json::Null));
         assert_eq!(v.get("b"), Some(&Json::Bool(true)));
         assert_eq!(v.get("c"), Some(&Json::Bool(false)));
     }

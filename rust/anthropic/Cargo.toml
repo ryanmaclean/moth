@@ -9,5 +9,5 @@ description = "Streaming client for the Anthropic Messages API. libcurl + OpenSS
 path = "src/lib.rs"
 
 [dependencies]
-curl-sys = "0.4"
+curl-sys = { version = "0.4", features = ["static-curl", "static-ssl"] }
 wire = { path = "../wire" }

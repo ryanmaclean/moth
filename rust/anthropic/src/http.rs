@@ -82,14 +82,23 @@ pub(crate) fn post_stream(api_key: &str, body: String) -> Result<Stream, Error> 
 
     let handle = std::thread::spawn(move || {
         let mut ctx = Ctx { tx: tx.clone(), aborted: false };
-        let result = unsafe { run_easy(&url, &key_header, &version_header, &content_type, &accept, &body_c, &mut ctx) };
+        let result = unsafe {
+            run_easy(
+                &url,
+                &key_header,
+                &version_header,
+                &content_type,
+                &accept,
+                &body_c,
+                &mut ctx,
+            )
+        };
         let _ = tx.send(Chunk::End(result));
     });
 
     Ok(Stream { rx, handle: Some(handle) })
 }
 
-#[allow(clippy::too_many_arguments)]
 unsafe fn run_easy(
     url: &CString,
     key_header: &CString,
@@ -99,93 +108,115 @@ unsafe fn run_easy(
     body: &[u8],
     ctx: *mut Ctx,
 ) -> Result<u32, Error> {
-    let easy = unsafe { c::curl_easy_init() };
-    if easy.is_null() {
-        return Err(Error::Http("curl_easy_init failed".into()));
-    }
-
-    let mut headers: *mut c::curl_slist = ptr::null_mut();
     unsafe {
+        let easy = c::curl_easy_init();
+        if easy.is_null() {
+            return Err(Error::Http("curl_easy_init failed".into()));
+        }
+
+        let mut headers: *mut c::curl_slist = ptr::null_mut();
         headers = c::curl_slist_append(headers, key_header.as_ptr());
         headers = c::curl_slist_append(headers, version_header.as_ptr());
         headers = c::curl_slist_append(headers, content_type.as_ptr());
         headers = c::curl_slist_append(headers, accept.as_ptr());
-    }
 
-    let result = unsafe {
-        let mut rc;
-        rc = c::curl_easy_setopt(easy, c::CURLOPT_URL, url.as_ptr());
-        if rc != c::CURLE_OK {
-            cleanup(easy, headers);
-            return Err(curl_err(rc, "setopt URL"));
-        }
-        rc = c::curl_easy_setopt(easy, c::CURLOPT_POST, 1_i64);
-        if rc != c::CURLE_OK {
-            cleanup(easy, headers);
-            return Err(curl_err(rc, "setopt POST"));
-        }
-        rc = c::curl_easy_setopt(easy, c::CURLOPT_POSTFIELDS, body.as_ptr());
-        if rc != c::CURLE_OK {
-            cleanup(easy, headers);
-            return Err(curl_err(rc, "setopt POSTFIELDS"));
-        }
-        rc = c::curl_easy_setopt(easy, c::CURLOPT_POSTFIELDSIZE, body.len() as i64);
-        if rc != c::CURLE_OK {
-            cleanup(easy, headers);
-            return Err(curl_err(rc, "setopt POSTFIELDSIZE"));
-        }
-        rc = c::curl_easy_setopt(easy, c::CURLOPT_HTTPHEADER, headers);
-        if rc != c::CURLE_OK {
-            cleanup(easy, headers);
-            return Err(curl_err(rc, "setopt HTTPHEADER"));
-        }
-        rc = c::curl_easy_setopt(easy, c::CURLOPT_WRITEFUNCTION, write_cb as *const c_void);
-        if rc != c::CURLE_OK {
-            cleanup(easy, headers);
-            return Err(curl_err(rc, "setopt WRITEFUNCTION"));
-        }
-        rc = c::curl_easy_setopt(easy, c::CURLOPT_WRITEDATA, ctx as *mut c_void);
-        if rc != c::CURLE_OK {
-            cleanup(easy, headers);
-            return Err(curl_err(rc, "setopt WRITEDATA"));
-        }
-        rc = c::curl_easy_setopt(easy, c::CURLOPT_NOPROGRESS, 1_i64);
-        if rc != c::CURLE_OK {
-            cleanup(easy, headers);
-            return Err(curl_err(rc, "setopt NOPROGRESS"));
-        }
-        rc = c::curl_easy_setopt(easy, c::CURLOPT_FOLLOWLOCATION, 1_i64);
-        if rc != c::CURLE_OK {
-            cleanup(easy, headers);
-            return Err(curl_err(rc, "setopt FOLLOWLOCATION"));
-        }
+        let guard = Handle { easy, headers };
+
+        setopt_ptr(easy, c::CURLOPT_URL, url.as_ptr() as *const c_void, "URL")?;
+        setopt_long(easy, c::CURLOPT_POST, 1, "POST")?;
+        setopt_ptr(
+            easy,
+            c::CURLOPT_POSTFIELDS,
+            body.as_ptr() as *const c_void,
+            "POSTFIELDS",
+        )?;
+        setopt_long(
+            easy,
+            c::CURLOPT_POSTFIELDSIZE,
+            body.len() as i64,
+            "POSTFIELDSIZE",
+        )?;
+        setopt_ptr(
+            easy,
+            c::CURLOPT_HTTPHEADER,
+            headers as *const c_void,
+            "HTTPHEADER",
+        )?;
+        setopt_ptr(
+            easy,
+            c::CURLOPT_WRITEFUNCTION,
+            write_cb as *const c_void,
+            "WRITEFUNCTION",
+        )?;
+        setopt_ptr(
+            easy,
+            c::CURLOPT_WRITEDATA,
+            ctx as *const c_void,
+            "WRITEDATA",
+        )?;
+        setopt_long(easy, c::CURLOPT_NOPROGRESS, 1, "NOPROGRESS")?;
+        setopt_long(easy, c::CURLOPT_FOLLOWLOCATION, 1, "FOLLOWLOCATION")?;
 
         let perform_rc = c::curl_easy_perform(easy);
         let mut status: i64 = 0;
-        let _ = c::curl_easy_getinfo(easy, c::CURLINFO_RESPONSE_CODE, &mut status);
-        cleanup(easy, headers);
+        c::curl_easy_getinfo(easy, c::CURLINFO_RESPONSE_CODE, &mut status);
 
-        // CURLE_WRITE_ERROR is what we return from write_cb when the receiver
-        // dropped — that's a clean caller-initiated abort, not a real failure.
+        drop(guard);
+
+        // CURLE_WRITE_ERROR comes from write_cb returning 0 when the receiver
+        // was dropped — a clean caller-initiated abort, not a real failure.
         if perform_rc != c::CURLE_OK && perform_rc != c::CURLE_WRITE_ERROR {
             return Err(curl_err(perform_rc, "perform"));
         }
-        if status < 200 || status >= 300 {
+        if !(200..300).contains(&status) {
             return Err(Error::Http(format!("HTTP {status}")));
         }
         Ok(status as u32)
-    };
-
-    result
+    }
 }
 
-unsafe fn cleanup(easy: *mut c::CURL, headers: *mut c::curl_slist) {
-    unsafe {
-        if !headers.is_null() {
-            c::curl_slist_free_all(headers);
+struct Handle {
+    easy: *mut c::CURL,
+    headers: *mut c::curl_slist,
+}
+
+impl Drop for Handle {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.headers.is_null() {
+                c::curl_slist_free_all(self.headers);
+            }
+            if !self.easy.is_null() {
+                c::curl_easy_cleanup(self.easy);
+            }
         }
-        c::curl_easy_cleanup(easy);
     }
+}
+
+unsafe fn setopt_ptr(
+    easy: *mut c::CURL,
+    opt: c::CURLoption,
+    val: *const c_void,
+    name: &str,
+) -> Result<(), Error> {
+    let rc = unsafe { c::curl_easy_setopt(easy, opt, val) };
+    if rc != c::CURLE_OK {
+        return Err(curl_err(rc, name));
+    }
+    Ok(())
+}
+
+unsafe fn setopt_long(
+    easy: *mut c::CURL,
+    opt: c::CURLoption,
+    val: i64,
+    name: &str,
+) -> Result<(), Error> {
+    let rc = unsafe { c::curl_easy_setopt(easy, opt, val) };
+    if rc != c::CURLE_OK {
+        return Err(curl_err(rc, name));
+    }
+    Ok(())
 }
 
 fn curl_err(code: c::CURLcode, where_: &str) -> Error {
