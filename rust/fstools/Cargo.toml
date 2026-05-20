@@ -1,0 +1,16 @@
+[package]
+name = "fstools"
+version = "0.0.1"
+edition = "2024"
+publish = false
+description = "Filesystem tools (Read, Write, Edit) implementing harness::Tool."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+anthropic = { path = "../anthropic" }
+harness = { path = "../harness" }
+
+[dev-dependencies]
+actor = { path = "../actor" }
