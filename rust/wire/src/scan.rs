@@ -193,8 +193,8 @@ mod tests {
     #[test]
     fn byte_empty_and_single() {
         cross_check_byte(&[], b'x');
-        cross_check_byte(&[b'x'], b'x');
-        cross_check_byte(&[b'y'], b'x');
+        cross_check_byte(b"x", b'x');
+        cross_check_byte(b"y", b'x');
     }
 
     #[test]
