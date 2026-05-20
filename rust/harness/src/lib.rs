@@ -15,6 +15,7 @@ mod instance;
 mod model;
 mod sandbox;
 mod session;
+mod tools;
 
 pub use adapters::{AnthropicModel, AuditedShell};
 pub use instance::{Instance, InstanceMsg};
@@ -23,6 +24,5 @@ pub use model::{
     Role, ToolDef,
 };
 pub use sandbox::{MockSandbox, Sandbox, SandboxError, ShellResult};
-pub use session::{
-    bash_tool, HarnessState, PromptResult, Session, SessionError, SessionMsg,
-};
+pub use session::{HarnessState, PromptResult, Session, SessionError, SessionMsg};
+pub use tools::{BashTool, Tool, ToolCtx, ToolError, default_tools};

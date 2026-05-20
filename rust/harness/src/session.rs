@@ -15,7 +15,7 @@
 //!      loop back to (2). Otherwise return.
 
 use std::sync::Arc;
-use std::sync::mpsc::{SyncSender, sync_channel};
+use std::sync::mpsc::SyncSender;
 
 use actor::{Actor, ActorRef};
 use wire::find_tag;
@@ -25,6 +25,7 @@ use crate::model::{
     ChatMessage, ContentBlock, Model, ModelEvent, ModelRequest, Role, ToolDef,
 };
 use crate::sandbox::{SandboxError, ShellResult};
+use crate::tools::{Tool, ToolCtx, default_tools};
 
 const DEFAULT_MAX_TOKENS: u32 = 4096;
 const MAX_TURNS_PER_PROMPT: usize = 16;
@@ -35,7 +36,7 @@ pub struct HarnessState {
     pub default_system: Option<String>,
     pub default_max_tokens: u32,
     pub instance: ActorRef<InstanceMsg>,
-    pub tools: Vec<ToolDef>,
+    pub tools: Vec<Arc<dyn Tool>>,
 }
 
 impl HarnessState {
@@ -50,7 +51,7 @@ impl HarnessState {
             default_system: None,
             default_max_tokens: DEFAULT_MAX_TOKENS,
             instance,
-            tools: vec![bash_tool()],
+            tools: default_tools(),
         }
     }
 
@@ -59,17 +60,13 @@ impl HarnessState {
         self
     }
 
-    pub fn with_tools(mut self, tools: Vec<ToolDef>) -> Self {
+    pub fn with_tools(mut self, tools: Vec<Arc<dyn Tool>>) -> Self {
         self.tools = tools;
         self
     }
-}
 
-pub fn bash_tool() -> ToolDef {
-    ToolDef {
-        name: "bash".into(),
-        description: "Execute a bash command in the agent's sandbox. Returns stdout, stderr, and exit code.".into(),
-        input_schema: r#"{"type":"object","properties":{"command":{"type":"string","description":"The shell command to execute."}},"required":["command"]}"#.into(),
+    pub fn tool_defs(&self) -> Vec<ToolDef> {
+        self.tools.iter().map(|t| t.definition()).collect()
     }
 }
 
@@ -155,7 +152,7 @@ impl Session {
                 system: self.harness.default_system.clone(),
                 messages: self.history.clone(),
                 max_tokens: self.harness.default_max_tokens,
-                tools: self.harness.tools.clone(),
+                tools: self.harness.tool_defs(),
             };
 
             let mut blocks: Vec<ContentBlock> = Vec::new();
@@ -243,84 +240,27 @@ impl Session {
     }
 
     fn execute_tool(&self, id: &str, name: &str, input: &str) -> ContentBlock {
-        if name != "bash" {
+        let tool = self.harness.tools.iter().find(|t| t.name() == name);
+        let Some(tool) = tool else {
             return ContentBlock::ToolResult {
                 tool_use_id: id.into(),
                 content: format!("unknown tool: {name}"),
                 is_error: true,
             };
-        }
-        let cmd = match extract_command(input) {
-            Some(c) => c,
-            None => {
-                return ContentBlock::ToolResult {
-                    tool_use_id: id.into(),
-                    content: format!("missing or invalid 'command' field in tool input: {input}"),
-                    is_error: true,
-                };
-            }
         };
-        let (tx, rx) = sync_channel(1);
-        if self
-            .harness
-            .instance
-            .send(InstanceMsg::Shell { cmd, reply: tx })
-            .is_err()
-        {
-            return ContentBlock::ToolResult {
+        let ctx = ToolCtx { instance: &self.harness.instance };
+        match tool.call(input, &ctx) {
+            Ok(content) => ContentBlock::ToolResult {
                 tool_use_id: id.into(),
-                content: "instance mailbox closed".into(),
-                is_error: true,
-            };
-        }
-        match rx.recv() {
-            Ok(Ok(r)) => {
-                let mut content = String::new();
-                if !r.stdout.is_empty() {
-                    content.push_str(&String::from_utf8_lossy(&r.stdout));
-                }
-                if !r.stderr.is_empty() {
-                    if !content.is_empty() && !content.ends_with('\n') {
-                        content.push('\n');
-                    }
-                    content.push_str("stderr: ");
-                    content.push_str(&String::from_utf8_lossy(&r.stderr));
-                }
-                if r.exit_code != 0 {
-                    if !content.is_empty() && !content.ends_with('\n') {
-                        content.push('\n');
-                    }
-                    content.push_str(&format!("(exit {})", r.exit_code));
-                }
-                ContentBlock::ToolResult {
-                    tool_use_id: id.into(),
-                    content,
-                    is_error: r.exit_code != 0,
-                }
-            }
-            Ok(Err(e)) => ContentBlock::ToolResult {
+                content,
+                is_error: false,
+            },
+            Err(e) => ContentBlock::ToolResult {
                 tool_use_id: id.into(),
                 content: e.0,
                 is_error: true,
             },
-            Err(_) => ContentBlock::ToolResult {
-                tool_use_id: id.into(),
-                content: "instance dropped reply channel".into(),
-                is_error: true,
-            },
         }
-    }
-}
-
-/// Parse `{"command":"..."}` and return the command. Tolerant of whitespace
-/// and ordering. Returns None if the input isn't valid JSON or lacks the
-/// field. Uses the anthropic crate's JSON walker — same parser we already
-/// vendored for streaming responses.
-fn extract_command(input: &str) -> Option<String> {
-    let parsed = anthropic::json::parse(input.as_bytes()).ok()?;
-    match parsed.get("command")? {
-        anthropic::json::Json::Str(s) => Some(s.clone()),
-        _ => None,
     }
 }
 
