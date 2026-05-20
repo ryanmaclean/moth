@@ -378,14 +378,20 @@ mod tests {
 
     #[test]
     fn parse_unicode_escape() {
-        let v = parse(br#""é""#).unwrap();
-        assert_eq!(v.as_str(), Some("é"));
+        let v = parse(b"\"\\u00e9\"").unwrap();
+        assert_eq!(v.as_str(), Some("\u{00e9}"));
     }
 
     #[test]
     fn parse_surrogate_pair() {
-        let v = parse(br#""😀""#).unwrap();
+        let v = parse(b"\"\\uD83D\\uDE00\"").unwrap();
         assert_eq!(v.as_str(), Some("\u{1F600}"));
+    }
+
+    #[test]
+    fn parse_raw_utf8_string() {
+        let v = parse("\"é😀\"".as_bytes()).unwrap();
+        assert_eq!(v.as_str(), Some("é😀"));
     }
 
     #[test]
