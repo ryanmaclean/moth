@@ -1,0 +1,12 @@
+[package]
+name = "audit"
+version = "0.0.1"
+edition = "2024"
+publish = false
+description = "Defensive shell-command scanner. Literal multi-pattern match over wire's SIMD byte scan. Refuses shai-hulud-class payloads before exec."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+wire = { path = "../wire" }

@@ -10,11 +10,13 @@
 //! See Flue's instance/harness/session hierarchy for the conceptual model;
 //! the implementation collapses Harness into a value type.
 
+mod adapters;
 mod instance;
 mod model;
 mod sandbox;
 mod session;
 
+pub use adapters::{AnthropicModel, AuditedShell};
 pub use instance::{Instance, InstanceMsg};
 pub use model::{
     ChatMessage, MockModel, Model, ModelError, ModelEvent, ModelRequest, Role,

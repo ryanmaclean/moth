@@ -10,4 +10,7 @@ path = "src/lib.rs"
 
 [dependencies]
 actor = { path = "../actor" }
+anthropic = { path = "../anthropic" }
+audit = { path = "../audit" }
+vshell = { path = "../vshell" }
 wire = { path = "../wire" }
