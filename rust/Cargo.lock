@@ -105,6 +105,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "mcp"
+version = "0.0.1"
+dependencies = [
+ "actor",
+ "anthropic",
+ "harness",
+ "wire",
+]
+
+[[package]]
 name = "openai"
 version = "0.0.1"
 dependencies = [

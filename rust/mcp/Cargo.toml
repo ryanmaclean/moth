@@ -1,0 +1,17 @@
+[package]
+name = "mcp"
+version = "0.0.1"
+edition = "2024"
+publish = false
+description = "Model Context Protocol client. Stdio transport. Exposes remote tools as harness::Tool impls."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+anthropic = { path = "../anthropic" }
+harness = { path = "../harness" }
+wire = { path = "../wire" }
+
+[dev-dependencies]
+actor = { path = "../actor" }
