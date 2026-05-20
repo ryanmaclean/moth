@@ -11,5 +11,9 @@ path = "src/main.rs"
 
 [dependencies]
 actor = { path = "../actor" }
+anthropic = { path = "../anthropic" }
+fstools = { path = "../fstools" }
 harness = { path = "../harness" }
+server = { path = "../server" }
+tmpl = { path = "../tmpl" }
 vshell = { path = "../vshell" }

@@ -17,7 +17,7 @@ mod sandbox;
 mod session;
 mod tools;
 
-pub use adapters::{AnthropicModel, AuditedShell};
+pub use adapters::{AnthropicModel, AuditedShell, OpenAiModel};
 pub use instance::{Instance, InstanceMsg};
 pub use model::{
     ChatMessage, ContentBlock, MockModel, Model, ModelError, ModelEvent, ModelRequest,

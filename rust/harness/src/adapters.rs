@@ -87,6 +87,88 @@ fn map_event(
     }
 }
 
+pub struct OpenAiModel {
+    client: openai::Client,
+    model: String,
+}
+
+impl OpenAiModel {
+    pub fn new(api_key: String, model: impl Into<String>) -> Self {
+        Self { client: openai::Client::new(api_key), model: model.into() }
+    }
+
+    pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
+        self.client = self.client.with_base_url(url);
+        self
+    }
+}
+
+impl Model for OpenAiModel {
+    fn stream(
+        &self,
+        req: ModelRequest,
+    ) -> Box<dyn Iterator<Item = Result<ModelEvent, ModelError>> + Send> {
+        let upstream = openai::Request {
+            model: self.model.clone(),
+            max_tokens: req.max_tokens,
+            messages: req.messages.into_iter().map(map_oa_message).collect(),
+            system: req.system,
+            tools: req
+                .tools
+                .into_iter()
+                .map(|t| openai::Tool {
+                    name: t.name,
+                    description: t.description,
+                    input_schema: t.input_schema,
+                })
+                .collect(),
+        };
+        match self.client.stream(upstream) {
+            Ok(stream) => Box::new(stream.filter_map(map_oa_event)),
+            Err(e) => Box::new(std::iter::once(Err(ModelError(format!("{e:?}"))))),
+        }
+    }
+}
+
+fn map_oa_message(m: ChatMessage) -> openai::Message {
+    let role = match m.role {
+        Role::User => openai::Role::User,
+        Role::Assistant => openai::Role::Assistant,
+    };
+    // ToolResult blocks become role:"tool" messages on the OpenAI wire — the
+    // openai serializer handles that, but it needs the block under a User
+    // message at our type level. Map straight through; openai/lib.rs splits.
+    let content = m
+        .content
+        .into_iter()
+        .map(|b| match b {
+            ContentBlock::Text(s) => openai::ContentBlock::Text(s),
+            ContentBlock::ToolUse { id, name, input } => {
+                openai::ContentBlock::ToolUse { id, name, input }
+            }
+            ContentBlock::ToolResult { tool_use_id, content, .. } => {
+                openai::ContentBlock::ToolResult { tool_use_id, content }
+            }
+        })
+        .collect();
+    openai::Message { role, content }
+}
+
+fn map_oa_event(
+    ev: Result<openai::Event, openai::Error>,
+) -> Option<Result<ModelEvent, ModelError>> {
+    use openai::Event;
+    match ev {
+        Ok(Event::TextDelta(s)) => Some(Ok(ModelEvent::TextDelta(s))),
+        Ok(Event::ToolUseStart { id, name }) => Some(Ok(ModelEvent::ToolUseStart { id, name })),
+        Ok(Event::ToolUseInputDelta(s)) => Some(Ok(ModelEvent::ToolUseInputDelta(s))),
+        Ok(Event::ContentBlockStop) => Some(Ok(ModelEvent::BlockStop)),
+        Ok(Event::Stop { reason }) => Some(Ok(ModelEvent::Stop { reason })),
+        Ok(Event::Other(_)) => None,
+        Err(e) => Some(Err(ModelError(format!("{e:?}")))),
+    }
+}
+
 impl Sandbox for vshell::VShell {
     fn execute(&mut self, cmd: &str) -> Result<ShellResult, SandboxError> {
         let r = vshell::VShell::execute(self, cmd);
