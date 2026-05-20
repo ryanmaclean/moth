@@ -100,6 +100,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "openai"
+version = "0.0.1"
+dependencies = [
+ "curl-sys",
+ "wire",
+]
+
+[[package]]
 name = "openssl-src"
 version = "300.6.0+3.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
