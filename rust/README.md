@@ -8,12 +8,13 @@ into a build with a small dependency footprint.
 
 ## Status
 
-Coding-agent grade. 18 crates, 456 inline tests across the workspace;
+Coding-agent grade. 19 crates, 463 inline tests across the workspace;
 one direct external dependency (`curl-sys`), all transitive deps fully
 vendored. HTTP server hardened, sessions persist, MCP-pluggable (stdio
 + HTTP), fstools symlink + hard-link safe, git + jj branch strategies,
-Gitea forge client, multi-node `cluster::RemoteActorRef`, microbench
-suite with measured numbers, cross-crate integration suite.
+Gitea + GitHub forge clients, multi-node `cluster::RemoteActorRef`,
+Aho-Corasick `audit` scanner, microbench suite with measured numbers,
+cross-crate integration suite with three gated real-network E2E tests.
 
 ## Layout
 
@@ -34,6 +35,7 @@ suite with measured numbers, cross-crate integration suite.
 | `jj/` | Jujutsu (jj) branch strategies implementing `git::BranchStrategy`. Workspace + bookmark mapping. Tests skip cleanly if `jj` isn't installed. | `git` |
 | `gitea/` | Minimal Gitea REST API client (PATs via `Authorization: token`, `/api/v1/...`). Issues, comments, PRs. Works with Forgejo, Codeberg. | `wire`, `anthropic`, `curl-sys` |
 | `cluster/` | Multi-node `RemoteActorRef<M: Codec>` over TCP. Length-prefixed frames, per-node registry, fire-and-forget delivery, cached connections with re-dial on failure. | `actor`, `wire`, `anthropic` |
+| `github/` | GitHub REST API client. `Authorization: Bearer`, `Accept: application/vnd.github+json`, `X-GitHub-Api-Version`, required `User-Agent`. Filters PRs out of `list_issues`. Works with Enterprise via `with_base_url`. | `anthropic`, `curl-sys` |
 | `benches/` | Microbenchmarks for the SIMD/parsing hot paths. `std::time::Instant`-based, no criterion. `cargo test -p benches --release -- --nocapture`. | `wire`, `audit`, `anthropic`, `vshell` |
 | `persist/` | File-backed `SessionStore`. Atomic writes via tmp + rename. Version-tagged JSON; key validation rejects path-traversal. | `harness`, `anthropic` |
 | `harness/` | Instance + Session actors. `Model` / `Sandbox` / `Tool` / `SessionStore` traits. `AnthropicModel`, `OpenAiModel`, `AuditedShell<S>`, `BashTool`. Iteration loop with tool-use, completion signal, structured output, 16-turn cap, optional persistence hook. | `actor`, `wire`, `anthropic`, `openai`, `audit`, `vshell` |
@@ -102,9 +104,7 @@ finds every match regardless of pattern count.
 
 ## What's left
 
-- Real-network E2E test (would require an `ANTHROPIC_API_KEY` and is
-  sandbox-policy-sensitive).
-- GitHub forge client (parallel to `gitea` — different auth scheme,
-  same shape).
-- Aho–Corasick for `audit` (per-pattern cost dominates the 1 KiB-no-hit
-  case at ~5.5 µs; multi-pattern scan would cut that ~5×).
+(Nothing actively deferred. The crate set covers the workflows we set
+out to support — runtime, models, tools, sandbox, audit, forges, VCS
+strategies, cluster, persistence, MCP, HTTP service, CLI. Future work
+is feature growth rather than gap-closing.)

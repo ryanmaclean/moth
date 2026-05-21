@@ -47,14 +47,17 @@ pub struct Finding {
 const NONE: u32 = u32::MAX;
 
 struct Node {
-    /// `goto[b]` = child index or `NONE`. Direct-addressed for one indexed
-    /// load per byte; ~1 KiB per node × ~250 nodes = ~250 KiB total, an
-    /// easy trade for branchless dispatch on the hot path.
+    /// `goto[b]` = child index or `NONE`. Direct-addressed for one
+    /// indexed load per haystack byte; ~1 KiB per node × a few hundred
+    /// nodes for our pattern set. We keep the NFA-style sparse table
+    /// (NONE for non-children) instead of pre-baking the full DFA —
+    /// empirically the sparse form benches faster on benign input, where
+    /// state stays at root and the inner fail-loop never iterates.
     goto: Box<[u32; 256]>,
     fail: u32,
-    /// Pattern indices that match if we end at this node. Pre-unioned with
-    /// every node reachable via fail links during BFS, so a single read
-    /// here covers all suffix matches.
+    /// Pattern indices that match if we end at this node. Pre-unioned
+    /// with every node reachable via fail links during BFS, so a single
+    /// read here covers all suffix matches.
     output: Vec<u32>,
 }
 
@@ -92,8 +95,9 @@ impl Scanner {
         let mut out = Vec::new();
         let nodes = &self.trie.nodes;
         for (i, &b) in haystack.iter().enumerate() {
-            // Walk fail links until we either find a goto for `b` or
-            // bottom out at the root. Root's missing goto stays root.
+            // Walk fail links until we find a goto for `b` or bottom out
+            // at root. On benign input state stays 0, the first lookup
+            // is NONE, and the loop exits in one iteration.
             loop {
                 let nx = nodes[state].goto[b as usize];
                 if nx != NONE {
@@ -152,7 +156,8 @@ fn build_trie(patterns: &[Pattern]) -> Trie {
         nodes[cur].output.push(pi as u32);
     }
 
-    // BFS to compute fail links. Root's direct children all fail to root.
+    // BFS to compute fail links and union outputs along the fail chain.
+    // Root's direct children all fail to root.
     let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
     for b in 0..256usize {
         let c = nodes[0].goto[b];
@@ -168,8 +173,8 @@ fn build_trie(patterns: &[Pattern]) -> Trie {
             if v == NONE {
                 continue;
             }
-            // fail(v) = δ(fail(u), b): climb u's fail chain until we find
-            // a node with a goto on `b`. Root acts as the sink — if root
+            // fail(v) = δ(fail(u), b): climb u's fail chain until we
+            // find a node with a goto on `b`. Root is the sink — if it
             // has no child via `b`, fail(v) = 0.
             let mut f = nodes[u].fail as usize;
             let fail_v = loop {
@@ -183,9 +188,8 @@ fn build_trie(patterns: &[Pattern]) -> Trie {
                 f = nodes[f].fail as usize;
             };
             nodes[v as usize].fail = fail_v as u32;
-            // Pre-union outputs along the fail chain. fail_v was queued
-            // earlier in BFS order, so its output already contains every
-            // suffix match transitively.
+            // fail_v was queued earlier in BFS order, so its `output` is
+            // already the full transitive union along its fail chain.
             if fail_v != v as usize {
                 let extra = nodes[fail_v].output.clone();
                 nodes[v as usize].output.extend(extra);

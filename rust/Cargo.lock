@@ -109,6 +109,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "github"
+version = "0.0.1"
+dependencies = [
+ "anthropic",
+ "curl-sys",
+]
+
+[[package]]
 name = "harness"
 version = "0.0.1"
 dependencies = [
