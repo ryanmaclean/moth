@@ -109,6 +109,7 @@ unsafe fn run_easy(
     ctx: *mut Ctx,
 ) -> Result<u32, Error> {
     unsafe {
+        curl_global_init_once();
         let easy = c::curl_easy_init();
         if easy.is_null() {
             return Err(Error::Http("curl_easy_init failed".into()));
@@ -229,4 +230,15 @@ fn curl_err(code: c::CURLcode, where_: &str) -> Error {
         }
     };
     Error::Http(format!("curl {where_}: {msg} (code {code})"))
+}
+
+/// Idempotent process-wide `curl_global_init`. libcurl docs require
+/// global_init be called once before any other curl call, and it's not
+/// itself thread-safe — without this, parallel callers (tests, multi-Client
+/// production code) occasionally corrupt state at first-init.
+unsafe fn curl_global_init_once() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        unsafe { c::curl_global_init(c::CURL_GLOBAL_DEFAULT); }
+    });
 }

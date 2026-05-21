@@ -44,6 +44,7 @@ pub(crate) fn request(
     let status: u16;
 
     unsafe {
+        curl_global_init_once();
         let easy = c::curl_easy_init();
         if easy.is_null() {
             return Err(Error::Http("curl_easy_init failed".into()));
@@ -182,4 +183,13 @@ fn curl_err(code: c::CURLcode, where_: &str) -> Error {
         }
     };
     Error::Http(format!("curl {where_}: {msg} (code {code})"))
+}
+
+/// Idempotent process-wide `curl_global_init`. See gitea / anthropic
+/// equivalents — libcurl global_init is required-once and not thread-safe.
+unsafe fn curl_global_init_once() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        unsafe { c::curl_global_init(c::CURL_GLOBAL_DEFAULT); }
+    });
 }

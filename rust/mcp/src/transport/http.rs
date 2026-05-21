@@ -219,6 +219,7 @@ fn post(
     let perform_status: i64;
 
     unsafe {
+        curl_global_init_once();
         let easy = c::curl_easy_init();
         if easy.is_null() {
             return Err("curl_easy_init failed".into());
@@ -428,6 +429,16 @@ fn curl_err(code: c::CURLcode, where_: &str) -> String {
         }
     };
     format!("curl {where_}: {msg} (code {code})")
+}
+
+/// Idempotent process-wide `curl_global_init`. Required-once and not
+/// thread-safe per libcurl docs; sync::Once makes it safe across parallel
+/// callers (tests, multiple McpClient instances).
+unsafe fn curl_global_init_once() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        unsafe { c::curl_global_init(c::CURL_GLOBAL_DEFAULT); }
+    });
 }
 
 // ---- tests -----------------------------------------------------------------

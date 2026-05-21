@@ -508,7 +508,6 @@ mod tests {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::{Arc, Mutex};
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
 
     #[derive(Clone)]
@@ -538,30 +537,45 @@ mod tests {
         base_url: String,
         captured: Arc<Mutex<Vec<Captured>>>,
         _handle: thread::JoinHandle<()>,
+        running: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Drop for Mock {
+        fn drop(&mut self) {
+            self.running.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 
     fn start_mock(replies: Vec<Reply>) -> Mock {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+
         let captured = Arc::new(Mutex::new(Vec::<Captured>::new()));
         let cap_clone = Arc::clone(&captured);
         let total = replies.len();
-        let idx = Arc::new(AtomicUsize::new(0));
         let replies = Arc::new(replies);
+        let running = Arc::new(AtomicBool::new(true));
+        let running_clone = Arc::clone(&running);
 
         let handle = thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(stream) = stream else { break };
-                let i = idx.fetch_add(1, Ordering::SeqCst);
-                if i >= total {
-                    break;
-                }
-                let reply = replies[i].clone();
-                if let Some(c) = handle_one(stream, &reply) {
-                    cap_clone.lock().unwrap().push(c);
-                }
-                if i + 1 >= total {
-                    break;
+            let mut idx = 0usize;
+            while running_clone.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        if idx < total {
+                            let reply = replies[idx].clone();
+                            idx += 1;
+                            handle_one(stream, &reply, &cap_clone);
+                        }
+                        // Else: extra connection (libcurl probe, retry) — drop it.
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    Err(_) => break,
                 }
             }
         });
@@ -570,13 +584,23 @@ mod tests {
             base_url: format!("http://{addr}"),
             captured,
             _handle: handle,
+            running,
         }
     }
 
-    fn handle_one(mut stream: TcpStream, reply: &Reply) -> Option<Captured> {
-        let mut reader = BufReader::new(stream.try_clone().ok()?);
+    fn handle_one(
+        mut stream: TcpStream,
+        reply: &Reply,
+        captured_sink: &Arc<Mutex<Vec<Captured>>>,
+    ) {
+        let mut reader = match stream.try_clone() {
+            Ok(s) => BufReader::new(s),
+            Err(_) => return,
+        };
         let mut request_line = String::new();
-        reader.read_line(&mut request_line).ok()?;
+        if reader.read_line(&mut request_line).is_err() {
+            return;
+        }
         let request_line = request_line.trim_end_matches(['\r', '\n']).to_string();
         let mut parts = request_line.split_whitespace();
         let method = parts.next().unwrap_or("").to_string();
@@ -590,7 +614,9 @@ mod tests {
         let mut content_length: usize = 0;
         loop {
             let mut line = String::new();
-            reader.read_line(&mut line).ok()?;
+            if reader.read_line(&mut line).is_err() {
+                return;
+            }
             if line == "\r\n" || line == "\n" || line.is_empty() {
                 break;
             }
@@ -610,19 +636,25 @@ mod tests {
 
         if content_length > 0 {
             let mut body = vec![0u8; content_length];
-            reader.read_exact(&mut body).ok()?;
+            if reader.read_exact(&mut body).is_err() {
+                return;
+            }
             captured.body = body;
         }
+
+        // Record BEFORE we respond. Otherwise the client's libcurl perform
+        // can return to the test thread before the mock loop pushes,
+        // leaving the test reading an empty Vec.
+        captured_sink.lock().unwrap().push(captured);
 
         let body = &reply.body;
         let mut resp = format!("HTTP/1.1 {} {}\r\n", reply.status, status_text(reply.status));
         resp.push_str("content-type: application/json\r\n");
         resp.push_str(&format!("content-length: {}\r\n", body.len()));
         resp.push_str("connection: close\r\n\r\n");
-        stream.write_all(resp.as_bytes()).ok()?;
-        stream.write_all(body).ok()?;
-        stream.flush().ok()?;
-        Some(captured)
+        let _ = stream.write_all(resp.as_bytes());
+        let _ = stream.write_all(body);
+        let _ = stream.flush();
     }
 
     fn status_text(code: u16) -> &'static str {
