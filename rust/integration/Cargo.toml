@@ -10,10 +10,12 @@ path = "src/lib.rs"
 
 [dev-dependencies]
 actor = { path = "../actor" }
+anthropic = { path = "../anthropic" }
 audit = { path = "../audit" }
 fstools = { path = "../fstools" }
 harness = { path = "../harness" }
 mcp = { path = "../mcp" }
+openai = { path = "../openai" }
 persist = { path = "../persist" }
 tmpl = { path = "../tmpl" }
 vshell = { path = "../vshell" }

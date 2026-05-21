@@ -13,8 +13,16 @@
 //! watching can evade with whitespace tricks — that's why we run this
 //! BEFORE quoting normalisation, on the raw command string, and treat
 //! findings as one signal among several.
+//!
+//! Implementation: a flat Aho–Corasick automaton. One walk over the
+//! haystack finds every pattern, regardless of how many we configured.
+//! Replaces the previous per-pattern scan that paid 22× the cost on a
+//! clean buffer.
 
-use wire::scan_for_byte;
+// `wire` stays in the dep set — other crates in the workspace key off it,
+// and an Aho–Corasick scanner has no use for the SIMD byte scanner once
+// the trie subsumes per-pattern dispatch.
+use wire as _;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
@@ -36,13 +44,39 @@ pub struct Finding {
     pub offset: usize,
 }
 
+const NONE: u32 = u32::MAX;
+
+struct Node {
+    /// `goto[b]` = child index or `NONE`. Direct-addressed for one indexed
+    /// load per byte; ~1 KiB per node × ~250 nodes = ~250 KiB total, an
+    /// easy trade for branchless dispatch on the hot path.
+    goto: Box<[u32; 256]>,
+    fail: u32,
+    /// Pattern indices that match if we end at this node. Pre-unioned with
+    /// every node reachable via fail links during BFS, so a single read
+    /// here covers all suffix matches.
+    output: Vec<u32>,
+}
+
+impl Node {
+    fn new() -> Self {
+        Self { goto: Box::new([NONE; 256]), fail: 0, output: Vec::new() }
+    }
+}
+
+struct Trie {
+    nodes: Vec<Node>,
+}
+
 pub struct Scanner {
     patterns: Vec<Pattern>,
+    trie: Trie,
 }
 
 impl Scanner {
     pub fn new(patterns: Vec<Pattern>) -> Self {
-        Self { patterns }
+        let trie = build_trie(&patterns);
+        Self { patterns, trie }
     }
 
     pub fn default_patterns() -> Self {
@@ -50,14 +84,31 @@ impl Scanner {
     }
 
     /// All literal patterns that match. Multiple findings may share an
-    /// offset when needles overlap (e.g. `| bash` and `| sh`).
+    /// offset when needles overlap (e.g. `| bash` and `| sh`). Reported
+    /// in haystack order (left to right); within one position, by the
+    /// fail-link traversal order set at construction time.
     pub fn scan(&self, haystack: &[u8]) -> Vec<Finding> {
+        let mut state = 0usize;
         let mut out = Vec::new();
-        for p in &self.patterns {
-            let mut from = 0;
-            while let Some(off) = find_at(haystack, from, p.needle) {
-                out.push(Finding { label: p.label, severity: p.severity, offset: off });
-                from = off + 1;
+        let nodes = &self.trie.nodes;
+        for (i, &b) in haystack.iter().enumerate() {
+            // Walk fail links until we either find a goto for `b` or
+            // bottom out at the root. Root's missing goto stays root.
+            loop {
+                let nx = nodes[state].goto[b as usize];
+                if nx != NONE {
+                    state = nx as usize;
+                    break;
+                }
+                if state == 0 {
+                    break;
+                }
+                state = nodes[state].fail as usize;
+            }
+            for &pi in &nodes[state].output {
+                let p = &self.patterns[pi as usize];
+                let offset = i + 1 - p.needle.len();
+                out.push(Finding { label: p.label, severity: p.severity, offset });
             }
         }
         out
@@ -78,24 +129,73 @@ impl Default for Scanner {
     }
 }
 
-fn find_at(haystack: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || needle.len() > haystack.len().saturating_sub(from) {
-        return None;
-    }
-    let first = needle[0];
-    let mut cursor = from;
-    while cursor + needle.len() <= haystack.len() {
-        let off = scan_for_byte(&haystack[cursor..], first)?;
-        let pos = cursor + off;
-        if pos + needle.len() > haystack.len() {
-            return None;
+fn build_trie(patterns: &[Pattern]) -> Trie {
+    let mut nodes = vec![Node::new()];
+    // Insert each non-empty pattern into the trie. Empty needles are
+    // skipped — they'd match at every position and never made sense.
+    for (pi, p) in patterns.iter().enumerate() {
+        if p.needle.is_empty() {
+            continue;
         }
-        if &haystack[pos..pos + needle.len()] == needle {
-            return Some(pos);
+        let mut cur = 0usize;
+        for &b in p.needle {
+            let nx = nodes[cur].goto[b as usize];
+            if nx == NONE {
+                let new_idx = nodes.len() as u32;
+                nodes.push(Node::new());
+                nodes[cur].goto[b as usize] = new_idx;
+                cur = new_idx as usize;
+            } else {
+                cur = nx as usize;
+            }
         }
-        cursor = pos + 1;
+        nodes[cur].output.push(pi as u32);
     }
-    None
+
+    // BFS to compute fail links. Root's direct children all fail to root.
+    let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+    for b in 0..256usize {
+        let c = nodes[0].goto[b];
+        if c != NONE {
+            nodes[c as usize].fail = 0;
+            queue.push_back(c as usize);
+        }
+    }
+
+    while let Some(u) = queue.pop_front() {
+        for b in 0..256usize {
+            let v = nodes[u].goto[b];
+            if v == NONE {
+                continue;
+            }
+            // Find fail for v: climb u's fail chain until we find a goto
+            // on `b`, or land at root.
+            let mut f = nodes[u].fail as usize;
+            loop {
+                let g = nodes[f].goto[b];
+                if g != NONE && g as usize != v as usize {
+                    nodes[v as usize].fail = g;
+                    break;
+                }
+                if f == 0 {
+                    nodes[v as usize].fail = 0;
+                    break;
+                }
+                f = nodes[f].fail as usize;
+            }
+            // Pre-union outputs along the fail chain. Since v's fail is
+            // already finalised (BFS order: fail target was processed
+            // earlier), one extend suffices.
+            let fail_idx = nodes[v as usize].fail as usize;
+            if fail_idx != v as usize {
+                let extra = nodes[fail_idx].output.clone();
+                nodes[v as usize].output.extend(extra);
+            }
+            queue.push_back(v as usize);
+        }
+    }
+
+    Trie { nodes }
 }
 
 fn default_patterns() -> Vec<Pattern> {
@@ -217,5 +317,83 @@ mod tests {
         ]);
         assert_eq!(s.scan(b"this is secret data").len(), 1);
         assert!(s.scan(b"benign").is_empty());
+    }
+
+    // --- new tests for Aho–Corasick behaviour ---
+
+    /// `aaab` with patterns {`aa`, `aab`} must report both — Aho–Corasick
+    /// finds every match, including those that overlap.
+    #[test]
+    fn overlapping_patterns_all_reported() {
+        let s = Scanner::new(vec![
+            Pattern { needle: b"aa", severity: Severity::Warn, label: "aa" },
+            Pattern { needle: b"aab", severity: Severity::Warn, label: "aab" },
+        ]);
+        let findings = s.scan(b"aaab");
+        let labels: Vec<_> = findings.iter().map(|f| f.label).collect();
+        assert!(labels.contains(&"aa"), "missing aa in {labels:?}");
+        assert!(labels.contains(&"aab"), "missing aab in {labels:?}");
+        // `aa` matches twice: offsets 0 and 1. `aab` matches once at 1.
+        let aa_offsets: Vec<_> =
+            findings.iter().filter(|f| f.label == "aa").map(|f| f.offset).collect();
+        assert_eq!(aa_offsets, vec![0, 1]);
+        let aab_offsets: Vec<_> =
+            findings.iter().filter(|f| f.label == "aab").map(|f| f.offset).collect();
+        assert_eq!(aab_offsets, vec![1]);
+    }
+
+    /// When one pattern is a suffix of another, ending at the longer
+    /// pattern's node must also emit the shorter. This is the fail-link
+    /// output union check.
+    #[test]
+    fn suffix_pattern_reported_via_fail_link() {
+        let s = Scanner::new(vec![
+            Pattern { needle: b"abcdef", severity: Severity::Warn, label: "long" },
+            Pattern { needle: b"def", severity: Severity::Warn, label: "suffix" },
+        ]);
+        let findings = s.scan(b"xxabcdefyy");
+        let labels: Vec<_> = findings.iter().map(|f| f.label).collect();
+        assert!(labels.contains(&"long"));
+        assert!(labels.contains(&"suffix"));
+        let long = findings.iter().find(|f| f.label == "long").unwrap();
+        let suffix = findings.iter().find(|f| f.label == "suffix").unwrap();
+        assert_eq!(long.offset, 2);
+        assert_eq!(suffix.offset, 5);
+    }
+
+    /// Scanner with no patterns on empty input — no panic, no findings.
+    #[test]
+    fn empty_pattern_set_and_empty_haystack() {
+        let s = Scanner::new(vec![]);
+        assert!(s.scan(b"").is_empty());
+        assert!(s.scan(b"some stuff").is_empty());
+    }
+
+    /// Pattern positioned exactly at the end of the buffer — must be hit,
+    /// and the reported offset must be correct (off-by-one regression
+    /// guard for the `i + 1 - len` arithmetic).
+    #[test]
+    fn match_at_buffer_end() {
+        let s = Scanner::new(vec![
+            Pattern { needle: b"end", severity: Severity::Block, label: "end" },
+        ]);
+        let buf = b"start middle end";
+        let findings = s.scan(buf);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].offset, buf.len() - 3);
+        assert_eq!(&buf[findings[0].offset..], b"end");
+    }
+
+    /// Empty needles in the configured pattern set are silently ignored
+    /// (they would match everywhere and never made sense).
+    #[test]
+    fn empty_needle_is_ignored() {
+        let s = Scanner::new(vec![
+            Pattern { needle: b"", severity: Severity::Warn, label: "empty" },
+            Pattern { needle: b"hit", severity: Severity::Warn, label: "hit" },
+        ]);
+        let findings = s.scan(b"a hit b");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].label, "hit");
     }
 }

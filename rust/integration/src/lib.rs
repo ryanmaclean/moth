@@ -631,3 +631,117 @@ fn unknown_tool_name_returns_tool_error_block() {
     drop(seen);
     rig.finish();
 }
+
+// ----- gated real-network E2E tests --------------------------------------
+//
+// These are `#[ignore]` so `cargo test -p integration` doesn't hit the
+// network. Run with `cargo test -p integration -- --ignored` and the
+// relevant env var set. If the env var is missing the test exits cleanly
+// (no-op skip) so the suite stays green when only some keys are set.
+
+#[test]
+#[ignore = "requires ANTHROPIC_API_KEY and network access"]
+fn anthropic_real_network_roundtrip() {
+    let Ok(key) = std::env::var("ANTHROPIC_API_KEY") else {
+        eprintln!("ANTHROPIC_API_KEY not set; skipping");
+        return;
+    };
+    let model = std::env::var("ANTHROPIC_MODEL")
+        .unwrap_or_else(|_| "claude-haiku-4-5".into());
+
+    let client = anthropic::Client::new(key);
+    let req = anthropic::Request {
+        model,
+        max_tokens: 64,
+        messages: vec![anthropic::Message::user_text(
+            "Reply with exactly the single word PONG and nothing else.",
+        )],
+        system: None,
+        tools: Vec::new(),
+    };
+
+    let mut text = String::new();
+    let mut stop_seen = false;
+    for ev in client.stream(req).expect("stream open") {
+        match ev.expect("event") {
+            anthropic::Event::TextDelta(s) => text.push_str(&s),
+            anthropic::Event::MessageDelta { stop_reason: _ } => stop_seen = true,
+            _ => {}
+        }
+    }
+    assert!(stop_seen, "stream never emitted a stop event");
+    assert!(!text.is_empty(), "stream returned no text");
+    eprintln!("anthropic responded: {text:?}");
+}
+
+#[test]
+#[ignore = "requires OPENAI_API_KEY (and optional OPENAI_BASE_URL) and network access"]
+fn openai_compatible_real_network_roundtrip() {
+    let Ok(key) = std::env::var("OPENAI_API_KEY") else {
+        eprintln!("OPENAI_API_KEY not set; skipping");
+        return;
+    };
+    let model_name = std::env::var("OPENAI_MODEL")
+        .unwrap_or_else(|_| "gpt-4o-mini".into());
+
+    let mut client = openai::Client::new(key);
+    if let Ok(base) = std::env::var("OPENAI_BASE_URL") {
+        client = client.with_base_url(base);
+    }
+
+    let req = openai::Request {
+        model: model_name,
+        max_tokens: 64,
+        messages: vec![openai::Message::user_text(
+            "Reply with exactly the single word PONG and nothing else.",
+        )],
+        system: None,
+        tools: Vec::new(),
+    };
+
+    let mut text = String::new();
+    let mut stop_seen = false;
+    for ev in client.stream(req).expect("stream open") {
+        match ev.expect("event") {
+            openai::Event::TextDelta(s) => text.push_str(&s),
+            openai::Event::Stop { reason: _ } => stop_seen = true,
+            _ => {}
+        }
+    }
+    assert!(stop_seen, "stream never emitted a stop event");
+    assert!(!text.is_empty(), "stream returned no text");
+    eprintln!("openai responded: {text:?}");
+}
+
+#[test]
+#[ignore = "requires ANTHROPIC_API_KEY and network; drives the full harness"]
+fn anthropic_through_harness_roundtrip() {
+    let Ok(key) = std::env::var("ANTHROPIC_API_KEY") else {
+        eprintln!("ANTHROPIC_API_KEY not set; skipping");
+        return;
+    };
+    let model_name = std::env::var("ANTHROPIC_MODEL")
+        .unwrap_or_else(|_| "claude-haiku-4-5".into());
+
+    let model: Arc<dyn harness::Model> =
+        Arc::new(harness::AnthropicModel::new(key, model_name));
+    let sandbox: Box<dyn Sandbox> = Box::new(harness::AuditedShell::new(vshell::VShell::new()));
+    let inst = spawn(harness::Instance::new("e2e", sandbox));
+    let state = harness::HarnessState::new("e2e", model, inst.addr.clone());
+    let sess = spawn(Session::new("e2e", Arc::new(state)));
+
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    sess.addr
+        .send(SessionMsg::Prompt {
+            text: "Reply with exactly the single word PONG and nothing else.".into(),
+            structured_output_tag: None,
+            reply: tx,
+        })
+        .unwrap();
+    let result = rx.recv().expect("recv").expect("ok");
+    assert!(!result.text.is_empty(), "harness returned no text");
+    eprintln!("harness responded: {:?} ({} turn(s))", result.text, result.turns);
+
+    sess.join().unwrap();
+    inst.join().unwrap();
+}
