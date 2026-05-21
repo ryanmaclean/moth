@@ -13,6 +13,7 @@ path = "src/main.rs"
 actor = { path = "../actor" }
 anthropic = { path = "../anthropic" }
 fstools = { path = "../fstools" }
+git = { path = "../git" }
 harness = { path = "../harness" }
 mcp = { path = "../mcp" }
 persist = { path = "../persist" }

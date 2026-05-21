@@ -73,6 +73,11 @@ impl Tool for ReadTool {
                 "refusing to follow symlink: {path}"
             )));
         }
+        if sandboxed && hard_linked(&meta) {
+            return Err(ToolError(format!(
+                "refusing hard-linked file (st_nlink > 1): {path}"
+            )));
+        }
         // When sandboxed `resolve_existing` already vetted every
         // component, including the leaf, so by here the file cannot be
         // a symlink. The check above is belt-and-braces against a TOCTOU
@@ -129,11 +134,19 @@ impl Tool for WriteTool {
             // Refuse to write through a pre-existing symlink at the
             // leaf. `symlink_metadata` does not follow symlinks, so a
             // planted `<root>/innocent -> /etc/passwd` is detected
-            // here.
+            // here. Also refuse if the leaf has hard-link count > 1
+            // — best-effort hard-link defence; doesn't catch every
+            // case (an inode could acquire a second link between this
+            // check and the write) but defeats the obvious vector.
             match std::fs::symlink_metadata(&full) {
                 Ok(meta) if meta.file_type().is_symlink() => {
                     return Err(ToolError(format!(
                         "refusing to write through symlink: {path}"
+                    )));
+                }
+                Ok(meta) if hard_linked(&meta) => {
+                    return Err(ToolError(format!(
+                        "refusing to write through hard-linked file (st_nlink > 1): {path}"
                     )));
                 }
                 Ok(_) | Err(_) => {}
@@ -170,6 +183,11 @@ impl Tool for EditTool {
             if meta.file_type().is_symlink() {
                 return Err(ToolError(format!(
                     "refusing to edit through symlink: {path}"
+                )));
+            }
+            if hard_linked(&meta) {
+                return Err(ToolError(format!(
+                    "refusing to edit hard-linked file (st_nlink > 1): {path}"
                 )));
             }
         }
@@ -223,6 +241,23 @@ fn optional_usize(v: &Json, key: &str) -> Result<Option<usize>, ToolError> {
 
 fn io_err(e: std::io::Error) -> ToolError {
     ToolError(e.to_string())
+}
+
+/// Best-effort hard-link detection. A file with `nlink > 1` has another
+/// directory entry somewhere — possibly outside our sandbox root — and
+/// modifying it modifies the linked content as well. Path-level resolution
+/// can't catch this because hard links share the same inode without
+/// crossing any symlink boundary. Returns false on non-Unix where nlink
+/// isn't available through std (we don't bring in `libc` just for this).
+#[cfg(unix)]
+fn hard_linked(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    meta.is_file() && meta.nlink() > 1
+}
+
+#[cfg(not(unix))]
+fn hard_linked(_meta: &std::fs::Metadata) -> bool {
+    false
 }
 
 /// Split a relative path into its `Normal` components, rejecting any
@@ -1076,6 +1111,92 @@ mod tests {
                 std::fs::read_to_string(root.join("f.txt")).unwrap(),
                 "hello there\n"
             );
+            cleanup(&parent);
+        }
+
+        #[test]
+        fn read_refuses_hard_linked_file() {
+            let parent = unique("hl-read");
+            std::fs::create_dir_all(&parent).unwrap();
+            let root = parent.join("root");
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join("a.txt"), b"shared content").unwrap();
+            std::fs::hard_link(root.join("a.txt"), root.join("b.txt")).unwrap();
+            let h = Harness::new();
+            let ctx = ToolCtx { instance: h.addr() };
+            let err = ReadTool { root: Some(root.clone()) }
+                .call(r#"{"path":"a.txt"}"#, &ctx)
+                .unwrap_err();
+            assert!(
+                err.0.contains("hard-linked"),
+                "expected hard-link refusal, got: {}",
+                err.0
+            );
+            cleanup(&parent);
+        }
+
+        #[test]
+        fn write_refuses_hard_linked_file() {
+            let parent = unique("hl-write");
+            std::fs::create_dir_all(&parent).unwrap();
+            let root = parent.join("root");
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join("a.txt"), b"original").unwrap();
+            std::fs::hard_link(root.join("a.txt"), root.join("b.txt")).unwrap();
+            let h = Harness::new();
+            let ctx = ToolCtx { instance: h.addr() };
+            let err = WriteTool { root: Some(root.clone()) }
+                .call(
+                    r#"{"path":"a.txt","content":"replacement"}"#,
+                    &ctx,
+                )
+                .unwrap_err();
+            assert!(err.0.contains("hard-linked"), "got: {}", err.0);
+            // Confirm neither name was overwritten.
+            assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "original");
+            cleanup(&parent);
+        }
+
+        #[test]
+        fn edit_refuses_hard_linked_file() {
+            let parent = unique("hl-edit");
+            std::fs::create_dir_all(&parent).unwrap();
+            let root = parent.join("root");
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join("a.txt"), b"hello world").unwrap();
+            std::fs::hard_link(root.join("a.txt"), root.join("b.txt")).unwrap();
+            let h = Harness::new();
+            let ctx = ToolCtx { instance: h.addr() };
+            let err = EditTool { root: Some(root.clone()) }
+                .call(
+                    r#"{"path":"a.txt","old_text":"world","new_text":"there"}"#,
+                    &ctx,
+                )
+                .unwrap_err();
+            assert!(err.0.contains("hard-linked"), "got: {}", err.0);
+            cleanup(&parent);
+        }
+
+        #[test]
+        fn rootless_hard_link_follows() {
+            // Without a configured root, no sandboxing — hard links are
+            // legitimate. Read should succeed.
+            let parent = unique("hl-rootless");
+            std::fs::create_dir_all(&parent).unwrap();
+            std::fs::write(parent.join("a.txt"), b"shared content").unwrap();
+            std::fs::hard_link(parent.join("a.txt"), parent.join("b.txt")).unwrap();
+            let h = Harness::new();
+            let ctx = ToolCtx { instance: h.addr() };
+            let out = ReadTool { root: None }
+                .call(
+                    &format!(
+                        r#"{{"path":"{}"}}"#,
+                        parent.join("a.txt").to_string_lossy()
+                    ),
+                    &ctx,
+                )
+                .unwrap();
+            assert!(out.contains("shared content"));
             cleanup(&parent);
         }
     }

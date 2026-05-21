@@ -8,12 +8,12 @@ into a build with a small dependency footprint.
 
 ## Status
 
-Coding-agent grade. 15 crates, 375 inline tests across the workspace;
+Coding-agent grade. 18 crates, 456 inline tests across the workspace;
 one direct external dependency (`curl-sys`), all transitive deps fully
-vendored. HTTP server hardened (timeouts, connection cap, keep-alive),
-sessions persist across requests, MCP-pluggable (stdio + HTTP),
-fstools symlink-safe, git branch strategies for safe code edits,
-cross-crate integration suite covering whole-stack scenarios.
+vendored. HTTP server hardened, sessions persist, MCP-pluggable (stdio
++ HTTP), fstools symlink + hard-link safe, git + jj branch strategies,
+Gitea forge client, multi-node `cluster::RemoteActorRef`, microbench
+suite with measured numbers, cross-crate integration suite.
 
 ## Layout
 
@@ -31,6 +31,10 @@ cross-crate integration suite covering whole-stack scenarios.
 | `mcp/` | Model Context Protocol client (stdio + streamable-HTTP transports). Each remote tool implements `harness::Tool`. Session-id propagation, SSE response framing via `wire`, bearer auth. | `harness`, `wire`, `anthropic`, `curl-sys` |
 | `git/` | Branch strategies for code-editing agents: `HeadStrategy` (works in repo_root, refuses dirty tree), `MergeToHeadStrategy` (temp worktree + merge back on success, leave on failure), `Branch{name}` (named persistent branch). Shells out to `git(1)`. | — |
 | `integration/` | Cross-crate scenario tests. 12 whole-stack tests covering tool routing, audit blocking, fstools sandboxing, session persistence, MCP wiring, completion signal, turn cap, structured output extraction. | every crate it tests |
+| `jj/` | Jujutsu (jj) branch strategies implementing `git::BranchStrategy`. Workspace + bookmark mapping. Tests skip cleanly if `jj` isn't installed. | `git` |
+| `gitea/` | Minimal Gitea REST API client (PATs via `Authorization: token`, `/api/v1/...`). Issues, comments, PRs. Works with Forgejo, Codeberg. | `wire`, `anthropic`, `curl-sys` |
+| `cluster/` | Multi-node `RemoteActorRef<M: Codec>` over TCP. Length-prefixed frames, per-node registry, fire-and-forget delivery, cached connections with re-dial on failure. | `actor`, `wire`, `anthropic` |
+| `benches/` | Microbenchmarks for the SIMD/parsing hot paths. `std::time::Instant`-based, no criterion. `cargo test -p benches --release -- --nocapture`. | `wire`, `audit`, `anthropic`, `vshell` |
 | `persist/` | File-backed `SessionStore`. Atomic writes via tmp + rename. Version-tagged JSON; key validation rejects path-traversal. | `harness`, `anthropic` |
 | `harness/` | Instance + Session actors. `Model` / `Sandbox` / `Tool` / `SessionStore` traits. `AnthropicModel`, `OpenAiModel`, `AuditedShell<S>`, `BashTool`. Iteration loop with tool-use, completion signal, structured output, 16-turn cap, optional persistence hook. | `actor`, `wire`, `anthropic`, `openai`, `audit`, `vshell` |
 | `cli/` | `agent run` / `agent serve` binary. Wires every other crate. | all of the above |
@@ -76,14 +80,28 @@ cargo run --bin agent -- run --mcp 'npx -y @modelcontextprotocol/server-filesyst
 cargo run --bin agent -- serve --addr 0.0.0.0:3583 --sessions ./.sessions
 ```
 
+## Measured numbers
+
+From `cargo test -p benches --release -- --nocapture` on x86_64 + AVX2:
+
+```
+wire::scan_for_byte 4 KiB (absent):       63 ns/op   64.7 GB/s
+wire::scan_for_byte 64 KiB (absent):     982 ns/op   66.7 GB/s
+wire::scan_for_pair 4 KiB (absent):      150 ns/op   27.2 GB/s
+wire::find_tag 4 KiB (tag at end):       104 ns/op   39.0 GB/s
+audit::Scanner::scan benign:             133 ns/op
+audit::Scanner::scan malicious:          448 ns/op
+anthropic::json::parse SSE event:        835 ns/op
+vshell::execute("echo $X"):              566 ns/op
+```
+
+SIMD byte scan saturates L1 bandwidth (~65 GB/s).
+
 ## What's left
 
-- Multi-node `ActorRef` (location-transparent addressing across nodes).
-- Hard-link safety inside `fstools` (path-level defence only — a hard
-  link to an outside-root inode isn't distinguishable by path).
 - Real-network E2E test (would require an `ANTHROPIC_API_KEY` and is
   sandbox-policy-sensitive).
-- CLI integration with the `git` crate (the strategies exist but the
-  `agent run` binary doesn't yet take a `--branch-strategy` flag).
-- Benchmarks (we have 375 tests but zero perf measurements — the SIMD
-  paths are functionally correct but unmeasured).
+- GitHub forge client (parallel to `gitea` — different auth scheme,
+  same shape).
+- Aho–Corasick for `audit` (per-pattern cost dominates the 1 KiB-no-hit
+  case at ~5.5 µs; multi-pattern scan would cut that ~5×).

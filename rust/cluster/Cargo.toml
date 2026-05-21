@@ -1,0 +1,14 @@
+[package]
+name = "cluster"
+version = "0.0.1"
+edition = "2024"
+publish = false
+description = "Multi-node ActorRef: TCP-backed remote message passing on top of the actor crate."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+actor = { path = "../actor" }
+wire = { path = "../wire" }
+anthropic = { path = "../anthropic" }

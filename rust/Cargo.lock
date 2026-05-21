@@ -22,6 +22,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "benches"
+version = "0.0.1"
+dependencies = [
+ "anthropic",
+ "audit",
+ "vshell",
+ "wire",
+]
+
+[[package]]
 name = "cc"
 version = "1.2.62"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -38,12 +48,22 @@ dependencies = [
  "actor",
  "anthropic",
  "fstools",
+ "git",
  "harness",
  "mcp",
  "persist",
  "server",
  "tmpl",
  "vshell",
+]
+
+[[package]]
+name = "cluster"
+version = "0.0.1"
+dependencies = [
+ "actor",
+ "anthropic",
+ "wire",
 ]
 
 [[package]]
@@ -81,6 +101,14 @@ name = "git"
 version = "0.0.1"
 
 [[package]]
+name = "gitea"
+version = "0.0.1"
+dependencies = [
+ "anthropic",
+ "curl-sys",
+]
+
+[[package]]
 name = "harness"
 version = "0.0.1"
 dependencies = [
@@ -105,6 +133,13 @@ dependencies = [
  "tmpl",
  "vshell",
  "wire",
+]
+
+[[package]]
+name = "jj"
+version = "0.0.1"
+dependencies = [
+ "git",
 ]
 
 [[package]]

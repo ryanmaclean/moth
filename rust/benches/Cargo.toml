@@ -1,0 +1,15 @@
+[package]
+name = "benches"
+version = "0.0.1"
+edition = "2024"
+publish = false
+description = "Microbenchmarks for wire / audit / anthropic JSON / vshell hot paths. std::time::Instant only."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+wire = { path = "../wire" }
+audit = { path = "../audit" }
+anthropic = { path = "../anthropic" }
+vshell = { path = "../vshell" }

@@ -26,6 +26,7 @@ use std::sync::Arc;
 use std::sync::mpsc::sync_channel;
 
 use actor::spawn;
+use git::{AgentStatus, Branch, BranchStrategy, HeadStrategy, MergeToHeadStrategy};
 use harness::{
     AnthropicModel, AuditedShell, BashTool, HarnessState, Instance, Model, OpenAiModel,
     Sandbox, Session, SessionMsg, SessionStore, Tool,
@@ -62,6 +63,7 @@ fn usage_and_exit(code: u8) -> ExitCode {
         --arg KEY=VAL                substitute {{KEY}} in the skill (repeatable)\n  \
         --sessions DIR               persist message history to DIR (or SESSIONS_DIR env)\n  \
         --mcp 'CMD ARGS'             spawn MCP server, register its tools (repeatable)\n  \
+        --branch-strategy STRATEGY   [run] head | merge-to-head | branch:NAME\n  \
         --addr HOST:PORT             [serve] bind address (default 0.0.0.0:3583)";
     eprintln!("{m}");
     ExitCode::from(code)
@@ -177,6 +179,7 @@ fn run_cmd(mut args: Vec<String>) -> ExitCode {
 
     let mut skill_name: Option<String> = None;
     let mut skill_args: HashMap<String, String> = HashMap::new();
+    let mut strategy_spec: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -198,9 +201,23 @@ fn run_cmd(mut args: Vec<String>) -> ExitCode {
                     }
                 }
             }
+            "--branch-strategy" => {
+                args.remove(i);
+                if i < args.len() {
+                    strategy_spec = Some(args.remove(i));
+                }
+            }
             _ => i += 1,
         }
     }
+
+    let strategy = match parse_strategy(strategy_spec.as_deref()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(2);
+        }
+    };
 
     let model = match build_model(&common) {
         Ok(m) => m,
@@ -239,7 +256,37 @@ fn run_cmd(mut args: Vec<String>) -> ExitCode {
         }
     };
 
-    let mut tools = default_tools(None);
+    // If a branch strategy was given, prepare the workspace and constrain
+    // fstools + vshell to it. Caller's cwd is moved to the workspace path
+    // for the duration of the run.
+    let (workspace, strategy) = match strategy {
+        Some(s) => {
+            let repo_root = match std::env::current_dir() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("cwd: {e}");
+                    return ExitCode::from(1);
+                }
+            };
+            match s.prepare(&repo_root) {
+                Ok(ws) => {
+                    if let Err(e) = std::env::set_current_dir(&ws.path) {
+                        eprintln!("cd {ws_path:?}: {e}", ws_path = ws.path);
+                        return ExitCode::from(1);
+                    }
+                    (Some(ws), Some(s))
+                }
+                Err(e) => {
+                    eprintln!("branch strategy prepare: {e:?}");
+                    return ExitCode::from(1);
+                }
+            }
+        }
+        None => (None, None),
+    };
+
+    let fstools_root = workspace.as_ref().map(|w| w.path.clone());
+    let mut tools = default_tools(fstools_root);
     tools.extend(mcp_tools);
 
     let sandbox: Box<dyn Sandbox> = Box::new(AuditedShell::new(vshell::VShell::new()));
@@ -259,10 +306,13 @@ fn run_cmd(mut args: Vec<String>) -> ExitCode {
     }) {
         eprintln!("send failed: {e}");
         drop(mcp_clients);
+        if let (Some(s), Some(ws)) = (strategy, workspace) {
+            let _ = s.finish(ws, AgentStatus::Failure(e.to_string()));
+        }
         return ExitCode::from(1);
     }
 
-    let exit = match rx.recv() {
+    let (exit, agent_status) = match rx.recv() {
         Ok(Ok(pr)) => {
             print!("{}", pr.text);
             if !pr.text.ends_with('\n') {
@@ -273,22 +323,48 @@ fn run_cmd(mut args: Vec<String>) -> ExitCode {
             } else if pr.turns > 1 {
                 eprintln!("[{} turn(s)]", pr.turns);
             }
-            ExitCode::SUCCESS
+            (ExitCode::SUCCESS, AgentStatus::Success)
         }
         Ok(Err(e)) => {
             eprintln!("session error: {e:?}");
-            ExitCode::from(1)
+            (ExitCode::from(1), AgentStatus::Failure(format!("{e:?}")))
         }
         Err(_) => {
             eprintln!("session dropped reply channel");
-            ExitCode::from(1)
+            (
+                ExitCode::from(1),
+                AgentStatus::Failure("session dropped reply channel".into()),
+            )
         }
     };
 
     let _ = sess.join();
     let _ = inst.join();
     drop(mcp_clients);
+    if let (Some(s), Some(ws)) = (strategy, workspace)
+        && let Err(e) = s.finish(ws, agent_status)
+    {
+        eprintln!("branch strategy finish: {e:?}");
+    }
     exit
+}
+
+fn parse_strategy(spec: Option<&str>) -> Result<Option<Box<dyn BranchStrategy>>, String> {
+    let Some(s) = spec else { return Ok(None) };
+    match s {
+        "head" => Ok(Some(Box::new(HeadStrategy))),
+        "merge-to-head" => Ok(Some(Box::new(MergeToHeadStrategy))),
+        other if other.starts_with("branch:") => {
+            let name = other[7..].trim();
+            if name.is_empty() {
+                return Err("--branch-strategy branch:<name> requires a name".into());
+            }
+            Ok(Some(Box::new(Branch { name: name.to_string() })))
+        }
+        other => Err(format!(
+            "unknown --branch-strategy '{other}' (try: head | merge-to-head | branch:NAME)"
+        )),
+    }
 }
 
 fn render_skill(name: &str, args: &HashMap<String, String>) -> Result<String, String> {
