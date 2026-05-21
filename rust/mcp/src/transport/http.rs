@@ -456,7 +456,6 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
     use std::sync::Arc;
     use std::sync::Mutex as StdMutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
 
     use crate::McpClient;
@@ -525,35 +524,44 @@ mod tests {
         addr: String,
         captured: Arc<StdMutex<Vec<Captured>>>,
         _handle: thread::JoinHandle<()>,
+        running: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Drop for Mock {
+        fn drop(&mut self) {
+            self.running.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 
     fn start_mock(replies: Vec<Reply>) -> Mock {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+
         let captured = Arc::new(StdMutex::new(Vec::<Captured>::new()));
         let cap_clone = Arc::clone(&captured);
         let total = replies.len();
-        let idx = Arc::new(AtomicUsize::new(0));
         let replies = Arc::new(replies);
+        let running = Arc::new(AtomicBool::new(true));
+        let running_clone = Arc::clone(&running);
 
         let handle = thread::spawn(move || {
-            for stream in listener.incoming() {
-                let stream = match stream {
-                    Ok(s) => s,
+            let mut idx = 0usize;
+            while running_clone.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        if idx < total {
+                            let reply = replies[idx].clone();
+                            idx += 1;
+                            handle_one(stream, &reply, &cap_clone);
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(std::time::Duration::from_millis(1));
+                    }
                     Err(_) => break,
-                };
-                let i = idx.fetch_add(1, Ordering::SeqCst);
-                if i >= total {
-                    // Out of script — drop the connection.
-                    break;
-                }
-                let reply = replies[i].clone();
-                let cap = handle_one(stream, &reply);
-                if let Some(c) = cap {
-                    cap_clone.lock().unwrap().push(c);
-                }
-                if i + 1 >= total {
-                    break;
                 }
             }
         });
@@ -562,19 +570,31 @@ mod tests {
             addr: format!("http://{addr}/mcp"),
             captured,
             _handle: handle,
+            running,
         }
     }
 
-    fn handle_one(mut stream: TcpStream, reply: &Reply) -> Option<Captured> {
-        let mut reader = BufReader::new(stream.try_clone().ok()?);
+    fn handle_one(
+        mut stream: TcpStream,
+        reply: &Reply,
+        captured_sink: &Arc<StdMutex<Vec<Captured>>>,
+    ) {
+        let mut reader = match stream.try_clone() {
+            Ok(s) => BufReader::new(s),
+            Err(_) => return,
+        };
         let mut request_line = String::new();
-        reader.read_line(&mut request_line).ok()?;
+        if reader.read_line(&mut request_line).is_err() {
+            return;
+        }
 
         let mut captured = Captured::default();
         let mut content_length: usize = 0;
         loop {
             let mut line = String::new();
-            reader.read_line(&mut line).ok()?;
+            if reader.read_line(&mut line).is_err() {
+                return;
+            }
             if line == "\r\n" || line == "\n" || line.is_empty() {
                 break;
             }
@@ -594,10 +614,14 @@ mod tests {
         }
 
         let mut body = vec![0u8; content_length];
-        if content_length > 0 {
-            reader.read_exact(&mut body).ok()?;
+        if content_length > 0 && reader.read_exact(&mut body).is_err() {
+            return;
         }
         captured.body = body;
+
+        // Record BEFORE responding so the test thread can't read an empty
+        // captured Vec between perform completing and the mock loop pushing.
+        captured_sink.lock().unwrap().push(captured);
 
         let mut resp = format!(
             "HTTP/1.1 {} {}\r\n",
@@ -609,11 +633,9 @@ mod tests {
             resp.push_str(&format!("mcp-session-id: {sid}\r\n"));
         }
         resp.push_str("connection: close\r\n\r\n");
-        stream.write_all(resp.as_bytes()).ok()?;
-        stream.write_all(&reply.body).ok()?;
-        stream.flush().ok()?;
-
-        Some(captured)
+        let _ = stream.write_all(resp.as_bytes());
+        let _ = stream.write_all(&reply.body);
+        let _ = stream.flush();
     }
 
     fn init_reply(id: u64) -> Vec<u8> {
