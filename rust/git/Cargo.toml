@@ -1,0 +1,9 @@
+[package]
+name = "git"
+version = "0.0.1"
+edition = "2024"
+publish = false
+description = "Branch strategies for an agent editing a repo: head / merge-to-head / branch. Shells out to git(1). Zero deps."
+
+[lib]
+path = "src/lib.rs"
