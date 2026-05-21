@@ -168,27 +168,26 @@ fn build_trie(patterns: &[Pattern]) -> Trie {
             if v == NONE {
                 continue;
             }
-            // Find fail for v: climb u's fail chain until we find a goto
-            // on `b`, or land at root.
+            // fail(v) = δ(fail(u), b): climb u's fail chain until we find
+            // a node with a goto on `b`. Root acts as the sink — if root
+            // has no child via `b`, fail(v) = 0.
             let mut f = nodes[u].fail as usize;
-            loop {
+            let fail_v = loop {
                 let g = nodes[f].goto[b];
-                if g != NONE && g as usize != v as usize {
-                    nodes[v as usize].fail = g;
-                    break;
+                if g != NONE {
+                    break g as usize;
                 }
                 if f == 0 {
-                    nodes[v as usize].fail = 0;
-                    break;
+                    break 0;
                 }
                 f = nodes[f].fail as usize;
-            }
-            // Pre-union outputs along the fail chain. Since v's fail is
-            // already finalised (BFS order: fail target was processed
-            // earlier), one extend suffices.
-            let fail_idx = nodes[v as usize].fail as usize;
-            if fail_idx != v as usize {
-                let extra = nodes[fail_idx].output.clone();
+            };
+            nodes[v as usize].fail = fail_v as u32;
+            // Pre-union outputs along the fail chain. fail_v was queued
+            // earlier in BFS order, so its output already contains every
+            // suffix match transitively.
+            if fail_v != v as usize {
+                let extra = nodes[fail_v].output.clone();
                 nodes[v as usize].output.extend(extra);
             }
             queue.push_back(v as usize);

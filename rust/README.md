@@ -85,17 +85,20 @@ cargo run --bin agent -- serve --addr 0.0.0.0:3583 --sessions ./.sessions
 From `cargo test -p benches --release -- --nocapture` on x86_64 + AVX2:
 
 ```
-wire::scan_for_byte 4 KiB (absent):       63 ns/op   64.7 GB/s
-wire::scan_for_byte 64 KiB (absent):     982 ns/op   66.7 GB/s
-wire::scan_for_pair 4 KiB (absent):      150 ns/op   27.2 GB/s
-wire::find_tag 4 KiB (tag at end):       104 ns/op   39.0 GB/s
-audit::Scanner::scan benign:             133 ns/op
-audit::Scanner::scan malicious:          448 ns/op
+wire::scan_for_byte 4 KiB (absent):       59 ns/op   68.9 GB/s
+wire::scan_for_byte 64 KiB (absent):    1032 ns/op   63.5 GB/s
+wire::scan_for_pair 4 KiB (absent):      146 ns/op   28.0 GB/s
+wire::find_tag 4 KiB (tag at end):       100 ns/op   40.7 GB/s
+audit::Scanner::scan benign:              25 ns/op  (was 133 — Aho-Corasick win)
+audit::Scanner::scan malicious:           94 ns/op  (was 448)
+audit::Scanner::scan 1 KiB no patterns: 2359 ns/op  (was 5501)
 anthropic::json::parse SSE event:        835 ns/op
 vshell::execute("echo $X"):              566 ns/op
 ```
 
-SIMD byte scan saturates L1 bandwidth (~65 GB/s).
+SIMD byte scan saturates L1 bandwidth (~65 GB/s). Audit replaced its
+per-pattern scan with a flat Aho-Corasick automaton; one walk now
+finds every match regardless of pattern count.
 
 ## What's left
 
