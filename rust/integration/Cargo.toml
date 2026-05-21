@@ -1,0 +1,20 @@
+[package]
+name = "integration"
+version = "0.0.1"
+edition = "2024"
+publish = false
+description = "Cross-crate integration tests. Wires real vshell + fstools + audit + persist + mcp through the harness with scripted MockModel."
+
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+actor = { path = "../actor" }
+audit = { path = "../audit" }
+fstools = { path = "../fstools" }
+harness = { path = "../harness" }
+mcp = { path = "../mcp" }
+persist = { path = "../persist" }
+tmpl = { path = "../tmpl" }
+vshell = { path = "../vshell" }
+wire = { path = "../wire" }

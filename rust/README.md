@@ -8,10 +8,12 @@ into a build with a small dependency footprint.
 
 ## Status
 
-Production-shippable v1. 13 crates, 320 inline tests across the workspace;
+Coding-agent grade. 15 crates, 375 inline tests across the workspace;
 one direct external dependency (`curl-sys`), all transitive deps fully
 vendored. HTTP server hardened (timeouts, connection cap, keep-alive),
-sessions persist across requests, MCP-pluggable, fstools symlink-safe.
+sessions persist across requests, MCP-pluggable (stdio + HTTP),
+fstools symlink-safe, git branch strategies for safe code edits,
+cross-crate integration suite covering whole-stack scenarios.
 
 ## Layout
 
@@ -26,7 +28,9 @@ sessions persist across requests, MCP-pluggable, fstools symlink-safe.
 | `fstools/` | `read_file` / `write_file` / `edit_file` tools. Per-component canonicalisation + leaf `symlink_metadata` check makes them symlink-safe when a `root` is set. | `harness`, `anthropic` |
 | `tmpl/` | `{{KEY}}` substitution + `.agents/skills/<name>.md` + `.agents/roles/<name>.md` markdown loading. | `wire` |
 | `server/` | Hand-rolled HTTP/1.1 + SSE. Read/write timeouts, configurable connection cap (atomic counter), HTTP/1.1 keep-alive on non-streaming responses. | — |
-| `mcp/` | Model Context Protocol client (stdio transport). Each remote tool implements `harness::Tool`. | `harness`, `wire`, `anthropic` |
+| `mcp/` | Model Context Protocol client (stdio + streamable-HTTP transports). Each remote tool implements `harness::Tool`. Session-id propagation, SSE response framing via `wire`, bearer auth. | `harness`, `wire`, `anthropic`, `curl-sys` |
+| `git/` | Branch strategies for code-editing agents: `HeadStrategy` (works in repo_root, refuses dirty tree), `MergeToHeadStrategy` (temp worktree + merge back on success, leave on failure), `Branch{name}` (named persistent branch). Shells out to `git(1)`. | — |
+| `integration/` | Cross-crate scenario tests. 12 whole-stack tests covering tool routing, audit blocking, fstools sandboxing, session persistence, MCP wiring, completion signal, turn cap, structured output extraction. | every crate it tests |
 | `persist/` | File-backed `SessionStore`. Atomic writes via tmp + rename. Version-tagged JSON; key validation rejects path-traversal. | `harness`, `anthropic` |
 | `harness/` | Instance + Session actors. `Model` / `Sandbox` / `Tool` / `SessionStore` traits. `AnthropicModel`, `OpenAiModel`, `AuditedShell<S>`, `BashTool`. Iteration loop with tool-use, completion signal, structured output, 16-turn cap, optional persistence hook. | `actor`, `wire`, `anthropic`, `openai`, `audit`, `vshell` |
 | `cli/` | `agent run` / `agent serve` binary. Wires every other crate. | all of the above |
@@ -74,11 +78,12 @@ cargo run --bin agent -- serve --addr 0.0.0.0:3583 --sessions ./.sessions
 
 ## What's left
 
-- HTTP transport for MCP (stdio only in v1; the same `Transport` trait
-  takes an HTTP impl).
 - Multi-node `ActorRef` (location-transparent addressing across nodes).
-- Sandcastle's worktree + merge-to-head branch strategies.
 - Hard-link safety inside `fstools` (path-level defence only — a hard
   link to an outside-root inode isn't distinguishable by path).
 - Real-network E2E test (would require an `ANTHROPIC_API_KEY` and is
   sandbox-policy-sensitive).
+- CLI integration with the `git` crate (the strategies exist but the
+  `agent run` binary doesn't yet take a `--branch-strategy` flag).
+- Benchmarks (we have 375 tests but zero perf measurements — the SIMD
+  paths are functionally correct but unmeasured).

@@ -3,13 +3,14 @@ name = "mcp"
 version = "0.0.1"
 edition = "2024"
 publish = false
-description = "Model Context Protocol client. Stdio transport. Exposes remote tools as harness::Tool impls."
+description = "Model Context Protocol client. Stdio + streamable-HTTP transports. Exposes remote tools as harness::Tool impls."
 
 [lib]
 path = "src/lib.rs"
 
 [dependencies]
 anthropic = { path = "../anthropic" }
+curl-sys = { version = "0.4", features = ["static-curl", "static-ssl"] }
 harness = { path = "../harness" }
 wire = { path = "../wire" }
 

@@ -1,9 +1,5 @@
-//! Transports for the MCP client.
-//!
-//! v1 ships only [`StdioTransport`]: spawn a child process and exchange
-//! newline-delimited JSON over its stdin/stdout. The [`Transport`] trait
-//! is the seam tests use to swap in an in-memory implementation; future
-//! HTTP/SSE transports plug into the same trait.
+//! Stdio transport: spawn a child process and exchange newline-delimited
+//! JSON over its stdin/stdout. Used by most local MCP packages.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -11,18 +7,7 @@ use std::sync::Mutex;
 
 use wire::NdjsonSplitter;
 
-/// Abstract send/recv pair used by the MCP client. Errors are plain
-/// strings — transports report enough context inline that a typed enum
-/// would be overkill.
-pub trait Transport: Send + Sync {
-    /// Send a single JSON-RPC frame. Implementations append a trailing
-    /// `\n`; callers pass the payload without one.
-    fn send_line(&self, line: &[u8]) -> Result<(), String>;
-
-    /// Block until the next frame is available. Returns the payload
-    /// without the trailing `\n`. EOF/closed channel becomes an error.
-    fn recv_line(&self) -> Result<Vec<u8>, String>;
-}
+use super::Transport;
 
 /// Stdio transport: owns a child process, writes to its stdin, reads
 /// from its stdout. The child is killed on drop so callers can't leak

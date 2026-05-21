@@ -1,14 +1,20 @@
 //! Model Context Protocol client.
 //!
-//! Speaks JSON-RPC 2.0 over a transport. v1 ships **stdio only**: spawn a
-//! child process, write requests as newline-delimited JSON to stdin, read
-//! responses as newline-delimited JSON from stdout. Used by most local
-//! MCP tool packages. Streamable HTTP transport is deferred to v2.
+//! Speaks JSON-RPC 2.0 over a transport. Two transports ship:
+//!
+//! - [`StdioTransport`] — spawn a child process and exchange newline-
+//!   delimited JSON over its stdin/stdout. Used by most local MCP
+//!   packages.
+//! - [`HttpTransport`] — streamable HTTP per the MCP spec. A single POST
+//!   endpoint; responses come back as either `application/json` (one
+//!   JSON-RPC frame) or `text/event-stream` (one frame per `data:`
+//!   block). Session continuity via the `Mcp-Session-Id` header.
 //!
 //! The handshake (`initialize` → `notifications/initialized` → `tools/list`)
-//! runs in [`McpClient::stdio`]; the returned client exposes a catalog of
-//! [`McpTool`]s, each implementing [`harness::Tool`] so they slot directly
-//! into the harness's tool registry alongside built-ins.
+//! runs in [`McpClient::stdio`] / [`McpClient::http`]; the returned client
+//! exposes a catalog of [`McpTool`]s, each implementing [`harness::Tool`]
+//! so they slot directly into the harness's tool registry alongside
+//! built-ins.
 
 mod jsonrpc;
 mod transport;
@@ -19,7 +25,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anthropic::json::{Json, parse as parse_json};
 use harness::{Tool, ToolCtx, ToolError};
 
-pub use transport::{StdioTransport, Transport};
+pub use transport::{HttpTransport, StdioTransport, Transport};
 
 /// Errors surfaced by the MCP client. Compact on purpose: most failures
 /// upstream just want a message to log, not a typed taxonomy.
@@ -144,6 +150,24 @@ impl McpClient {
     /// tool catalog. The child process is killed on drop.
     pub fn stdio(command: &str, args: &[&str]) -> Result<Self, McpError> {
         let transport = StdioTransport::spawn(command, args).map_err(McpError::Transport)?;
+        Self::with_transport(Box::new(transport))
+    }
+
+    /// Connect to a remote MCP server over streamable HTTP. Performs the
+    /// `initialize` → `notifications/initialized` → `tools/list` handshake
+    /// just like [`McpClient::stdio`].
+    pub fn http(url: impl Into<String>) -> Result<Self, McpError> {
+        let transport = HttpTransport::new(url);
+        Self::with_transport(Box::new(transport))
+    }
+
+    /// Connect over HTTP with a bearer token. Sets `Authorization: Bearer
+    /// <token>` on every request.
+    pub fn http_with_bearer(
+        url: impl Into<String>,
+        token: impl Into<String>,
+    ) -> Result<Self, McpError> {
+        let transport = HttpTransport::new(url).with_bearer(token);
         Self::with_transport(Box::new(transport))
     }
 
