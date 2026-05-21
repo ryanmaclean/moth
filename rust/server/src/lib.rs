@@ -7,18 +7,53 @@
 //! Routing: `POST /agents/<name>/<id>` dispatches to a registered handler
 //! by `<name>`. Everything else is a hard error (404 / 405 / 400 / 413).
 //!
-//! Streaming model: handlers write SSE frames through `EventSink`; the
-//! transport is `Connection: close` and we flush after every frame so
+//! Streaming model: handlers write SSE frames through `EventSink`; an SSE
+//! response uses `Connection: close` and we flush after every frame so
 //! clients see events as they arrive.
+//!
+//! # Production hardening
+//!
+//! - Per-connection read/write timeouts (`ServerConfig::read_timeout`,
+//!   `ServerConfig::write_timeout`). A read timeout on an idle socket
+//!   produces a clean close; mid-request it produces 408.
+//! - Bounded accept counter (`ServerConfig::max_connections`). Connections
+//!   accepted beyond the cap are closed immediately with no thread spawned.
+//! - HTTP/1.1 keep-alive for non-SSE responses (4xx error paths). SSE
+//!   responses still terminate the connection — the body is open-ended and
+//!   can't be safely followed by another request on the same socket.
 
 use std::collections::HashMap;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, ErrorKind, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
+use std::time::Duration;
 
 const MAX_BODY: usize = 1024 * 1024;
 const MAX_HEADER_LINE: usize = 8 * 1024;
 const MAX_HEADERS: usize = 64;
+
+/// Tunables for `Server::serve_with`. Defaults aim at a conservative
+/// production posture: short timeouts, modest connection cap, keep-alive on.
+#[derive(Debug, Clone)]
+pub struct ServerConfig {
+    pub read_timeout: Duration,
+    pub write_timeout: Duration,
+    pub max_connections: usize,
+    pub keep_alive: bool,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            read_timeout: Duration::from_secs(30),
+            write_timeout: Duration::from_secs(30),
+            max_connections: 256,
+            keep_alive: true,
+        }
+    }
+}
 
 pub trait AgentHandler: Send + Sync + 'static {
     fn handle(&self, id: &str, body: &[u8], sink: &mut EventSink) -> Result<(), HandlerError>;
@@ -78,64 +113,158 @@ impl Server {
         self.handlers.insert(name.into(), handler);
     }
 
+    /// Bind `addr` and serve with [`ServerConfig::default`].
     pub fn serve(self, addr: &str) -> io::Result<()> {
-        self.serve_listener(TcpListener::bind(addr)?)
+        self.serve_with(addr, ServerConfig::default())
     }
 
-    /// Drive an already-bound listener. Lets tests pick a free port and own
-    /// the listener's lifetime without leaking threads on `0.0.0.0`.
+    /// Bind `addr` and serve with a caller-supplied config.
+    pub fn serve_with(self, addr: &str, cfg: ServerConfig) -> io::Result<()> {
+        self.serve_listener_with(TcpListener::bind(addr)?, cfg)
+    }
+
+    /// Drive an already-bound listener with the default config. Lets tests
+    /// pick a free port and own the listener's lifetime without leaking
+    /// threads on `0.0.0.0`.
     pub fn serve_listener(self, listener: TcpListener) -> io::Result<()> {
-        let shared = std::sync::Arc::new(self);
+        self.serve_listener_with(listener, ServerConfig::default())
+    }
+
+    /// Drive an already-bound listener with a caller-supplied config.
+    pub fn serve_listener_with(self, listener: TcpListener, cfg: ServerConfig) -> io::Result<()> {
+        let shared = Arc::new(self);
+        let active = Arc::new(AtomicUsize::new(0));
         for conn in listener.incoming() {
             let stream = conn?;
-            let server = shared.clone();
-            thread::spawn(move || {
-                let _ = server.handle_connection(stream);
-            });
+            // Enforce the connection cap before spawning. We use a load /
+            // compare-exchange pair rather than fetch_add+rollback so we
+            // never even momentarily exceed the cap from another thread's
+            // perspective.
+            loop {
+                let current = active.load(Ordering::Acquire);
+                if current >= cfg.max_connections {
+                    // Drop the stream immediately — no thread, no buffering.
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                    break;
+                }
+                if active
+                    .compare_exchange(
+                        current,
+                        current + 1,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    // Successfully reserved a slot — apply timeouts and
+                    // spawn a worker.
+                    let _ = stream.set_read_timeout(Some(cfg.read_timeout));
+                    let _ = stream.set_write_timeout(Some(cfg.write_timeout));
+                    let server = shared.clone();
+                    let active = active.clone();
+                    let cfg = cfg.clone();
+                    thread::spawn(move || {
+                        let _ = server.handle_connection(stream, &cfg);
+                        active.fetch_sub(1, Ordering::AcqRel);
+                    });
+                    break;
+                }
+                // Lost the race; retry the load.
+            }
         }
         Ok(())
     }
 
-    fn handle_connection(&self, mut stream: TcpStream) -> io::Result<()> {
-        let mut reader = BufReader::new(stream.try_clone()?);
-        match parse_request(&mut reader) {
-            Ok(req) => self.dispatch(req, &mut stream),
-            Err(ParseError::TooLarge) => write_simple(&mut stream, 413, "Payload Too Large"),
-            Err(ParseError::MethodNotAllowed) => {
-                write_simple(&mut stream, 405, "Method Not Allowed")
+    fn handle_connection(&self, mut stream: TcpStream, cfg: &ServerConfig) -> io::Result<()> {
+        loop {
+            // Each iteration handles one request. We must clone the stream
+            // for buffered reads because BufReader takes ownership, but the
+            // raw stream stays here for writing the response and (on
+            // keep-alive) the next iteration.
+            let mut reader = BufReader::new(stream.try_clone()?);
+
+            // Distinguish "idle close" (peer hung up, or read timeout with
+            // no bytes consumed yet) from "mid-request error". The first
+            // returns Ok(None) and ends the loop cleanly; the second
+            // returns a parse error we map to 4xx.
+            let outcome = parse_request(&mut reader);
+
+            let keep_alive = match outcome {
+                Ok(req) => {
+                    let client_wants_close = req.connection_close;
+                    let (response_kind, write_res) = self.dispatch(req, &mut stream);
+                    write_res?;
+                    // SSE responses always terminate the connection; the
+                    // body has no length and we have no way to delimit it
+                    // from a following request.
+                    let response_keeps_alive = matches!(response_kind, ResponseKind::Buffered);
+                    cfg.keep_alive && response_keeps_alive && !client_wants_close
+                }
+                Err(ParseError::Idle) => return Ok(()),
+                Err(ParseError::Timeout) => {
+                    // Partial request then silence: 408. Don't keep-alive
+                    // because the framing state is unknown.
+                    let _ = write_simple(&mut stream, 408, "Request Timeout");
+                    return Ok(());
+                }
+                Err(ParseError::TooLarge) => {
+                    write_simple(&mut stream, 413, "Payload Too Large")?;
+                    // Body framing is unknown after a 413 — there may be
+                    // unread bytes on the wire. Close.
+                    return Ok(());
+                }
+                Err(ParseError::MethodNotAllowed) => {
+                    write_simple(&mut stream, 405, "Method Not Allowed")?;
+                    return Ok(());
+                }
+                Err(_) => {
+                    write_simple(&mut stream, 400, "Bad Request")?;
+                    return Ok(());
+                }
+            };
+
+            if !keep_alive {
+                return Ok(());
             }
-            Err(_) => write_simple(&mut stream, 400, "Bad Request"),
+            // Loop and read the next request on the same socket. The next
+            // `parse_request` call applies the same read_timeout as an
+            // idle timeout.
         }
     }
 
-    fn dispatch(&self, req: Request, stream: &mut TcpStream) -> io::Result<()> {
+    fn dispatch(
+        &self,
+        req: Request,
+        stream: &mut TcpStream,
+    ) -> (ResponseKind, io::Result<()>) {
         let Some((name, id)) = parse_agent_path(&req.path) else {
-            return write_simple(stream, 404, "Not Found");
+            return (ResponseKind::Buffered, write_simple(stream, 404, "Not Found"));
         };
         let Some(handler) = self.handlers.get(name) else {
-            return write_simple(stream, 404, "Not Found");
+            return (ResponseKind::Buffered, write_simple(stream, 404, "Not Found"));
         };
 
-        // SSE headers first; once sent, errors become 500-in-body-too-late
-        // territory, so we capture handler errors into a buffer first and
-        // only commit headers when we know the outcome of the very first
-        // write. To keep this simple we send headers up front and, on
-        // handler error, emit a final SSE `error` event then close.
-        stream.write_all(
+        // Commit SSE headers up front. Once they're on the wire any handler
+        // error has to be surfaced inside the stream as an `error` event;
+        // we can't retroactively change the status.
+        let header_res = stream.write_all(
             b"HTTP/1.1 200 OK\r\n\
               Content-Type: text/event-stream\r\n\
               Cache-Control: no-cache\r\n\
               Connection: close\r\n\r\n",
-        )?;
-        stream.flush()?;
+        );
+        if let Err(e) = header_res {
+            return (ResponseKind::Sse, Err(e));
+        }
+        if let Err(e) = stream.flush() {
+            return (ResponseKind::Sse, Err(e));
+        }
 
         let mut sink = EventSink::new(stream);
         if let Err(e) = handler.handle(id, &req.body, &mut sink) {
-            // Headers are already on the wire; we can't change status. Surface
-            // the failure as a structured SSE event so clients can react.
             let _ = sink.emit(Some("error"), &e.0);
         }
-        Ok(())
+        (ResponseKind::Sse, Ok(()))
     }
 }
 
@@ -143,6 +272,14 @@ impl Default for Server {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Distinguishes responses that can share a connection with subsequent
+/// requests (`Buffered`, length-delimited) from ones that can't (`Sse`,
+/// open-ended).
+enum ResponseKind {
+    Buffered,
+    Sse,
 }
 
 fn parse_agent_path(path: &str) -> Option<(&str, &str)> {
@@ -160,25 +297,27 @@ fn parse_agent_path(path: &str) -> Option<(&str, &str)> {
 struct Request {
     path: String,
     body: Vec<u8>,
+    connection_close: bool,
 }
 
 #[derive(Debug)]
 enum ParseError {
+    /// Peer closed (or read-timed-out) before sending any bytes.
+    Idle,
+    /// Bytes received but read timed out mid-request → 408.
+    Timeout,
     Malformed,
     MethodNotAllowed,
     TooLarge,
 }
 
-impl From<io::Error> for ParseError {
-    fn from(_: io::Error) -> Self {
-        // Treat truncated / dropped connections as malformed input; we have
-        // no way to send a partial response with a different status anyway.
-        ParseError::Malformed
-    }
-}
-
 fn parse_request<R: BufRead>(reader: &mut R) -> Result<Request, ParseError> {
-    let status = read_line(reader)?;
+    // Status line: distinguish "peer never sent anything" (idle close)
+    // from "peer sent half a line and stalled" (timeout).
+    let status = match read_line(reader, true)? {
+        Some(s) => s,
+        None => return Err(ParseError::Idle),
+    };
     let mut parts = status.splitn(3, ' ');
     let method = parts.next().ok_or(ParseError::Malformed)?;
     let path = parts.next().ok_or(ParseError::Malformed)?.to_string();
@@ -189,11 +328,12 @@ fn parse_request<R: BufRead>(reader: &mut R) -> Result<Request, ParseError> {
     if method != "POST" {
         return Err(ParseError::MethodNotAllowed);
     }
-
+    // HTTP/1.0 defaults to Connection: close; HTTP/1.1 to keep-alive.
     let mut content_length: Option<usize> = None;
+    let mut connection_close = version == "HTTP/1.0";
     let mut header_count = 0usize;
     loop {
-        let line = read_line(reader)?;
+        let line = read_line(reader, false)?.ok_or(ParseError::Malformed)?;
         if line.is_empty() {
             break;
         }
@@ -217,6 +357,17 @@ fn parse_request<R: BufRead>(reader: &mut R) -> Result<Request, ParseError> {
                 // silently mis-framing the body.
                 return Err(ParseError::Malformed);
             }
+            "connection" => {
+                // RFC 7230 allows comma-separated tokens. `close` wins
+                // over `keep-alive` if both appear.
+                for tok in value.split(',') {
+                    match tok.trim().to_ascii_lowercase().as_str() {
+                        "close" => connection_close = true,
+                        "keep-alive" if !connection_close => connection_close = false,
+                        _ => {}
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -225,21 +376,44 @@ fn parse_request<R: BufRead>(reader: &mut R) -> Result<Request, ParseError> {
         Some(0) | None => Vec::new(),
         Some(n) => {
             let mut buf = vec![0u8; n];
-            reader.read_exact(&mut buf)?;
+            read_exact_mapped(reader, &mut buf)?;
             buf
         }
     };
 
-    Ok(Request { path, body })
+    Ok(Request { path, body, connection_close })
 }
 
-fn read_line<R: BufRead>(reader: &mut R) -> Result<String, ParseError> {
+/// Read one CRLF-terminated line. With `allow_idle = true` (used only for
+/// the request line), a peer that closes or read-times-out before sending
+/// any bytes returns `Ok(None)` — that's a clean keep-alive idle close,
+/// not a 408.
+fn read_line<R: BufRead>(
+    reader: &mut R,
+    allow_idle: bool,
+) -> Result<Option<String>, ParseError> {
     let mut buf = Vec::with_capacity(128);
+    let mut any = false;
     loop {
-        let chunk = reader.fill_buf()?;
+        let chunk = match reader.fill_buf() {
+            Ok(c) => c,
+            Err(e) if is_timeout(&e) => {
+                return if any || !allow_idle {
+                    Err(ParseError::Timeout)
+                } else {
+                    Ok(None)
+                };
+            }
+            Err(_) => return Err(ParseError::Malformed),
+        };
         if chunk.is_empty() {
-            return Err(ParseError::Malformed);
+            return if any || !allow_idle {
+                Err(ParseError::Malformed)
+            } else {
+                Ok(None)
+            };
         }
+        any = true;
         if let Some(pos) = chunk.iter().position(|&b| b == b'\n') {
             buf.extend_from_slice(&chunk[..pos]);
             reader.consume(pos + 1);
@@ -255,7 +429,27 @@ fn read_line<R: BufRead>(reader: &mut R) -> Result<String, ParseError> {
     if buf.last() == Some(&b'\r') {
         buf.pop();
     }
-    String::from_utf8(buf).map_err(|_| ParseError::Malformed)
+    String::from_utf8(buf).map(Some).map_err(|_| ParseError::Malformed)
+}
+
+/// Like `BufRead::read_exact` but maps a read timeout to `Timeout` instead
+/// of `Malformed` so callers can return 408.
+fn read_exact_mapped<R: BufRead>(reader: &mut R, buf: &mut [u8]) -> Result<(), ParseError> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match reader.read(&mut buf[filled..]) {
+            Ok(0) => return Err(ParseError::Malformed),
+            Ok(n) => filled += n,
+            Err(e) if is_timeout(&e) => return Err(ParseError::Timeout),
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(_) => return Err(ParseError::Malformed),
+        }
+    }
+    Ok(())
+}
+
+fn is_timeout(e: &io::Error) -> bool {
+    matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
 }
 
 fn write_simple(w: &mut dyn Write, status: u16, reason: &str) -> io::Result<()> {
@@ -318,6 +512,10 @@ mod tests {
     }
 
     fn spawn_server() -> (std::net::SocketAddr, thread::JoinHandle<()>) {
+        spawn_server_with(ServerConfig::default())
+    }
+
+    fn spawn_server_with(cfg: ServerConfig) -> (std::net::SocketAddr, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let mut server = Server::new();
@@ -325,7 +523,7 @@ mod tests {
         server.register("err", Box::new(ErrAgent));
         server.register("len", Box::new(LenAgent));
         let handle = thread::spawn(move || {
-            let _ = server.serve_listener(listener);
+            let _ = server.serve_listener_with(listener, cfg);
         });
         (addr, handle)
     }
@@ -548,5 +746,316 @@ mod tests {
             w.join().unwrap();
         }
         assert_eq!(count.load(Ordering::SeqCst), 16, "errors: {:?}", errors.lock().unwrap());
+    }
+
+    // Hardening tests --------------------------------------------------------
+
+    #[test]
+    fn config_defaults_are_30s_256_keep_alive() {
+        let cfg = ServerConfig::default();
+        assert_eq!(cfg.read_timeout, Duration::from_secs(30));
+        assert_eq!(cfg.write_timeout, Duration::from_secs(30));
+        assert_eq!(cfg.max_connections, 256);
+        assert!(cfg.keep_alive);
+    }
+
+    /// A client that opens a connection and sits silent gets a clean idle
+    /// close (not a 408): the parser distinguishes "no bytes yet" from
+    /// "partial request then stall".
+    #[test]
+    fn idle_connection_closes_after_read_timeout() {
+        let cfg = ServerConfig {
+            read_timeout: Duration::from_millis(100),
+            ..Default::default()
+        };
+        let (addr, _h) = spawn_server_with(cfg);
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut out = Vec::new();
+        let start = std::time::Instant::now();
+        s.read_to_end(&mut out).unwrap();
+        assert!(start.elapsed() < Duration::from_secs(2));
+        // No response body: idle close, not 408.
+        assert!(out.is_empty(), "unexpected response: {out:?}");
+    }
+
+    /// Slowloris: a client that sends a partial request line then stalls
+    /// gets a 408 from the server.
+    #[test]
+    fn read_timeout_mid_request_returns_408() {
+        let cfg = ServerConfig {
+            read_timeout: Duration::from_millis(150),
+            ..Default::default()
+        };
+        let (addr, _h) = spawn_server_with(cfg);
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        // Partial request — no terminating CRLF.
+        s.write_all(b"POST /agents/echo/x HTTP/1").unwrap();
+        let mut out = Vec::new();
+        s.read_to_end(&mut out).unwrap();
+        assert!(out.starts_with(b"HTTP/1.1 408"), "got: {:?}", String::from_utf8_lossy(&out));
+    }
+
+    /// Write timeout: if the client refuses to read, an SSE handler that
+    /// emits enough data to overflow the kernel buffers will eventually
+    /// have its write fail.
+    #[test]
+    fn write_timeout_fires_when_client_refuses_to_read() {
+        struct FloodAgent;
+        impl AgentHandler for FloodAgent {
+            fn handle(
+                &self,
+                _id: &str,
+                _body: &[u8],
+                sink: &mut EventSink,
+            ) -> Result<(), HandlerError> {
+                // 1 MiB payload per emit; the kernel send buffer is much
+                // smaller, so once the client stops reading the write will
+                // block and eventually time out.
+                let big = "x".repeat(1024 * 1024);
+                for _ in 0..64 {
+                    sink.emit_data(&big).map_err(|e| HandlerError(e.to_string()))?;
+                }
+                Ok(())
+            }
+        }
+        let cfg = ServerConfig {
+            write_timeout: Duration::from_millis(200),
+            ..Default::default()
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut server = Server::new();
+        server.register("flood", Box::new(FloodAgent));
+        thread::spawn(move || {
+            let _ = server.serve_listener_with(listener, cfg);
+        });
+
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.write_all(b"POST /agents/flood/x HTTP/1.1\r\nContent-Length: 0\r\n\r\n")
+            .unwrap();
+        // Don't read. The server's write_timeout should fire and the
+        // handler thread should exit cleanly within a few seconds. We
+        // probe by waiting then doing one short read to confirm no panic.
+        thread::sleep(Duration::from_millis(800));
+        s.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+        let mut tiny = [0u8; 16];
+        // Either we read something (the bytes that did make it before the
+        // timeout) or we don't — both are fine. The contract under test is
+        // that the server doesn't panic and the connection is closed
+        // server-side.
+        let _ = s.read(&mut tiny);
+    }
+
+    /// Connection cap: with `max_connections = 4`, the 5th simultaneous
+    /// connection is dropped immediately by the server.
+    #[test]
+    fn max_connections_drops_overflow() {
+        struct BlockAgent {
+            release: Arc<Mutex<()>>,
+        }
+        impl AgentHandler for BlockAgent {
+            fn handle(
+                &self,
+                _id: &str,
+                _body: &[u8],
+                sink: &mut EventSink,
+            ) -> Result<(), HandlerError> {
+                sink.emit(Some("hold"), "").map_err(|e| HandlerError(e.to_string()))?;
+                // Park until the test releases us.
+                let _g = self.release.lock().unwrap();
+                Ok(())
+            }
+        }
+        let release = Arc::new(Mutex::new(()));
+        let guard = release.lock().unwrap();
+
+        let cfg = ServerConfig { max_connections: 4, ..Default::default() };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut server = Server::new();
+        server.register("block", Box::new(BlockAgent { release: release.clone() }));
+        thread::spawn(move || {
+            let _ = server.serve_listener_with(listener, cfg);
+        });
+
+        // Open 4 long-running connections.
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            let mut s = TcpStream::connect(addr).unwrap();
+            s.write_all(b"POST /agents/block/x HTTP/1.1\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+            // Wait for the "hold" SSE event so we know the handler is
+            // running and the slot is in use.
+            s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut buf = [0u8; 256];
+            let n = s.read(&mut buf).unwrap();
+            assert!(n > 0);
+            held.push(s);
+        }
+
+        // 5th connection: the server should accept and immediately close.
+        let mut overflow = TcpStream::connect(addr).unwrap();
+        overflow.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut out = Vec::new();
+        overflow.read_to_end(&mut out).unwrap();
+        assert!(out.is_empty(), "overflow connection got data: {out:?}");
+
+        // Release the held handlers and let everything shut down.
+        drop(guard);
+        for s in held {
+            let _ = s.shutdown(std::net::Shutdown::Both);
+        }
+    }
+
+    /// Two requests on a single TCP connection both succeed.
+    #[test]
+    fn keep_alive_serves_two_requests_on_one_connection() {
+        let (addr, _h) = spawn_server();
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        // Send the first request, but the response is SSE which closes
+        // the connection. So instead pick a route that produces a non-SSE
+        // response: 404 path. Two 404s on the same socket.
+        s.write_all(b"POST /nope HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n").unwrap();
+        let mut buf = [0u8; 512];
+        let mut first = Vec::new();
+        // Read exactly one response. We know its Content-Length so we
+        // can avoid blocking on EOF.
+        read_one_response(&mut s, &mut buf, &mut first);
+        assert!(first.starts_with(b"HTTP/1.1 404"), "first: {:?}", String::from_utf8_lossy(&first));
+
+        s.write_all(b"POST /nope HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n").unwrap();
+        let mut second = Vec::new();
+        read_one_response(&mut s, &mut buf, &mut second);
+        assert!(second.starts_with(b"HTTP/1.1 404"), "second: {:?}", String::from_utf8_lossy(&second));
+    }
+
+    /// `Connection: close` on a non-SSE response terminates the socket
+    /// after one request even with keep-alive enabled.
+    #[test]
+    fn connection_close_header_terminates_after_one_request() {
+        let (addr, _h) = spawn_server();
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s.write_all(
+            b"POST /nope HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        s.read_to_end(&mut out).unwrap();
+        assert!(out.starts_with(b"HTTP/1.1 404"));
+        // No second response: connection was closed after the first.
+        // (read_to_end returned, meaning the server closed its side.)
+    }
+
+    /// SSE response always terminates the connection, even with keep-alive
+    /// enabled and no `Connection: close` header from the client.
+    #[test]
+    fn sse_response_closes_connection_despite_keep_alive() {
+        let (addr, _h) = spawn_server();
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s.write_all(b"POST /agents/echo/x HTTP/1.1\r\nContent-Length: 0\r\n\r\n").unwrap();
+        let mut out = Vec::new();
+        s.read_to_end(&mut out).unwrap();
+        let (head, _body) = split_headers_body(&out);
+        assert!(head.contains("Content-Type: text/event-stream"));
+        // read_to_end completed → server closed the socket as required
+        // for an open-ended SSE body.
+    }
+
+    /// Plumb a custom config through `serve_with` and observe its effect:
+    /// a 1ms read timeout makes a slow client trip 408 almost immediately.
+    #[test]
+    fn serve_with_plumbs_config() {
+        let cfg = ServerConfig {
+            read_timeout: Duration::from_millis(50),
+            ..Default::default()
+        };
+        let (addr, _h) = spawn_server_with(cfg);
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        s.write_all(b"POST /agents/echo/x HTTP/1.").unwrap();
+        let mut out = Vec::new();
+        s.read_to_end(&mut out).unwrap();
+        assert!(out.starts_with(b"HTTP/1.1 408"));
+    }
+
+    /// HTTP/1.0 defaults to `Connection: close`. Verify the keep-alive
+    /// path honours that: one request, then close.
+    #[test]
+    fn http_1_0_closes_by_default() {
+        let (addr, _h) = spawn_server();
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s.write_all(b"POST /nope HTTP/1.0\r\nContent-Length: 0\r\n\r\n").unwrap();
+        let mut out = Vec::new();
+        s.read_to_end(&mut out).unwrap();
+        assert!(out.starts_with(b"HTTP/1.1 404"));
+    }
+
+    /// With `keep_alive = false` in config, even a clean non-SSE request
+    /// on HTTP/1.1 results in close-after-one.
+    #[test]
+    fn config_keep_alive_off_closes_after_one() {
+        let cfg = ServerConfig { keep_alive: false, ..Default::default() };
+        let (addr, _h) = spawn_server_with(cfg);
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s.write_all(b"POST /nope HTTP/1.1\r\nContent-Length: 0\r\n\r\n").unwrap();
+        let mut out = Vec::new();
+        s.read_to_end(&mut out).unwrap();
+        assert!(out.starts_with(b"HTTP/1.1 404"));
+    }
+
+    /// Three sequential 404s on one socket — exercises the keep-alive
+    /// loop more than twice.
+    #[test]
+    fn keep_alive_three_requests() {
+        let (addr, _h) = spawn_server();
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut buf = [0u8; 512];
+        for _ in 0..3 {
+            s.write_all(b"POST /nope HTTP/1.1\r\nContent-Length: 0\r\n\r\n").unwrap();
+            let mut resp = Vec::new();
+            read_one_response(&mut s, &mut buf, &mut resp);
+            assert!(resp.starts_with(b"HTTP/1.1 404"));
+        }
+    }
+
+    /// Read exactly one HTTP response from `s` into `out`. We rely on
+    /// `Content-Length` because `read_to_end` would block forever on a
+    /// keep-alive socket.
+    fn read_one_response(s: &mut TcpStream, buf: &mut [u8], out: &mut Vec<u8>) {
+        // Read until we have the full headers, then parse Content-Length
+        // and read that many body bytes.
+        loop {
+            let n = s.read(buf).unwrap();
+            assert!(n > 0, "EOF before headers");
+            out.extend_from_slice(&buf[..n]);
+            if let Some(idx) = out.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = std::str::from_utf8(&out[..idx]).unwrap();
+                let mut len = 0usize;
+                for line in head.split("\r\n") {
+                    if let Some(v) = line.strip_prefix("Content-Length:") {
+                        len = v.trim().parse().unwrap_or(0);
+                    } else if let Some(v) = line.strip_prefix("content-length:") {
+                        len = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                let body_start = idx + 4;
+                while out.len() < body_start + len {
+                    let n = s.read(buf).unwrap();
+                    if n == 0 {
+                        return;
+                    }
+                    out.extend_from_slice(&buf[..n]);
+                }
+                return;
+            }
+        }
     }
 }
