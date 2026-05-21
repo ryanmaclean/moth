@@ -1,0 +1,13 @@
+[package]
+name = "persist"
+version = "0.0.1"
+edition = "2024"
+publish = false
+description = "File-backed harness::SessionStore. Atomic writes via tmp + rename, JSON wire format."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+anthropic = { path = "../anthropic" }
+harness = { path = "../harness" }

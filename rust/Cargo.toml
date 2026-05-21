@@ -1,3 +1,3 @@
 [workspace]
 resolver = "2"
-members = ["actor", "anthropic", "audit", "cli", "fstools", "harness", "mcp", "openai", "server", "tmpl", "vshell", "wire"]
+members = ["actor", "anthropic", "audit", "cli", "fstools", "harness", "mcp", "openai", "persist", "server", "tmpl", "vshell", "wire"]
