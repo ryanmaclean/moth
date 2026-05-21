@@ -16,6 +16,8 @@
 //!   OPENAI_BASE_URL       override OpenAI base URL (OpenRouter, LM Studio, etc)
 //!   AGENTS_ROOT           dir for .agents/skills/<name>.md + .agents/roles/<name>.md
 //!                         (defaults to current dir)
+//!   SESSIONS_DIR          enable file-backed session persistence at this dir
+//!                         (or pass --sessions DIR)
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -26,9 +28,9 @@ use std::sync::mpsc::sync_channel;
 use actor::spawn;
 use harness::{
     AnthropicModel, AuditedShell, BashTool, HarnessState, Instance, Model, OpenAiModel,
-    Sandbox, Session, SessionMsg, Tool,
+    Sandbox, Session, SessionMsg, SessionStore, Tool,
 };
-use server::{AgentHandler, EventSink, HandlerError, Server};
+use server::{AgentHandler, EventSink, HandlerError, Server, ServerConfig};
 
 const DEFAULT_ANTHROPIC_MODEL: &str = "claude-haiku-4-5";
 const DEFAULT_OPENAI_MODEL: &str = "gpt-4o-mini";
@@ -51,8 +53,16 @@ fn main() -> ExitCode {
 
 fn usage_and_exit(code: u8) -> ExitCode {
     let m = "usage:\n  \
-        agent run [--openai] [--model NAME] [--skill NAME] [--arg KEY=VALUE]... <prompt>\n  \
-        agent serve [--addr 0.0.0.0:3583] [--openai] [--model NAME]";
+        agent run [opts] <prompt>\n  \
+        agent serve [opts]\n\n\
+        opts:\n  \
+        --openai                     use OpenAI-compatible provider\n  \
+        --model NAME                 model id\n  \
+        --skill NAME                 load .agents/skills/NAME.md\n  \
+        --arg KEY=VAL                substitute {{KEY}} in the skill (repeatable)\n  \
+        --sessions DIR               persist message history to DIR (or SESSIONS_DIR env)\n  \
+        --mcp 'CMD ARGS'             spawn MCP server, register its tools (repeatable)\n  \
+        --addr HOST:PORT             [serve] bind address (default 0.0.0.0:3583)";
     eprintln!("{m}");
     ExitCode::from(code)
 }
@@ -61,10 +71,15 @@ fn usage_and_exit(code: u8) -> ExitCode {
 struct CommonOpts {
     openai: bool,
     model: Option<String>,
+    sessions_dir: Option<PathBuf>,
+    mcp_specs: Vec<String>,
 }
 
 fn parse_common(args: &mut Vec<String>) -> CommonOpts {
     let mut opts = CommonOpts::default();
+    if let Ok(d) = std::env::var("SESSIONS_DIR") {
+        opts.sessions_dir = Some(PathBuf::from(d));
+    }
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -78,10 +93,48 @@ fn parse_common(args: &mut Vec<String>) -> CommonOpts {
                     opts.model = Some(args.remove(i));
                 }
             }
+            "--sessions" => {
+                args.remove(i);
+                if i < args.len() {
+                    opts.sessions_dir = Some(PathBuf::from(args.remove(i)));
+                }
+            }
+            "--mcp" => {
+                args.remove(i);
+                if i < args.len() {
+                    opts.mcp_specs.push(args.remove(i));
+                }
+            }
             _ => i += 1,
         }
     }
     opts
+}
+
+type McpConn = (Vec<mcp::McpClient>, Vec<Arc<dyn Tool>>);
+
+/// Returns owned clients so they live the duration of the run, plus the
+/// flattened tool list to register with the harness.
+fn connect_mcp(specs: &[String]) -> Result<McpConn, String> {
+    let mut clients = Vec::new();
+    let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
+    for spec in specs {
+        let parts: Vec<&str> = spec.split_whitespace().collect();
+        let (cmd, args) = parts.split_first().ok_or("empty --mcp value")?;
+        let client = mcp::McpClient::stdio(cmd, args)
+            .map_err(|e| format!("mcp {cmd}: {e:?}"))?;
+        for t in client.tools() {
+            tools.push(Arc::new(t));
+        }
+        clients.push(client);
+    }
+    Ok((clients, tools))
+}
+
+fn open_store(dir: Option<&PathBuf>) -> Result<Option<Arc<dyn SessionStore>>, String> {
+    let Some(d) = dir else { return Ok(None) };
+    let store = persist::FileStore::open(d).map_err(|e| format!("sessions dir {d:?}: {e}"))?;
+    Ok(Some(Arc::new(store)))
 }
 
 fn build_model(opts: &CommonOpts) -> Result<Arc<dyn Model>, String> {
@@ -171,11 +224,32 @@ fn run_cmd(mut args: Vec<String>) -> ExitCode {
         }
     };
 
+    let (mcp_clients, mcp_tools) = match connect_mcp(&common.mcp_specs) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+    let store = match open_store(common.sessions_dir.as_ref()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let mut tools = default_tools(None);
+    tools.extend(mcp_tools);
+
     let sandbox: Box<dyn Sandbox> = Box::new(AuditedShell::new(vshell::VShell::new()));
     let inst = spawn(Instance::new("cli", sandbox));
-    let state = HarnessState::new("default", model, inst.addr.clone())
-        .with_tools(default_tools(None));
-    let sess = spawn(Session::new("default", Arc::new(state)));
+    let state = HarnessState::new("default", model, inst.addr.clone()).with_tools(tools);
+    let mut sess_build = Session::new("default", Arc::new(state));
+    if let Some(s) = store {
+        sess_build = sess_build.with_store(s);
+    }
+    let sess = spawn(sess_build);
 
     let (tx, rx) = sync_channel(1);
     if let Err(e) = sess.addr.send(SessionMsg::Prompt {
@@ -184,6 +258,7 @@ fn run_cmd(mut args: Vec<String>) -> ExitCode {
         reply: tx,
     }) {
         eprintln!("send failed: {e}");
+        drop(mcp_clients);
         return ExitCode::from(1);
     }
 
@@ -212,6 +287,7 @@ fn run_cmd(mut args: Vec<String>) -> ExitCode {
 
     let _ = sess.join();
     let _ = inst.join();
+    drop(mcp_clients);
     exit
 }
 
@@ -252,15 +328,40 @@ fn serve_cmd(mut args: Vec<String>) -> ExitCode {
         }
     };
 
+    let (mcp_clients, mcp_tools) = match connect_mcp(&common.mcp_specs) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+    let store = match open_store(common.sessions_dir.as_ref()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let mut tools = default_tools(None);
+    tools.extend(mcp_tools);
+
     let mut srv = Server::new();
-    srv.register("chat", Box::new(ChatHandler { model }));
+    srv.register(
+        "chat",
+        Box::new(ChatHandler { model, tools: Arc::new(tools), store }),
+    );
 
     eprintln!("serving on {addr}");
-    if let Err(e) = srv.serve(&addr) {
-        eprintln!("serve failed: {e}");
-        return ExitCode::from(1);
+    let result = srv.serve_with(&addr, ServerConfig::default());
+    drop(mcp_clients);
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("serve failed: {e}");
+            ExitCode::from(1)
+        }
     }
-    ExitCode::SUCCESS
 }
 
 /// One `ChatHandler` per server; one fresh Instance + Session per request.
@@ -268,6 +369,8 @@ fn serve_cmd(mut args: Vec<String>) -> ExitCode {
 /// for log correlation but the in-memory state is per-connection.
 struct ChatHandler {
     model: Arc<dyn Model>,
+    tools: Arc<Vec<Arc<dyn Tool>>>,
+    store: Option<Arc<dyn SessionStore>>,
 }
 
 impl AgentHandler for ChatHandler {
@@ -278,8 +381,12 @@ impl AgentHandler for ChatHandler {
         let sandbox: Box<dyn Sandbox> = Box::new(AuditedShell::new(vshell::VShell::new()));
         let inst = spawn(Instance::new(id, sandbox));
         let state = HarnessState::new("chat", self.model.clone(), inst.addr.clone())
-            .with_tools(default_tools(None));
-        let sess = spawn(Session::new(id, Arc::new(state)));
+            .with_tools((*self.tools).clone());
+        let mut sess_build = Session::new(id, Arc::new(state));
+        if let Some(s) = &self.store {
+            sess_build = sess_build.with_store(s.clone());
+        }
+        let sess = spawn(sess_build);
 
         let (tx, rx) = sync_channel(1);
         sess.addr

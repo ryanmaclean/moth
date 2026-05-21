@@ -6,6 +6,21 @@
 //! escape the directory; with `None`, file ops are unrestricted (trusted
 //! CLI runs). `..` components are always refused; absolute paths are
 //! refused when a root is set.
+//!
+//! ## Symlink safety
+//!
+//! When a `root` is configured, every component of the resolved path is
+//! validated against symlinks: any symlink encountered along the path —
+//! whether at an intermediate directory or at the leaf — causes the
+//! operation to be refused, *even if the symlink points back inside the
+//! root*. This strict policy is easier to reason about than tracking
+//! "safe" vs "unsafe" symlinks; agents that legitimately need to follow
+//! a symlink should resolve it themselves and pass the resolved path.
+//!
+//! For `WriteTool` creating new files (or intermediate directories), each
+//! parent component is verified before being created via `mkdir`, and the
+//! final leaf is written with `create_new`-style semantics that refuse to
+//! overwrite a pre-existing symlink.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -49,9 +64,27 @@ impl Tool for ReadTool {
         let path = require_str(&v, "path")?;
         let offset = optional_usize(&v, "offset")?;
         let limit = optional_usize(&v, "limit")?;
-        let full = resolve(self.root.as_deref(), &path)?;
+        let sandboxed = self.root.is_some();
+        let full = resolve_existing(self.root.as_deref(), &path)?;
 
-        let meta = std::fs::metadata(&full).map_err(io_err)?;
+        let meta = std::fs::symlink_metadata(&full).map_err(io_err)?;
+        if sandboxed && meta.file_type().is_symlink() {
+            return Err(ToolError(format!(
+                "refusing to follow symlink: {path}"
+            )));
+        }
+        // When sandboxed `resolve_existing` already vetted every
+        // component, including the leaf, so by here the file cannot be
+        // a symlink. The check above is belt-and-braces against a TOCTOU
+        // race where the leaf was swapped after the walk.
+        let meta = if meta.file_type().is_symlink() {
+            // Rootless: follow the symlink to report size of the target
+            // (matches historical behaviour, where std::fs::metadata
+            // followed symlinks transparently).
+            std::fs::metadata(&full).map_err(io_err)?
+        } else {
+            meta
+        };
         if meta.len() > MAX_BYTES {
             return Err(ToolError(format!(
                 "file too large: {} bytes (max {})",
@@ -89,12 +122,22 @@ impl Tool for WriteTool {
         let v = parse_input(input)?;
         let path = require_str(&v, "path")?;
         let content = require_str(&v, "content")?;
-        let full = resolve(self.root.as_deref(), &path)?;
+        let sandboxed = self.root.is_some();
+        let full = resolve_for_write(self.root.as_deref(), &path)?;
 
-        if let Some(parent) = full.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent).map_err(io_err)?;
+        if sandboxed {
+            // Refuse to write through a pre-existing symlink at the
+            // leaf. `symlink_metadata` does not follow symlinks, so a
+            // planted `<root>/innocent -> /etc/passwd` is detected
+            // here.
+            match std::fs::symlink_metadata(&full) {
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    return Err(ToolError(format!(
+                        "refusing to write through symlink: {path}"
+                    )));
+                }
+                Ok(_) | Err(_) => {}
+            }
         }
         std::fs::write(&full, content.as_bytes()).map_err(io_err)?;
         Ok(format!("wrote {} bytes to {}", content.len(), full.display()))
@@ -119,8 +162,17 @@ impl Tool for EditTool {
         let path = require_str(&v, "path")?;
         let old_text = require_str(&v, "old_text")?;
         let new_text = require_str(&v, "new_text")?;
-        let full = resolve(self.root.as_deref(), &path)?;
+        let sandboxed = self.root.is_some();
+        let full = resolve_existing(self.root.as_deref(), &path)?;
 
+        if sandboxed {
+            let meta = std::fs::symlink_metadata(&full).map_err(io_err)?;
+            if meta.file_type().is_symlink() {
+                return Err(ToolError(format!(
+                    "refusing to edit through symlink: {path}"
+                )));
+            }
+        }
         let bytes = std::fs::read(&full).map_err(io_err)?;
         let text = std::str::from_utf8(&bytes)
             .map_err(|e| ToolError(format!("not UTF-8: {e}")))?;
@@ -173,11 +225,38 @@ fn io_err(e: std::io::Error) -> ToolError {
     ToolError(e.to_string())
 }
 
-/// Resolve `path` under optional sandbox `root`. Refuses `..` components
-/// always; refuses absolute paths when a root is set; ensures the
-/// canonicalised result (when both the resolved path and root exist)
-/// stays inside the root.
-fn resolve(root: Option<&Path>, path: &str) -> Result<PathBuf, ToolError> {
+/// Split a relative path into its `Normal` components, rejecting any
+/// `..`, `.`, prefix (drive letters on Windows) or root-dir components.
+/// Returns the components as owned `PathBuf`s — easier to feed back into
+/// `join` than `Component<'_>`.
+fn user_components(path: &str) -> Result<Vec<PathBuf>, ToolError> {
+    let p = Path::new(path);
+    let mut out = Vec::new();
+    for c in p.components() {
+        match c {
+            Component::Normal(part) => out.push(PathBuf::from(part)),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(ToolError(format!("path traversal not allowed: {path}")));
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                // The caller has already separately rejected absolute
+                // paths when a root is set; this guards the
+                // root-less branch from somehow producing an absolute.
+                return Err(ToolError(format!(
+                    "absolute paths not allowed under sandbox root: {path}"
+                )));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Resolve `path` under optional sandbox `root` for an operation that
+/// requires the file to already exist (Read, Edit). Every intermediate
+/// component, plus the leaf, must be a non-symlink that resolves inside
+/// the canonical root.
+fn resolve_existing(root: Option<&Path>, path: &str) -> Result<PathBuf, ToolError> {
     let p = Path::new(path);
     if p.components().any(|c| matches!(c, Component::ParentDir)) {
         return Err(ToolError(format!("path traversal not allowed: {path}")));
@@ -193,17 +272,124 @@ fn resolve(root: Option<&Path>, path: &str) -> Result<PathBuf, ToolError> {
         )));
     }
 
-    let joined = root.join(p);
-    // If both ends canonicalise, double-check that the resolved path
-    // really sits under the root — guards against symlinks escaping.
-    if let (Ok(rc), Ok(jc)) = (root.canonicalize(), joined.canonicalize())
-        && !jc.starts_with(&rc)
-    {
+    let comps = user_components(path)?;
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|e| ToolError(format!("sandbox root unreadable: {e}")))?;
+
+    let mut cur = canonical_root.clone();
+    for part in &comps {
+        cur.push(part);
+        // `symlink_metadata` does NOT follow symlinks, so we detect a
+        // symlink at this component before walking through it.
+        let meta = std::fs::symlink_metadata(&cur).map_err(io_err)?;
+        if meta.file_type().is_symlink() {
+            return Err(ToolError(format!(
+                "refusing to traverse symlink at component {:?} of {path}",
+                part.display()
+            )));
+        }
+        // Belt and braces: even without symlinks, re-canonicalising the
+        // running prefix must stay inside the canonical root. This also
+        // catches obscure filesystems (bind mounts, hard-link tricks)
+        // where the lexical join wandered out of bounds.
+        let canon = cur
+            .canonicalize()
+            .map_err(|e| ToolError(format!("cannot resolve path: {e}")))?;
+        if !canon.starts_with(&canonical_root) {
+            return Err(ToolError(format!(
+                "resolved path escapes sandbox root: {path}"
+            )));
+        }
+    }
+    Ok(cur)
+}
+
+/// Resolve `path` under optional sandbox `root` for a write that may
+/// need to create the leaf (and intermediate directories). Walks the
+/// existing prefix using the same symlink checks as `resolve_existing`,
+/// then creates any missing intermediate directories one at a time via
+/// `mkdir` — never `create_dir_all` on a joined path, since that would
+/// happily follow an attacker-planted symlink.
+fn resolve_for_write(root: Option<&Path>, path: &str) -> Result<PathBuf, ToolError> {
+    let p = Path::new(path);
+    if p.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(ToolError(format!("path traversal not allowed: {path}")));
+    }
+
+    let Some(root) = root else {
+        // No sandbox: preserve historical behaviour (create_dir_all on
+        // the joined parent). Caller is trusted.
+        if let Some(parent) = p.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent).map_err(io_err)?;
+        }
+        return Ok(p.to_path_buf());
+    };
+
+    if p.is_absolute() {
         return Err(ToolError(format!(
-            "resolved path escapes sandbox root: {path}"
+            "absolute paths not allowed under sandbox root: {path}"
         )));
     }
-    Ok(joined)
+
+    let comps = user_components(path)?;
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|e| ToolError(format!("sandbox root unreadable: {e}")))?;
+
+    if comps.is_empty() {
+        return Err(ToolError(format!("empty path: {path}")));
+    }
+
+    let last_idx = comps.len() - 1;
+    let mut cur = canonical_root.clone();
+    for (i, part) in comps.iter().enumerate() {
+        cur.push(part);
+        let is_leaf = i == last_idx;
+        match std::fs::symlink_metadata(&cur) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    return Err(ToolError(format!(
+                        "refusing to traverse symlink at component {:?} of {path}",
+                        part.display()
+                    )));
+                }
+                // Verify the running prefix stays under the canonical
+                // root after symlink-free resolution.
+                let canon = cur
+                    .canonicalize()
+                    .map_err(|e| ToolError(format!("cannot resolve path: {e}")))?;
+                if !canon.starts_with(&canonical_root) {
+                    return Err(ToolError(format!(
+                        "resolved path escapes sandbox root: {path}"
+                    )));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // This component does not exist. If it's an
+                // intermediate, create it. If it's the leaf, leave it
+                // — the caller (`std::fs::write`) will create it. In
+                // either case the parent has already been verified.
+                if !is_leaf {
+                    std::fs::create_dir(&cur).map_err(io_err)?;
+                    // Re-validate: the freshly created dir should
+                    // canonicalize inside the root.
+                    let canon = cur
+                        .canonicalize()
+                        .map_err(|e| ToolError(format!("cannot resolve path: {e}")))?;
+                    if !canon.starts_with(&canonical_root) {
+                        return Err(ToolError(format!(
+                            "resolved path escapes sandbox root: {path}"
+                        )));
+                    }
+                }
+            }
+            Err(e) => return Err(io_err(e)),
+        }
+    }
+    Ok(cur)
 }
 
 fn format_numbered(text: &str, offset: Option<usize>, limit: Option<usize>) -> String {
@@ -623,6 +809,276 @@ mod tests {
     }
 
     // ---- definitions / metadata ----
+
+    // ---- symlink safety (unix only; we use std::os::unix::fs::symlink) ----
+
+    #[cfg(unix)]
+    mod symlink {
+        use super::*;
+        use std::os::unix::fs::symlink;
+
+        /// Build a sandbox `root` containing `target_kind`-style decoys.
+        /// Returns `(root, secret_file_path)` where `secret_file_path`
+        /// lives outside `root` and contains "SECRET".
+        fn sandbox_with_secret(label: &str) -> (PathBuf, PathBuf) {
+            let parent = unique(label);
+            std::fs::create_dir_all(&parent).unwrap();
+            let root = parent.join("root");
+            std::fs::create_dir_all(&root).unwrap();
+            let secret = parent.join("secret.txt");
+            std::fs::write(&secret, "SECRET").unwrap();
+            (root, secret)
+        }
+
+        #[test]
+        fn read_refuses_symlink_to_outside_file() {
+            let (root, secret) = sandbox_with_secret("sym-read-out");
+            symlink(&secret, root.join("innocent")).unwrap();
+            let h = Harness::new();
+            let ctx = ToolCtx { instance: h.addr() };
+            let err = ReadTool { root: Some(root.clone()) }
+                .call(r#"{"path":"innocent"}"#, &ctx)
+                .unwrap_err();
+            assert!(
+                err.0.contains("symlink") || err.0.contains("escapes"),
+                "got: {}",
+                err.0
+            );
+            cleanup(root.parent().unwrap());
+        }
+
+        #[test]
+        fn read_refuses_symlink_to_inside_file() {
+            // Strict policy: even an inside-root symlink is refused.
+            let parent = unique("sym-read-in");
+            std::fs::create_dir_all(&parent).unwrap();
+            let root = parent.join("root");
+            std::fs::create_dir_all(&root).unwrap();
+            let target = root.join("real.txt");
+            std::fs::write(&target, "ok").unwrap();
+            symlink(&target, root.join("alias")).unwrap();
+            let h = Harness::new();
+            let ctx = ToolCtx { instance: h.addr() };
+            let err = ReadTool { root: Some(root.clone()) }
+                .call(r#"{"path":"alias"}"#, &ctx)
+                .unwrap_err();
+            assert!(err.0.contains("symlink"), "got: {}", err.0);
+            cleanup(&parent);
+        }
+
+        #[test]
+        fn read_refuses_inside_symlinked_dir() {
+            // <root>/dir is a symlink to <parent>/elsewhere/ which has inner.txt.
+            let parent = unique("sym-read-dir");
+            std::fs::create_dir_all(&parent).unwrap();
+            let root = parent.join("root");
+            std::fs::create_dir_all(&root).unwrap();
+            let elsewhere = parent.join("elsewhere");
+            std::fs::create_dir_all(&elsewhere).unwrap();
+            std::fs::write(elsewhere.join("inner.txt"), "leaked").unwrap();
+            symlink(&elsewhere, root.join("dir")).unwrap();
+            let h = Harness::new();
+            let ctx = ToolCtx { instance: h.addr() };
+            let err = ReadTool { root: Some(root.clone()) }
+                .call(r#"{"path":"dir/inner.txt"}"#, &ctx)
+                .unwrap_err();
+            assert!(err.0.contains("symlink"), "got: {}", err.0);
+            cleanup(&parent);
+        }
+
+        #[test]
+        fn write_refuses_symlink_to_outside_file() {
+            let (root, secret) = sandbox_with_secret("sym-write-out");
+            symlink(&secret, root.join("innocent")).unwrap();
+            let h = Harness::new();
+            let ctx = ToolCtx { instance: h.addr() };
+            let err = WriteTool { root: Some(root.clone()) }
+                .call(r#"{"path":"innocent","content":"pwned"}"#, &ctx)
+                .unwrap_err();
+            assert!(err.0.contains("symlink"), "got: {}", err.0);
+            // And the target was NOT written through.
+            assert_eq!(std::fs::read_to_string(&secret).unwrap(), "SECRET");
+            cleanup(root.parent().unwrap());
+        }
+
+        #[test]
+        fn write_refuses_through_intermediate_symlink() {
+            // <root>/a -> /var/tmp-ish/somewhere; write a/b/c.txt would
+            // end up at .../somewhere/b/c.txt.
+            let parent = unique("sym-write-mid");
+            std::fs::create_dir_all(&parent).unwrap();
+            let root = parent.join("root");
+            std::fs::create_dir_all(&root).unwrap();
+            let elsewhere = parent.join("elsewhere");
+            std::fs::create_dir_all(&elsewhere).unwrap();
+            symlink(&elsewhere, root.join("a")).unwrap();
+            let h = Harness::new();
+            let ctx = ToolCtx { instance: h.addr() };
+            let err = WriteTool { root: Some(root.clone()) }
+                .call(r#"{"path":"a/b/c.txt","content":"pwned"}"#, &ctx)
+                .unwrap_err();
+            assert!(err.0.contains("symlink"), "got: {}", err.0);
+            assert!(!elsewhere.join("b").exists(), "wrote through symlink");
+            cleanup(&parent);
+        }
+
+        #[test]
+        fn edit_refuses_symlink_to_outside_file() {
+            let (root, secret) = sandbox_with_secret("sym-edit-out");
+            symlink(&secret, root.join("innocent")).unwrap();
+            let h = Harness::new();
+            let ctx = ToolCtx { instance: h.addr() };
+            let err = EditTool { root: Some(root.clone()) }
+                .call(
+                    r#"{"path":"innocent","old_text":"SECRET","new_text":"PWNED"}"#,
+                    &ctx,
+                )
+                .unwrap_err();
+            assert!(err.0.contains("symlink"), "got: {}", err.0);
+            assert_eq!(std::fs::read_to_string(&secret).unwrap(), "SECRET");
+            cleanup(root.parent().unwrap());
+        }
+
+        #[test]
+        fn edit_refuses_inside_symlinked_dir() {
+            let parent = unique("sym-edit-dir");
+            std::fs::create_dir_all(&parent).unwrap();
+            let root = parent.join("root");
+            std::fs::create_dir_all(&root).unwrap();
+            let elsewhere = parent.join("elsewhere");
+            std::fs::create_dir_all(&elsewhere).unwrap();
+            std::fs::write(elsewhere.join("f.txt"), "alpha").unwrap();
+            symlink(&elsewhere, root.join("dir")).unwrap();
+            let h = Harness::new();
+            let ctx = ToolCtx { instance: h.addr() };
+            let err = EditTool { root: Some(root.clone()) }
+                .call(
+                    r#"{"path":"dir/f.txt","old_text":"alpha","new_text":"beta"}"#,
+                    &ctx,
+                )
+                .unwrap_err();
+            assert!(err.0.contains("symlink"), "got: {}", err.0);
+            assert_eq!(std::fs::read_to_string(elsewhere.join("f.txt")).unwrap(), "alpha");
+            cleanup(&parent);
+        }
+
+        #[test]
+        fn write_create_parents_under_legitimate_dirs_still_works() {
+            // Sanity: no symlinks involved, write should create intermediates.
+            let parent = unique("sym-write-ok");
+            std::fs::create_dir_all(&parent).unwrap();
+            let root = parent.join("root");
+            std::fs::create_dir_all(&root).unwrap();
+            let h = Harness::new();
+            let ctx = ToolCtx { instance: h.addr() };
+            WriteTool { root: Some(root.clone()) }
+                .call(r#"{"path":"x/y/z.txt","content":"ok"}"#, &ctx)
+                .unwrap();
+            assert_eq!(
+                std::fs::read_to_string(root.join("x/y/z.txt")).unwrap(),
+                "ok"
+            );
+            cleanup(&parent);
+        }
+
+        #[test]
+        fn read_without_root_follows_symlinks() {
+            // Opt-out path: when root: None, the caller is trusted and
+            // historical behaviour is preserved — symlinks are followed
+            // transparently. Restricting trusted CLI invocations would
+            // be a usability regression.
+            let parent = unique("sym-noroot");
+            std::fs::create_dir_all(&parent).unwrap();
+            let target = parent.join("target.txt");
+            std::fs::write(&target, "value\n").unwrap();
+            let link = parent.join("link");
+            symlink(&target, &link).unwrap();
+            let h = Harness::new();
+            let ctx = ToolCtx { instance: h.addr() };
+            let input = format!(
+                r#"{{"path":"{}"}}"#,
+                json_escape(&link.to_string_lossy())
+            );
+            let out = ReadTool { root: None }.call(&input, &ctx).unwrap();
+            assert!(out.contains("value"), "got: {}", out);
+            cleanup(&parent);
+        }
+
+        #[test]
+        fn symlink_loop_does_not_panic() {
+            let parent = unique("sym-loop");
+            std::fs::create_dir_all(&parent).unwrap();
+            let root = parent.join("root");
+            std::fs::create_dir_all(&root).unwrap();
+            // a -> b, b -> a.
+            symlink(root.join("b"), root.join("a")).unwrap();
+            symlink(root.join("a"), root.join("b")).unwrap();
+            let h = Harness::new();
+            let ctx = ToolCtx { instance: h.addr() };
+            let err = ReadTool { root: Some(root.clone()) }
+                .call(r#"{"path":"a"}"#, &ctx)
+                .unwrap_err();
+            // Should be a ToolError with non-empty message, not a panic.
+            assert!(!err.0.is_empty());
+            cleanup(&parent);
+        }
+
+        #[test]
+        fn write_refuses_absolute_path_under_root() {
+            let parent = unique("sym-abs");
+            std::fs::create_dir_all(&parent).unwrap();
+            let root = parent.join("root");
+            std::fs::create_dir_all(&root).unwrap();
+            let h = Harness::new();
+            let ctx = ToolCtx { instance: h.addr() };
+            let err = WriteTool { root: Some(root.clone()) }
+                .call(r#"{"path":"/etc/passwd","content":"x"}"#, &ctx)
+                .unwrap_err();
+            assert!(err.0.contains("absolute paths not allowed"), "got: {}", err.0);
+            cleanup(&parent);
+        }
+
+        #[test]
+        fn write_into_existing_inside_root_dir_succeeds() {
+            // <root>/dir/ exists as a real dir; write dir/f.txt works.
+            let parent = unique("sym-real-dir");
+            std::fs::create_dir_all(&parent).unwrap();
+            let root = parent.join("root");
+            std::fs::create_dir_all(root.join("dir")).unwrap();
+            let h = Harness::new();
+            let ctx = ToolCtx { instance: h.addr() };
+            WriteTool { root: Some(root.clone()) }
+                .call(r#"{"path":"dir/f.txt","content":"hello"}"#, &ctx)
+                .unwrap();
+            assert_eq!(
+                std::fs::read_to_string(root.join("dir/f.txt")).unwrap(),
+                "hello"
+            );
+            cleanup(&parent);
+        }
+
+        #[test]
+        fn edit_inside_root_real_file_succeeds() {
+            let parent = unique("sym-edit-real");
+            std::fs::create_dir_all(&parent).unwrap();
+            let root = parent.join("root");
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join("f.txt"), "hello world\n").unwrap();
+            let h = Harness::new();
+            let ctx = ToolCtx { instance: h.addr() };
+            EditTool { root: Some(root.clone()) }
+                .call(
+                    r#"{"path":"f.txt","old_text":"world","new_text":"there"}"#,
+                    &ctx,
+                )
+                .unwrap();
+            assert_eq!(
+                std::fs::read_to_string(root.join("f.txt")).unwrap(),
+                "hello there\n"
+            );
+            cleanup(&parent);
+        }
+    }
 
     #[test]
     fn tool_definitions_round_trip() {

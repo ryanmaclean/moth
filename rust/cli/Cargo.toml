@@ -14,6 +14,8 @@ actor = { path = "../actor" }
 anthropic = { path = "../anthropic" }
 fstools = { path = "../fstools" }
 harness = { path = "../harness" }
+mcp = { path = "../mcp" }
+persist = { path = "../persist" }
 server = { path = "../server" }
 tmpl = { path = "../tmpl" }
 vshell = { path = "../vshell" }

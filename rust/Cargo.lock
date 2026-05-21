@@ -39,6 +39,8 @@ dependencies = [
  "anthropic",
  "fstools",
  "harness",
+ "mcp",
+ "persist",
  "server",
  "tmpl",
  "vshell",
