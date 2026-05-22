@@ -23,6 +23,28 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Process-wide cancellation flag set by SIGINT. The `run` event loop
+/// checks it every event; flipping it causes the CLI to drop the
+/// streaming receiver, which propagates as a cancellation through the
+/// session iteration loop.
+static CANCEL: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn sigint_handler(_: libc::c_int) {
+    CANCEL.store(true, Ordering::SeqCst);
+}
+
+/// Install a SIGINT handler that flips `CANCEL`. Repeated SIGINTs after
+/// the first hit the default handler (SIG_DFL), so a second Ctrl-C
+/// terminates the process if the agent is stuck.
+fn install_sigint() {
+    unsafe {
+        // Set the C-side handler. After the first signal we restore
+        // SIG_DFL so the user can force-quit with a second Ctrl-C.
+        libc::signal(libc::SIGINT, sigint_handler as *const () as libc::sighandler_t);
+    }
+}
 
 use actor::spawn;
 use git::{AgentStatus, Branch, BranchStrategy, HeadStrategy, MergeToHeadStrategy};
@@ -36,6 +58,7 @@ const DEFAULT_ANTHROPIC_MODEL: &str = "claude-haiku-4-5";
 const DEFAULT_OPENAI_MODEL: &str = "gpt-4o-mini";
 
 fn main() -> ExitCode {
+    install_sigint();
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
         return usage_and_exit(2);
@@ -445,6 +468,15 @@ fn run_cmd(mut args: Vec<String>) -> ExitCode {
     let mut turns = 0usize;
     let mut last_was_newline = true;
     let (exit, agent_status) = loop {
+        // SIGINT? Drop the receiver to signal cancellation to the session.
+        if CANCEL.load(Ordering::SeqCst) {
+            drop(rx);
+            eprintln!("[cancelling on SIGINT]");
+            break (
+                ExitCode::from(130),
+                AgentStatus::Failure("cancelled by signal".into()),
+            );
+        }
         let ev = match rx.recv() {
             Ok(ev) => ev,
             Err(_) => {

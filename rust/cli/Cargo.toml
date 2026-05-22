@@ -24,3 +24,4 @@ server = { path = "../server" }
 subagent = { path = "../subagent" }
 tmpl = { path = "../tmpl" }
 vshell = { path = "../vshell" }
+libc = "0.2"

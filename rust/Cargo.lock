@@ -51,6 +51,7 @@ dependencies = [
  "fstools",
  "git",
  "harness",
+ "libc",
  "mcp",
  "mcp_server",
  "persist",
