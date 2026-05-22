@@ -298,11 +298,12 @@ fn run_cmd(mut args: Vec<String>) -> ExitCode {
     }
     let sess = spawn(sess_build);
 
-    let (tx, rx) = sync_channel(1);
-    if let Err(e) = sess.addr.send(SessionMsg::Prompt {
+    // Use streaming so text deltas print to stdout as the model generates them.
+    let (tx, rx) = std::sync::mpsc::channel::<harness::StreamEvent>();
+    if let Err(e) = sess.addr.send(SessionMsg::PromptStream {
         text: prompt,
         structured_output_tag: None,
-        reply: tx,
+        events: tx,
     }) {
         eprintln!("send failed: {e}");
         drop(mcp_clients);
@@ -312,31 +313,66 @@ fn run_cmd(mut args: Vec<String>) -> ExitCode {
         return ExitCode::from(1);
     }
 
-    let (exit, agent_status) = match rx.recv() {
-        Ok(Ok(pr)) => {
-            print!("{}", pr.text);
-            if !pr.text.ends_with('\n') {
-                println!();
+    use std::io::Write as _;
+    let mut completed = false;
+    let mut turns = 0usize;
+    let mut last_was_newline = true;
+    let (exit, agent_status) = loop {
+        match rx.recv() {
+            Ok(harness::StreamEvent::TextDelta(s)) => {
+                last_was_newline = s.ends_with('\n');
+                print!("{s}");
+                let _ = std::io::stdout().flush();
             }
-            if pr.completed {
-                eprintln!("[completion signal fired after {} turn(s)]", pr.turns);
-            } else if pr.turns > 1 {
-                eprintln!("[{} turn(s)]", pr.turns);
+            Ok(harness::StreamEvent::ToolUseStart { name, .. }) => {
+                if !last_was_newline {
+                    println!();
+                }
+                eprintln!("[tool: {name}]");
+                last_was_newline = true;
             }
-            (ExitCode::SUCCESS, AgentStatus::Success)
-        }
-        Ok(Err(e)) => {
-            eprintln!("session error: {e:?}");
-            (ExitCode::from(1), AgentStatus::Failure(format!("{e:?}")))
-        }
-        Err(_) => {
-            eprintln!("session dropped reply channel");
-            (
-                ExitCode::from(1),
-                AgentStatus::Failure("session dropped reply channel".into()),
-            )
+            Ok(harness::StreamEvent::ToolResult { is_error, .. }) => {
+                if is_error {
+                    eprintln!("[tool error]");
+                }
+            }
+            Ok(harness::StreamEvent::TurnComplete { turn, .. }) => {
+                turns = turn;
+            }
+            Ok(harness::StreamEvent::Done(pr)) => {
+                if !last_was_newline {
+                    println!();
+                }
+                completed = pr.completed;
+                turns = pr.turns;
+                break (ExitCode::SUCCESS, AgentStatus::Success);
+            }
+            Ok(harness::StreamEvent::Cancelled) => {
+                eprintln!("[cancelled]");
+                break (
+                    ExitCode::from(130),
+                    AgentStatus::Failure("cancelled".into()),
+                );
+            }
+            Ok(harness::StreamEvent::Error(e)) => {
+                eprintln!("session error: {e:?}");
+                break (ExitCode::from(1), AgentStatus::Failure(format!("{e:?}")));
+            }
+            Ok(_) => {}
+            Err(_) => {
+                eprintln!("session dropped event channel");
+                break (
+                    ExitCode::from(1),
+                    AgentStatus::Failure("session dropped event channel".into()),
+                );
+            }
         }
     };
+    if completed {
+        eprintln!("[completion signal fired after {turns} turn(s)]");
+    } else if turns > 1 {
+        eprintln!("[{turns} turn(s)]");
+    }
 
     let _ = sess.join();
     let _ = inst.join();

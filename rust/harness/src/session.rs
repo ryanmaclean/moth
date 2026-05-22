@@ -15,7 +15,7 @@
 //!      loop back to (2). Otherwise return.
 
 use std::sync::Arc;
-use std::sync::mpsc::SyncSender;
+use std::sync::mpsc::{Sender, SyncSender};
 
 use actor::{Actor, ActorRef};
 use wire::find_tag;
@@ -98,6 +98,7 @@ impl Session {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct PromptResult {
     pub text: String,
     pub structured: Option<Vec<u8>>,
@@ -118,10 +119,38 @@ pub enum SessionMsg {
         structured_output_tag: Option<String>,
         reply: SyncSender<Result<PromptResult, SessionError>>,
     },
+    /// Same iteration loop as `Prompt`, but emits `StreamEvent`s through
+    /// `events` as the turn progresses. Drop the receiver to cancel: the
+    /// next `events.send()` returns Err, the iteration aborts cleanly,
+    /// the partial assistant turn is appended to history, and the final
+    /// `Done(_)` / `Cancelled` is the last event sent (best-effort —
+    /// if the receiver is gone it's just dropped).
+    PromptStream {
+        text: String,
+        structured_output_tag: Option<String>,
+        events: Sender<StreamEvent>,
+    },
     Shell {
         cmd: String,
         reply: SyncSender<Result<ShellResult, SandboxError>>,
     },
+}
+
+/// Live events emitted while a prompt streams. Order matches the wire
+/// order of the underlying model + tool execution. `Done` or `Cancelled`
+/// is always the terminal event (best-effort: if the receiver dropped
+/// mid-stream we won't get to send it).
+#[derive(Debug, Clone)]
+pub enum StreamEvent {
+    TextDelta(String),
+    ToolUseStart { id: String, name: String },
+    ToolUseInputDelta(String),
+    BlockStop,
+    ToolResult { tool_use_id: String, content: String, is_error: bool },
+    TurnComplete { turn: usize, stop_reason: Option<String> },
+    Done(PromptResult),
+    Cancelled,
+    Error(SessionError),
 }
 
 impl Actor for Session {
@@ -131,6 +160,18 @@ impl Actor for Session {
         match msg {
             SessionMsg::Prompt { text, structured_output_tag, reply } => {
                 let _ = reply.send(self.run_prompt(text, structured_output_tag));
+            }
+            SessionMsg::PromptStream { text, structured_output_tag, events } => {
+                let result = self.run_prompt_inner(text, structured_output_tag, Some(&events));
+                // Best-effort terminal event. Cancellation already emitted
+                // its own terminal so we skip emitting Done after Cancelled.
+                if result.is_err() {
+                    let _ = events.send(StreamEvent::Error(result.err().unwrap()));
+                } else if let Ok(Some(pr)) = result {
+                    let _ = events.send(StreamEvent::Done(pr));
+                }
+                // result == Ok(None) means the receiver dropped — Cancelled
+                // was already sent (or attempted). Nothing to do.
             }
             SessionMsg::Shell { cmd, reply } => {
                 if self
@@ -152,11 +193,38 @@ impl Session {
         text: String,
         structured_output_tag: Option<String>,
     ) -> Result<PromptResult, SessionError> {
+        match self.run_prompt_inner(text, structured_output_tag, None)? {
+            Some(pr) => Ok(pr),
+            // events is None → cancellation impossible → always Some
+            None => unreachable!("non-streaming run can't be cancelled"),
+        }
+    }
+
+    /// Inner iteration loop shared by `run_prompt` (blocking) and
+    /// `SessionMsg::PromptStream`. `Ok(Some(pr))` on completion;
+    /// `Ok(None)` if `events` is set and the receiver dropped (cancellation
+    /// — partial assistant turn is still appended to history). `Err(_)` for
+    /// real failures (model error, turn-limit, etc.).
+    fn run_prompt_inner(
+        &mut self,
+        text: String,
+        structured_output_tag: Option<String>,
+        events: Option<&Sender<StreamEvent>>,
+    ) -> Result<Option<PromptResult>, SessionError> {
         self.history.push(ChatMessage::user(text));
 
         let mut response_text = String::new();
         let mut completed = false;
         let mut turns = 0;
+
+        // Closure: emit + detect cancellation. Returns false if the receiver
+        // dropped, true to keep going. No-op if there's no receiver.
+        let emit = |evs: Option<&Sender<StreamEvent>>, ev: StreamEvent| -> bool {
+            match evs {
+                Some(tx) => tx.send(ev).is_ok(),
+                None => true,
+            }
+        };
 
         loop {
             turns += 1;
@@ -175,12 +243,17 @@ impl Session {
             let mut current_text = String::new();
             let mut current_tool: Option<(String, String, String)> = None;
             let mut stop_reason: Option<String> = None;
+            let mut cancelled = false;
 
             for ev in self.harness.model.stream(req) {
                 match ev {
                     Ok(ModelEvent::TextDelta(s)) => {
                         current_text.push_str(&s);
                         response_text.push_str(&s);
+                        if !emit(events, StreamEvent::TextDelta(s)) {
+                            cancelled = true;
+                            break;
+                        }
                         if let Some(body) = find_tag(response_text.as_bytes(), b"promise")
                             && body == b"COMPLETE"
                         {
@@ -192,16 +265,31 @@ impl Session {
                         if !current_text.is_empty() {
                             blocks.push(ContentBlock::Text(std::mem::take(&mut current_text)));
                         }
+                        if !emit(events, StreamEvent::ToolUseStart {
+                            id: id.clone(),
+                            name: name.clone(),
+                        }) {
+                            cancelled = true;
+                            break;
+                        }
                         current_tool = Some((id, name, String::new()));
                     }
                     Ok(ModelEvent::ToolUseInputDelta(s)) => {
                         if let Some((_, _, input)) = current_tool.as_mut() {
                             input.push_str(&s);
                         }
+                        if !emit(events, StreamEvent::ToolUseInputDelta(s)) {
+                            cancelled = true;
+                            break;
+                        }
                     }
                     Ok(ModelEvent::BlockStop) => {
                         if let Some((id, name, input)) = current_tool.take() {
                             blocks.push(ContentBlock::ToolUse { id, name, input });
+                        }
+                        if !emit(events, StreamEvent::BlockStop) {
+                            cancelled = true;
+                            break;
                         }
                     }
                     Ok(ModelEvent::Stop { reason }) => {
@@ -231,8 +319,29 @@ impl Session {
 
             self.history.push(ChatMessage { role: Role::Assistant, content: blocks });
 
-            // Stop conditions: completion signal, no tool calls, or explicit
-            // end_turn from the model.
+            if cancelled {
+                // Persist partial history then surface Cancelled to the caller.
+                if let Some(store) = &self.store
+                    && let Err(e) = store.save(&self.name, &self.history)
+                {
+                    eprintln!("session store save failed for {}: {}", self.name, e);
+                }
+                let _ = emit(events, StreamEvent::Cancelled);
+                return Ok(None);
+            }
+
+            // Emit per-turn summary BEFORE we possibly execute tools — this
+            // lets observers (runlog, telemetry) checkpoint per turn.
+            if !emit(events, StreamEvent::TurnComplete { turn: turns, stop_reason: stop_reason.clone() }) {
+                let _ = emit(events, StreamEvent::Cancelled);
+                if let Some(store) = &self.store
+                    && let Err(e) = store.save(&self.name, &self.history)
+                {
+                    eprintln!("session store save failed for {}: {}", self.name, e);
+                }
+                return Ok(None);
+            }
+
             if completed
                 || tool_uses.is_empty()
                 || stop_reason.as_deref() == Some("end_turn")
@@ -240,10 +349,29 @@ impl Session {
                 break;
             }
 
-            // Execute each tool, build a user message of tool_results.
             let mut results: Vec<ContentBlock> = Vec::with_capacity(tool_uses.len());
             for (id, name, input) in tool_uses {
-                results.push(self.execute_tool(&id, &name, &input));
+                let block = self.execute_tool(&id, &name, &input);
+                if let ContentBlock::ToolResult { tool_use_id, content, is_error } = &block
+                    && !emit(events, StreamEvent::ToolResult {
+                        tool_use_id: tool_use_id.clone(),
+                        content: content.clone(),
+                        is_error: *is_error,
+                    })
+                {
+                    // Cancellation between tool calls: append what we have
+                    // and bail.
+                    results.push(block);
+                    self.history.push(ChatMessage { role: Role::User, content: results });
+                    if let Some(store) = &self.store
+                        && let Err(e) = store.save(&self.name, &self.history)
+                    {
+                        eprintln!("session store save failed for {}: {}", self.name, e);
+                    }
+                    let _ = emit(events, StreamEvent::Cancelled);
+                    return Ok(None);
+                }
+                results.push(block);
             }
             self.history.push(ChatMessage { role: Role::User, content: results });
         }
@@ -258,7 +386,7 @@ impl Session {
             eprintln!("session store save failed for {}: {}", self.name, e);
         }
 
-        Ok(PromptResult { text: response_text, structured, completed, turns })
+        Ok(Some(PromptResult { text: response_text, structured, completed, turns }))
     }
 
     fn execute_tool(&self, id: &str, name: &str, input: &str) -> ContentBlock {
@@ -709,6 +837,162 @@ mod tests {
             &second.messages[2].content[0],
             ContentBlock::ToolResult { is_error: true, .. }
         ));
+
+        session.join().unwrap();
+        instance.join().unwrap();
+    }
+
+    // ----- streaming + cancellation ---------------------------------------
+
+    #[test]
+    fn prompt_stream_emits_text_deltas_then_done() {
+        use std::sync::mpsc::channel;
+
+        let (instance, session, _model, _sb) = rig(
+            vec![vec![
+                ModelEvent::TextDelta("hel".into()),
+                ModelEvent::TextDelta("lo".into()),
+                ModelEvent::Stop { reason: Some("end_turn".into()) },
+            ]],
+            vec![],
+        );
+
+        let (tx, rx) = channel::<StreamEvent>();
+        session
+            .addr
+            .send(SessionMsg::PromptStream {
+                text: "hi".into(),
+                structured_output_tag: None,
+                events: tx,
+            })
+            .unwrap();
+
+        let mut text = String::new();
+        let mut done: Option<PromptResult> = None;
+        for ev in rx.iter() {
+            match ev {
+                StreamEvent::TextDelta(s) => text.push_str(&s),
+                StreamEvent::Done(pr) => {
+                    done = Some(pr);
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(text, "hello");
+        let pr = done.expect("Done event");
+        assert_eq!(pr.text, "hello");
+        assert_eq!(pr.turns, 1);
+
+        session.join().unwrap();
+        instance.join().unwrap();
+    }
+
+    #[test]
+    fn prompt_stream_cancellation_on_receiver_drop() {
+        use std::sync::mpsc::channel;
+
+        // Long script — caller will drop the receiver after the first delta.
+        let (instance, session, _model, _sb) = rig(
+            vec![vec![
+                ModelEvent::TextDelta("first".into()),
+                ModelEvent::TextDelta("second".into()),
+                ModelEvent::TextDelta("third".into()),
+                ModelEvent::Stop { reason: Some("end_turn".into()) },
+            ]],
+            vec![],
+        );
+
+        let (tx, rx) = channel::<StreamEvent>();
+        session
+            .addr
+            .send(SessionMsg::PromptStream {
+                text: "go".into(),
+                structured_output_tag: None,
+                events: tx,
+            })
+            .unwrap();
+
+        let first = rx.recv().unwrap();
+        assert!(matches!(first, StreamEvent::TextDelta(ref s) if s == "first"));
+        drop(rx); // signal cancellation
+
+        // Session shouldn't deadlock; subsequent message should still get through.
+        let echo: PromptResult = session
+            .addr
+            .ask(|reply| SessionMsg::Prompt {
+                text: "afterwards".into(),
+                structured_output_tag: None,
+                reply,
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(echo.turns, 1);
+
+        session.join().unwrap();
+        instance.join().unwrap();
+    }
+
+    #[test]
+    fn prompt_stream_emits_tool_lifecycle_events() {
+        use std::sync::mpsc::channel;
+
+        let (instance, session, _model, sandbox) = rig(
+            vec![
+                vec![
+                    ModelEvent::ToolUseStart {
+                        id: "toolu_1".into(),
+                        name: "bash".into(),
+                    },
+                    ModelEvent::ToolUseInputDelta(r#"{"command":"echo hi"}"#.into()),
+                    ModelEvent::BlockStop,
+                    ModelEvent::Stop { reason: Some("tool_use".into()) },
+                ],
+                vec![
+                    ModelEvent::TextDelta("done".into()),
+                    ModelEvent::Stop { reason: Some("end_turn".into()) },
+                ],
+            ],
+            vec![ShellResult {
+                exit_code: 0,
+                stdout: b"hi\n".to_vec(),
+                stderr: Vec::new(),
+            }],
+        );
+
+        let (tx, rx) = channel::<StreamEvent>();
+        session
+            .addr
+            .send(SessionMsg::PromptStream {
+                text: "run".into(),
+                structured_output_tag: None,
+                events: tx,
+            })
+            .unwrap();
+
+        let mut saw_tool_start = false;
+        let mut saw_tool_input = false;
+        let mut saw_tool_result = false;
+        let mut saw_done = false;
+        for ev in rx.iter() {
+            match ev {
+                StreamEvent::ToolUseStart { name, .. } if name == "bash" => saw_tool_start = true,
+                StreamEvent::ToolUseInputDelta(_) => saw_tool_input = true,
+                StreamEvent::ToolResult { content, is_error, .. } => {
+                    saw_tool_result = true;
+                    assert!(!is_error);
+                    assert!(content.contains("hi"));
+                }
+                StreamEvent::Done(_) => {
+                    saw_done = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_tool_start && saw_tool_input && saw_tool_result && saw_done);
+        assert_eq!(sandbox.recorded.lock().unwrap().len(), 1);
 
         session.join().unwrap();
         instance.join().unwrap();
