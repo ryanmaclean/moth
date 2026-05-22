@@ -233,6 +233,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
+name = "runlog"
+version = "0.0.1"
+dependencies = [
+ "anthropic",
+ "harness",
+]
+
+[[package]]
 name = "server"
 version = "0.0.1"
 
