@@ -12,11 +12,15 @@ path = "src/main.rs"
 [dependencies]
 actor = { path = "../actor" }
 anthropic = { path = "../anthropic" }
+compact = { path = "../compact" }
 fstools = { path = "../fstools" }
 git = { path = "../git" }
 harness = { path = "../harness" }
 mcp = { path = "../mcp" }
+mcp_server = { path = "../mcp_server" }
 persist = { path = "../persist" }
+runlog = { path = "../runlog" }
 server = { path = "../server" }
+subagent = { path = "../subagent" }
 tmpl = { path = "../tmpl" }
 vshell = { path = "../vshell" }

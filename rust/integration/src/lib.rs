@@ -745,3 +745,158 @@ fn anthropic_through_harness_roundtrip() {
     sess.join().unwrap();
     inst.join().unwrap();
 }
+
+// ----- round-6 wiring scenarios ------------------------------------------
+
+#[test]
+fn streaming_emits_events_in_wire_order() {
+    let sandbox: Box<dyn Sandbox> = Box::new(harness::MockSandbox::new(vec![]));
+    let rig = Rig::build(
+        "stream",
+        sandbox,
+        Vec::new(),
+        vec![vec![
+            harness::ModelEvent::TextDelta("alpha".into()),
+            harness::ModelEvent::TextDelta("beta".into()),
+            harness::ModelEvent::Stop { reason: Some("end_turn".into()) },
+        ]],
+        None,
+    );
+    let (tx, rx) = std::sync::mpsc::channel::<harness::StreamEvent>();
+    rig.session
+        .addr
+        .send(harness::SessionMsg::PromptStream {
+            text: "hi".into(),
+            structured_output_tag: None,
+            events: tx,
+        })
+        .unwrap();
+    let mut text = String::new();
+    let mut done_seen = false;
+    for ev in rx.iter() {
+        match ev {
+            harness::StreamEvent::TextDelta(s) => text.push_str(&s),
+            harness::StreamEvent::Done(_) => {
+                done_seen = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(done_seen);
+    assert_eq!(text, "alphabeta");
+    rig.finish();
+}
+
+#[test]
+fn runlog_records_every_stream_event_to_disk() {
+    let dir = scratch("runlog");
+    std::fs::create_dir_all(&dir).unwrap();
+    let log = std::sync::Arc::new(
+        runlog::RunLog::open(&dir, "run-1").expect("runlog open"),
+    );
+    let sandbox: Box<dyn Sandbox> = Box::new(harness::MockSandbox::new(vec![]));
+    let rig = Rig::build(
+        "runlog",
+        sandbox,
+        Vec::new(),
+        vec![vec![
+            harness::ModelEvent::TextDelta("hello".into()),
+            harness::ModelEvent::Stop { reason: Some("end_turn".into()) },
+        ]],
+        None,
+    );
+    let (tx, rx) = std::sync::mpsc::channel::<harness::StreamEvent>();
+    let drainer = {
+        let log = log.clone();
+        std::thread::spawn(move || log.drain(rx))
+    };
+    rig.session
+        .addr
+        .send(harness::SessionMsg::PromptStream {
+            text: "x".into(),
+            structured_output_tag: None,
+            events: tx,
+        })
+        .unwrap();
+    // Wait for the drain by joining it AFTER the session sends events.
+    // Need to drop session/instance to close the channel.
+    rig.finish();
+    let summary = drainer.join().unwrap().expect("drain ok");
+    assert_eq!(summary.final_event, Some("done"));
+    let log_path = dir.join("run-1.jsonl");
+    let contents = std::fs::read_to_string(&log_path).expect("read log");
+    let lines: Vec<&str> = contents.lines().collect();
+    assert!(lines.iter().any(|l| l.contains("\"kind\":\"start\"")));
+    assert!(lines.iter().any(|l| l.contains("\"kind\":\"text_delta\"") && l.contains("hello")));
+    assert!(lines.iter().any(|l| l.contains("\"kind\":\"done\"")));
+    cleanup(&dir);
+}
+
+#[test]
+fn compactor_intercepts_history_before_each_turn() {
+    use std::sync::Mutex;
+    let observed: std::sync::Arc<Mutex<Vec<Vec<harness::ChatMessage>>>> =
+        std::sync::Arc::new(Mutex::new(Vec::new()));
+    let observed_clone = observed.clone();
+    let compactor: std::sync::Arc<harness::CompactFn> = std::sync::Arc::new(move |msgs| {
+        observed_clone.lock().unwrap().push(msgs.clone());
+        msgs
+    });
+
+    let model = std::sync::Arc::new(harness::MockModel::single(vec![
+        harness::ModelEvent::TextDelta("done".into()),
+        harness::ModelEvent::Stop { reason: Some("end_turn".into()) },
+    ]));
+    let sandbox: Box<dyn Sandbox> = Box::new(harness::MockSandbox::new(vec![]));
+    let instance = spawn(harness::Instance::new("ci", sandbox));
+    let state = std::sync::Arc::new(
+        harness::HarnessState::new("c", model as std::sync::Arc<dyn Model>, instance.addr.clone())
+            .with_compactor(compactor),
+    );
+    let session = spawn(harness::Session::new("s", state));
+
+    let _ = session
+        .addr
+        .ask(|reply| harness::SessionMsg::Prompt {
+            text: "ping".into(),
+            structured_output_tag: None,
+            reply,
+        })
+        .unwrap()
+        .unwrap();
+
+    let log = observed.lock().unwrap();
+    assert_eq!(log.len(), 1, "compactor should fire once per turn");
+    assert_eq!(log[0].len(), 1); // just the user("ping") message
+    drop(log);
+
+    session.join().unwrap();
+    instance.join().unwrap();
+}
+
+#[test]
+fn subagent_task_runs_via_task_tool() {
+    let sandbox: Box<dyn Sandbox> = Box::new(harness::MockSandbox::new(vec![]));
+    let instance = spawn(harness::Instance::new("ci", sandbox));
+    let model = std::sync::Arc::new(harness::MockModel::single(vec![
+        harness::ModelEvent::TextDelta("child output".into()),
+        harness::ModelEvent::Stop { reason: Some("end_turn".into()) },
+    ]));
+    let parent_state = std::sync::Arc::new(harness::HarnessState::new(
+        "p",
+        model as std::sync::Arc<dyn Model>,
+        instance.addr.clone(),
+    ));
+
+    let task = subagent::spawn_task(
+        parent_state.clone(),
+        "child prompt".into(),
+        Some("be terse".into()),
+    );
+    let result = task.join().unwrap();
+    assert_eq!(result.text, "child output");
+
+    drop(parent_state);
+    instance.join().unwrap();
+}

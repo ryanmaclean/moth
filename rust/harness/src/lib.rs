@@ -27,6 +27,6 @@ pub use model::{
 };
 pub use sandbox::{MockSandbox, Sandbox, SandboxError, ShellResult};
 pub use session::{
-    HarnessState, PromptResult, Session, SessionError, SessionMsg, StreamEvent,
+    CompactFn, HarnessState, PromptResult, Session, SessionError, SessionMsg, StreamEvent,
 };
 pub use tools::{BashTool, Tool, ToolCtx, ToolError, default_tools};

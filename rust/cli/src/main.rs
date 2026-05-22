@@ -23,7 +23,6 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::sync::mpsc::sync_channel;
 
 use actor::spawn;
 use git::{AgentStatus, Branch, BranchStrategy, HeadStrategy, MergeToHeadStrategy};
@@ -44,6 +43,7 @@ fn main() -> ExitCode {
     match args.remove(0).as_str() {
         "run" => run_cmd(args),
         "serve" => serve_cmd(args),
+        "mcp-serve" => mcp_serve_cmd(args),
         "-h" | "--help" | "help" => usage_and_exit(0),
         other => {
             eprintln!("unknown subcommand: {other}");
@@ -55,7 +55,8 @@ fn main() -> ExitCode {
 fn usage_and_exit(code: u8) -> ExitCode {
     let m = "usage:\n  \
         agent run [opts] <prompt>\n  \
-        agent serve [opts]\n\n\
+        agent serve [opts]\n  \
+        agent mcp-serve [opts]            speak MCP over stdio\n\n\
         opts:\n  \
         --openai                     use OpenAI-compatible provider\n  \
         --model NAME                 model id\n  \
@@ -63,6 +64,8 @@ fn usage_and_exit(code: u8) -> ExitCode {
         --arg KEY=VAL                substitute {{KEY}} in the skill (repeatable)\n  \
         --sessions DIR               persist message history to DIR (or SESSIONS_DIR env)\n  \
         --mcp 'CMD ARGS'             spawn MCP server, register its tools (repeatable)\n  \
+        --runlog DIR                 tee every StreamEvent to <DIR>/<run_id>.jsonl (or RUNLOG_DIR env)\n  \
+        --task-tool                  expose a 'task' tool to the LLM (Flue-style session.task)\n  \
         --branch-strategy STRATEGY   [run] head | merge-to-head | branch:NAME\n  \
         --addr HOST:PORT             [serve] bind address (default 0.0.0.0:3583)";
     eprintln!("{m}");
@@ -75,12 +78,18 @@ struct CommonOpts {
     model: Option<String>,
     sessions_dir: Option<PathBuf>,
     mcp_specs: Vec<String>,
+    runlog_dir: Option<PathBuf>,
+    enable_task_tool: bool,
+    compact_budget: Option<usize>,
 }
 
 fn parse_common(args: &mut Vec<String>) -> CommonOpts {
     let mut opts = CommonOpts::default();
     if let Ok(d) = std::env::var("SESSIONS_DIR") {
         opts.sessions_dir = Some(PathBuf::from(d));
+    }
+    if let Ok(d) = std::env::var("RUNLOG_DIR") {
+        opts.runlog_dir = Some(PathBuf::from(d));
     }
     let mut i = 0;
     while i < args.len() {
@@ -105,6 +114,22 @@ fn parse_common(args: &mut Vec<String>) -> CommonOpts {
                 args.remove(i);
                 if i < args.len() {
                     opts.mcp_specs.push(args.remove(i));
+                }
+            }
+            "--runlog" => {
+                args.remove(i);
+                if i < args.len() {
+                    opts.runlog_dir = Some(PathBuf::from(args.remove(i)));
+                }
+            }
+            "--task-tool" => {
+                opts.enable_task_tool = true;
+                args.remove(i);
+            }
+            "--compact-budget" => {
+                args.remove(i);
+                if i < args.len() {
+                    opts.compact_budget = args.remove(i).parse().ok();
                 }
             }
             _ => i += 1,
@@ -172,6 +197,76 @@ fn default_tools(root: Option<PathBuf>) -> Vec<Arc<dyn Tool>> {
         Arc::new(fstools::WriteTool { root: root.clone() }),
         Arc::new(fstools::EditTool { root }),
     ]
+}
+
+/// LLM-facing tool that spawns a focused subagent and returns its final
+/// text. Exposes Flue-style `session.task()` semantics through the model
+/// interface so the LLM can fan out exploratory work to a child it
+/// describes in a JSON `prompt` argument.
+struct TaskTool {
+    parent_state: std::sync::RwLock<Option<Arc<HarnessState>>>,
+}
+
+impl TaskTool {
+    fn new() -> Self {
+        Self { parent_state: std::sync::RwLock::new(None) }
+    }
+    fn set_state(&self, state: Arc<HarnessState>) {
+        *self.parent_state.write().unwrap() = Some(state);
+    }
+}
+
+impl Tool for TaskTool {
+    fn name(&self) -> &str {
+        "task"
+    }
+    fn description(&self) -> &str {
+        "Run a focused subagent on a self-contained prompt. The child shares the parent's sandbox and tools but starts with empty conversation history. Returns the child's final answer."
+    }
+    fn input_schema(&self) -> &str {
+        r#"{"type":"object","properties":{"prompt":{"type":"string","description":"The prompt to give the child agent."},"role":{"type":"string","description":"Optional system prompt for the child."}},"required":["prompt"]}"#
+    }
+    fn call(
+        &self,
+        input: &str,
+        _ctx: &harness::ToolCtx,
+    ) -> Result<String, harness::ToolError> {
+        let v = anthropic::json::parse(input.as_bytes())
+            .map_err(|e| harness::ToolError(format!("invalid task input: {e:?}")))?;
+        let prompt = match v.get("prompt") {
+            Some(anthropic::json::Json::Str(s)) => s.clone(),
+            _ => return Err(harness::ToolError("task: missing 'prompt'".into())),
+        };
+        let role = match v.get("role") {
+            Some(anthropic::json::Json::Str(s)) => Some(s.clone()),
+            _ => None,
+        };
+        let parent = self
+            .parent_state
+            .read()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| harness::ToolError("task tool: parent state not bound".into()))?;
+        let handle = subagent::spawn_task(parent, prompt, role);
+        match handle.join() {
+            Ok(pr) => Ok(pr.text),
+            Err(e) => Err(harness::ToolError(format!("subagent: {e:?}"))),
+        }
+    }
+}
+
+/// Spawn a `RunLog` drainer if `--runlog DIR` was given, returning a
+/// channel-tee handle that mirrors every StreamEvent into the log file
+/// AND forwards to the caller's downstream receiver.
+fn open_runlog(dir: Option<&PathBuf>, run_id: &str) -> Option<Arc<runlog::RunLog>> {
+    let dir = dir?;
+    match runlog::RunLog::open(dir, run_id) {
+        Ok(r) => Some(Arc::new(r)),
+        Err(e) => {
+            eprintln!("runlog: open {dir:?} failed: {e:?}; continuing without log");
+            None
+        }
+    }
 }
 
 fn run_cmd(mut args: Vec<String>) -> ExitCode {
@@ -289,14 +384,46 @@ fn run_cmd(mut args: Vec<String>) -> ExitCode {
     let mut tools = default_tools(fstools_root);
     tools.extend(mcp_tools);
 
+    // Optional `task` tool — the LLM can spawn subagents at will.
+    let task_tool = if common.enable_task_tool {
+        let t = Arc::new(TaskTool::new());
+        tools.push(t.clone() as Arc<dyn Tool>);
+        Some(t)
+    } else {
+        None
+    };
+
     let sandbox: Box<dyn Sandbox> = Box::new(AuditedShell::new(vshell::VShell::new()));
     let inst = spawn(Instance::new("cli", sandbox));
-    let state = HarnessState::new("default", model, inst.addr.clone()).with_tools(tools);
-    let mut sess_build = Session::new("default", Arc::new(state));
+    let mut state_build =
+        HarnessState::new("default", model.clone(), inst.addr.clone()).with_tools(tools);
+    if let Some(budget) = common.compact_budget {
+        let compactor = compact::Compactor::new(model.clone(), budget);
+        let cb: Arc<harness::CompactFn> = Arc::new(move |msgs| {
+            compactor.maybe_compact(msgs.clone()).unwrap_or(msgs)
+        });
+        state_build = state_build.with_compactor(cb);
+    }
+    let state = Arc::new(state_build);
+    if let Some(tt) = &task_tool {
+        tt.set_state(state.clone());
+    }
+    let mut sess_build = Session::new("default", state.clone());
     if let Some(s) = store {
         sess_build = sess_build.with_store(s);
     }
     let sess = spawn(sess_build);
+
+    // Optional run log: tee every StreamEvent into <dir>/<run_id>.jsonl.
+    let run_id = format!("run-{}", unix_ms_now());
+    let runlog_handle = open_runlog(common.runlog_dir.as_ref(), &run_id);
+    let (log_tx, log_rx) = std::sync::mpsc::channel::<harness::StreamEvent>();
+    let log_thread = runlog_handle.as_ref().map(|r| {
+        let r = r.clone();
+        std::thread::spawn(move || {
+            let _ = r.drain(log_rx);
+        })
+    });
 
     // Use streaming so text deltas print to stdout as the model generates them.
     let (tx, rx) = std::sync::mpsc::channel::<harness::StreamEvent>();
@@ -318,47 +445,8 @@ fn run_cmd(mut args: Vec<String>) -> ExitCode {
     let mut turns = 0usize;
     let mut last_was_newline = true;
     let (exit, agent_status) = loop {
-        match rx.recv() {
-            Ok(harness::StreamEvent::TextDelta(s)) => {
-                last_was_newline = s.ends_with('\n');
-                print!("{s}");
-                let _ = std::io::stdout().flush();
-            }
-            Ok(harness::StreamEvent::ToolUseStart { name, .. }) => {
-                if !last_was_newline {
-                    println!();
-                }
-                eprintln!("[tool: {name}]");
-                last_was_newline = true;
-            }
-            Ok(harness::StreamEvent::ToolResult { is_error, .. }) => {
-                if is_error {
-                    eprintln!("[tool error]");
-                }
-            }
-            Ok(harness::StreamEvent::TurnComplete { turn, .. }) => {
-                turns = turn;
-            }
-            Ok(harness::StreamEvent::Done(pr)) => {
-                if !last_was_newline {
-                    println!();
-                }
-                completed = pr.completed;
-                turns = pr.turns;
-                break (ExitCode::SUCCESS, AgentStatus::Success);
-            }
-            Ok(harness::StreamEvent::Cancelled) => {
-                eprintln!("[cancelled]");
-                break (
-                    ExitCode::from(130),
-                    AgentStatus::Failure("cancelled".into()),
-                );
-            }
-            Ok(harness::StreamEvent::Error(e)) => {
-                eprintln!("session error: {e:?}");
-                break (ExitCode::from(1), AgentStatus::Failure(format!("{e:?}")));
-            }
-            Ok(_) => {}
+        let ev = match rx.recv() {
+            Ok(ev) => ev,
             Err(_) => {
                 eprintln!("session dropped event channel");
                 break (
@@ -366,6 +454,51 @@ fn run_cmd(mut args: Vec<String>) -> ExitCode {
                     AgentStatus::Failure("session dropped event channel".into()),
                 );
             }
+        };
+        // Mirror to the run log first; channel-closed there is a warning,
+        // not fatal — the run keeps going.
+        let _ = log_tx.send(ev.clone());
+        match ev {
+            harness::StreamEvent::TextDelta(s) => {
+                last_was_newline = s.ends_with('\n');
+                print!("{s}");
+                let _ = std::io::stdout().flush();
+            }
+            harness::StreamEvent::ToolUseStart { name, .. } => {
+                if !last_was_newline {
+                    println!();
+                }
+                eprintln!("[tool: {name}]");
+                last_was_newline = true;
+            }
+            harness::StreamEvent::ToolResult { is_error, .. } => {
+                if is_error {
+                    eprintln!("[tool error]");
+                }
+            }
+            harness::StreamEvent::TurnComplete { turn, .. } => {
+                turns = turn;
+            }
+            harness::StreamEvent::Done(pr) => {
+                if !last_was_newline {
+                    println!();
+                }
+                completed = pr.completed;
+                turns = pr.turns;
+                break (ExitCode::SUCCESS, AgentStatus::Success);
+            }
+            harness::StreamEvent::Cancelled => {
+                eprintln!("[cancelled]");
+                break (
+                    ExitCode::from(130),
+                    AgentStatus::Failure("cancelled".into()),
+                );
+            }
+            harness::StreamEvent::Error(e) => {
+                eprintln!("session error: {e:?}");
+                break (ExitCode::from(1), AgentStatus::Failure(format!("{e:?}")));
+            }
+            _ => {}
         }
     };
     if completed {
@@ -376,6 +509,11 @@ fn run_cmd(mut args: Vec<String>) -> ExitCode {
 
     let _ = sess.join();
     let _ = inst.join();
+    // Close the runlog channel so the drainer thread exits.
+    drop(log_tx);
+    if let Some(t) = log_thread {
+        let _ = t.join();
+    }
     drop(mcp_clients);
     if let (Some(s), Some(ws)) = (strategy, workspace)
         && let Err(e) = s.finish(ws, agent_status)
@@ -500,26 +638,66 @@ impl AgentHandler for ChatHandler {
         }
         let sess = spawn(sess_build);
 
-        let (tx, rx) = sync_channel(1);
+        // Streaming: forward each Session StreamEvent to the SSE client as
+        // it arrives. Client-disconnect (sink.emit fails) propagates to the
+        // session as a closed receiver, which triggers in-loop cancellation.
+        let (tx, rx) = std::sync::mpsc::channel::<harness::StreamEvent>();
         sess.addr
-            .send(SessionMsg::Prompt {
+            .send(SessionMsg::PromptStream {
                 text: prompt,
                 structured_output_tag: None,
-                reply: tx,
+                events: tx,
             })
             .map_err(|e| HandlerError(format!("session send: {e}")))?;
 
-        let result = rx.recv().map_err(|_| HandlerError("session dropped".into()))?;
+        let mut final_err: Option<HandlerError> = None;
+        for ev in rx.iter() {
+            let write_result = match &ev {
+                harness::StreamEvent::TextDelta(s) => sink.emit(Some("text_delta"), s),
+                harness::StreamEvent::ToolUseStart { id: tid, name } => {
+                    sink.emit(Some("tool_use_start"), &format!("{tid}\t{name}"))
+                }
+                harness::StreamEvent::ToolUseInputDelta(s) => {
+                    sink.emit(Some("tool_use_input_delta"), s)
+                }
+                harness::StreamEvent::BlockStop => sink.emit(Some("block_stop"), ""),
+                harness::StreamEvent::ToolResult { tool_use_id, content, is_error } => {
+                    sink.emit(
+                        Some("tool_result"),
+                        &format!("{tool_use_id}\t{is_error}\t{content}"),
+                    )
+                }
+                harness::StreamEvent::TurnComplete { turn, stop_reason } => sink.emit(
+                    Some("turn_complete"),
+                    &format!("{}\t{}", turn, stop_reason.as_deref().unwrap_or("")),
+                ),
+                harness::StreamEvent::Done(pr) => sink.emit(
+                    Some("done"),
+                    &format!("turns={}\tcompleted={}", pr.turns, pr.completed),
+                ),
+                harness::StreamEvent::Cancelled => sink.emit(Some("cancelled"), ""),
+                harness::StreamEvent::Error(e) => {
+                    final_err = Some(HandlerError(format!("{e:?}")));
+                    Ok(())
+                }
+            };
+            if write_result.is_err() {
+                // Client disconnected; dropping rx will cancel the in-flight
+                // turn on the next event boundary.
+                break;
+            }
+            if matches!(&ev, harness::StreamEvent::Done(_) | harness::StreamEvent::Cancelled) {
+                break;
+            }
+        }
+
+        drop(rx); // signal cancellation to the still-running session if any
         let _ = sess.join();
         let _ = inst.join();
 
-        match result {
-            Ok(pr) => {
-                let _ = sink.emit(Some("text"), &pr.text);
-                let _ = sink.emit(Some("done"), &format!("turns={}", pr.turns));
-                Ok(())
-            }
-            Err(e) => Err(HandlerError(format!("{e:?}"))),
+        match final_err {
+            Some(e) => Err(e),
+            None => Ok(()),
         }
     }
 }
@@ -538,5 +716,54 @@ fn parse_prompt(body: &[u8]) -> Result<String, String> {
         }
     } else {
         Ok(trimmed.to_string())
+    }
+}
+
+fn unix_ms_now() -> u128 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+/// `agent mcp-serve` — speak MCP JSON-RPC over stdio so other agents can
+/// call our tool registry (bash + read/write/edit + audit). Useful for
+/// chaining agents: parent agent A connects to child agent B's mcp server.
+fn mcp_serve_cmd(mut args: Vec<String>) -> ExitCode {
+    let common = parse_common(&mut args);
+    if !args.is_empty() {
+        eprintln!("unexpected args: {args:?}");
+        return usage_and_exit(2);
+    }
+
+    let (mcp_clients, mcp_tools) = match connect_mcp(&common.mcp_specs) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+    let mut tools = default_tools(None);
+    tools.extend(mcp_tools);
+
+    let sandbox: Box<dyn Sandbox> = Box::new(AuditedShell::new(vshell::VShell::new()));
+    let inst = spawn(Instance::new("mcp-serve", sandbox));
+
+    let mut srv = mcp_server::Server::new("sandcastle", env!("CARGO_PKG_VERSION"), inst.addr.clone());
+    for t in tools {
+        srv.register(t);
+    }
+
+    eprintln!("mcp server: stdio (waiting for handshake)");
+    let result = srv.serve_stdio();
+    drop(mcp_clients);
+    let _ = inst.join();
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("mcp serve: {e:?}");
+            ExitCode::from(1)
+        }
     }
 }

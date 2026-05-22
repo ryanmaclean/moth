@@ -79,6 +79,10 @@ fn child_state(
         default_max_tokens: parent.default_max_tokens,
         instance: parent.instance.clone(),
         tools: parent.tools.clone(),
+        // Inherit the parent's compactor — children of long sessions also
+        // benefit from history-trimming, even though their own history
+        // starts empty (they may run many internal turns).
+        compactor: parent.compactor.clone(),
     })
 }
 
@@ -357,6 +361,7 @@ mod tests {
             default_max_tokens: state_no_sys.default_max_tokens,
             instance: state_no_sys.instance.clone(),
             tools: state_no_sys.tools.clone(),
+            compactor: None,
         });
         drop(state_no_sys); // release its Instance ActorRef clone.
 
@@ -384,6 +389,7 @@ mod tests {
             default_max_tokens: state_no_sys.default_max_tokens,
             instance: state_no_sys.instance.clone(),
             tools: state_no_sys.tools.clone(),
+            compactor: None,
         });
 
         // Spawn a sub with an override.
@@ -398,6 +404,7 @@ mod tests {
             default_max_tokens: parent_state.default_max_tokens,
             instance: parent_state.instance.clone(),
             tools: parent_state.tools.clone(),
+            compactor: None,
         });
         let task = spawn_task(sub_state, "x".into(), Some("ROLE".into()));
         task.join().unwrap();
@@ -729,6 +736,7 @@ mod tests {
             default_max_tokens: 12345,
             instance: state_no_sys.instance.clone(),
             tools: state_no_sys.tools.clone(),
+            compactor: None,
         });
 
         let task = spawn_task(parent, "go".into(), None);

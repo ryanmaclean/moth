@@ -8,13 +8,17 @@ into a build with a small dependency footprint.
 
 ## Status
 
-Coding-agent grade. 19 crates, 463 inline tests across the workspace;
+Production-grade. 23 crates, 542 inline tests across the workspace;
 one direct external dependency (`curl-sys`), all transitive deps fully
-vendored. HTTP server hardened, sessions persist, MCP-pluggable (stdio
-+ HTTP), fstools symlink + hard-link safe, git + jj branch strategies,
-Gitea + GitHub forge clients, multi-node `cluster::RemoteActorRef`,
-Aho-Corasick `audit` scanner, microbench suite with measured numbers,
-cross-crate integration suite with three gated real-network E2E tests.
+vendored. Streaming + cancellation through the Session iteration loop;
+runlog audit trail; auto-compaction hook between turns; HTTP server
+hardened + streaming SSE; sessions persist; MCP client (stdio + HTTP)
+*and* MCP server (`agent mcp-serve`); fstools symlink + hard-link safe;
+git + jj branch strategies; Gitea + GitHub forge clients; multi-node
+`cluster::RemoteActorRef`; Flue-style `subagent::spawn_task` with an
+LLM-callable `task` tool; Aho-Corasick `audit` scanner; microbench
+suite with measured numbers; cross-crate integration suite (16 default
++ 3 gated real-network).
 
 ## Layout
 
@@ -37,6 +41,10 @@ cross-crate integration suite with three gated real-network E2E tests.
 | `cluster/` | Multi-node `RemoteActorRef<M: Codec>` over TCP. Length-prefixed frames, per-node registry, fire-and-forget delivery, cached connections with re-dial on failure. | `actor`, `wire`, `anthropic` |
 | `github/` | GitHub REST API client. `Authorization: Bearer`, `Accept: application/vnd.github+json`, `X-GitHub-Api-Version`, required `User-Agent`. Filters PRs out of `list_issues`. Works with Enterprise via `with_base_url`. | `anthropic`, `curl-sys` |
 | `benches/` | Microbenchmarks for the SIMD/parsing hot paths. `std::time::Instant`-based, no criterion. `cargo test -p benches --release -- --nocapture`. | `wire`, `audit`, `anthropic`, `vshell` |
+| `runlog/` | File-backed JSONL audit trail. Subscribes to `harness::StreamEvent` and writes one record per event. Atomic appends, mutex-guarded; ms-precision UNIX timestamps. | `harness`, `anthropic` |
+| `compact/` | Message-history compaction. Pure layer (`estimate_chars`, `split_for_compaction`) + model-driven `Compactor` that replaces older turns with a single synthetic summary message. Wires into `HarnessState::with_compactor`. | `harness` |
+| `mcp_server/` | Server side of MCP over stdio. Exposes `harness::Tool` as MCP-callable. `initialize`/`tools/list`/`tools/call`/`notifications/initialized` + standard JSON-RPC errors. | `harness`, `wire`, `anthropic` |
+| `subagent/` | Flue-style `session.task()`: spawn a focused child agent that shares the parent's sandbox + tools but starts with empty history. Optional role overlay. Streaming variant available. | `harness`, `actor` |
 | `persist/` | File-backed `SessionStore`. Atomic writes via tmp + rename. Version-tagged JSON; key validation rejects path-traversal. | `harness`, `anthropic` |
 | `harness/` | Instance + Session actors. `Model` / `Sandbox` / `Tool` / `SessionStore` traits. `AnthropicModel`, `OpenAiModel`, `AuditedShell<S>`, `BashTool`. Iteration loop with tool-use, completion signal, structured output, 16-turn cap, optional persistence hook. | `actor`, `wire`, `anthropic`, `openai`, `audit`, `vshell` |
 | `cli/` | `agent run` / `agent serve` binary. Wires every other crate. | all of the above |
@@ -78,7 +86,20 @@ cargo run --bin agent -- run --sessions ./.sessions "second turn — remembers t
 # Register external MCP tools (e.g. an MCP-spec'd filesystem server)
 cargo run --bin agent -- run --mcp 'npx -y @modelcontextprotocol/server-filesystem /tmp' "list /tmp"
 
-# HTTP server: POST /agents/chat/<id>, SSE response, sessions persist by id
+# Tee every StreamEvent to a JSONL log for audit / debugging
+cargo run --bin agent -- run --runlog ./.runs "do something"
+
+# Let the LLM spawn subagents via a 'task' tool
+cargo run --bin agent -- run --task-tool "research three approaches and summarise"
+
+# Compact history older than 50k chars before each model call
+cargo run --bin agent -- run --compact-budget 50000 "long conversation continues..."
+
+# Expose our tools as an MCP server over stdio (other agents can call us)
+cargo run --bin agent -- mcp-serve
+
+# HTTP server: POST /agents/chat/<id>, SSE response (now actually streams),
+# sessions persist by id
 cargo run --bin agent -- serve --addr 0.0.0.0:3583 --sessions ./.sessions
 ```
 

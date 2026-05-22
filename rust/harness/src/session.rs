@@ -31,6 +31,12 @@ use crate::tools::{Tool, ToolCtx, default_tools};
 const DEFAULT_MAX_TOKENS: u32 = 4096;
 const MAX_TURNS_PER_PROMPT: usize = 16;
 
+/// Callback that may shorten `messages` (typically by summarising older
+/// turns). Called by the iteration loop BEFORE each turn. Implementations
+/// should be best-effort: return the input unchanged on error.
+pub type CompactFn =
+    dyn Fn(Vec<ChatMessage>) -> Vec<ChatMessage> + Send + Sync;
+
 pub struct HarnessState {
     pub name: String,
     pub model: Arc<dyn Model>,
@@ -38,6 +44,9 @@ pub struct HarnessState {
     pub default_max_tokens: u32,
     pub instance: ActorRef<InstanceMsg>,
     pub tools: Vec<Arc<dyn Tool>>,
+    /// Optional compaction callback. The Session invokes it between turns
+    /// so a long history can be summarised before the next ModelRequest.
+    pub compactor: Option<Arc<CompactFn>>,
 }
 
 impl HarnessState {
@@ -53,6 +62,7 @@ impl HarnessState {
             default_max_tokens: DEFAULT_MAX_TOKENS,
             instance,
             tools: default_tools(),
+            compactor: None,
         }
     }
 
@@ -63,6 +73,11 @@ impl HarnessState {
 
     pub fn with_tools(mut self, tools: Vec<Arc<dyn Tool>>) -> Self {
         self.tools = tools;
+        self
+    }
+
+    pub fn with_compactor(mut self, c: Arc<CompactFn>) -> Self {
+        self.compactor = Some(c);
         self
     }
 
@@ -230,6 +245,13 @@ impl Session {
             turns += 1;
             if turns > MAX_TURNS_PER_PROMPT {
                 return Err(SessionError::TurnLimitExceeded);
+            }
+
+            // Best-effort compaction before the model sees the next request.
+            // The callback either summarises older turns or returns the
+            // history unchanged. Implementations must not panic.
+            if let Some(c) = &self.harness.compactor {
+                self.history = (c)(std::mem::take(&mut self.history));
             }
 
             let req = ModelRequest {
@@ -996,5 +1018,66 @@ mod tests {
 
         session.join().unwrap();
         instance.join().unwrap();
+    }
+
+    #[test]
+    fn compactor_fires_before_each_turn_after_the_first() {
+        // The callback receives the history just before the model is called.
+        // It records what it saw and returns the input unchanged so the
+        // iteration loop's other invariants stay verifiable.
+        let calls: Arc<std::sync::Mutex<Vec<Vec<ChatMessage>>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let calls_clone = calls.clone();
+        let compactor: Arc<crate::session::CompactFn> = Arc::new(move |msgs| {
+            calls_clone.lock().unwrap().push(msgs.clone());
+            msgs
+        });
+
+        let sandbox: Box<dyn crate::sandbox::Sandbox> =
+            Box::new(MockSandbox::new(vec![]));
+        let inst = spawn(Instance::new("ci", sandbox));
+        let model = Arc::new(MockModel::new(vec![
+            vec![
+                ModelEvent::TextDelta("first".into()),
+                ModelEvent::Stop { reason: Some("end_turn".into()) },
+            ],
+            vec![
+                ModelEvent::TextDelta("second".into()),
+                ModelEvent::Stop { reason: Some("end_turn".into()) },
+            ],
+        ]));
+        let state = Arc::new(
+            HarnessState::new("h", model as Arc<dyn Model>, inst.addr.clone())
+                .with_compactor(compactor),
+        );
+        let sess = spawn(Session::new("s", state));
+
+        let _ = sess
+            .addr
+            .ask(|reply| SessionMsg::Prompt {
+                text: "one".into(),
+                structured_output_tag: None,
+                reply,
+            })
+            .unwrap()
+            .unwrap();
+        let _ = sess
+            .addr
+            .ask(|reply| SessionMsg::Prompt {
+                text: "two".into(),
+                structured_output_tag: None,
+                reply,
+            })
+            .unwrap()
+            .unwrap();
+
+        // Two prompts → two turns → compactor invoked twice.
+        let seen = calls.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].len(), 1);     // just `one`
+        assert_eq!(seen[1].len(), 3);     // user(one), assistant(first), user(two)
+
+        sess.join().unwrap();
+        inst.join().unwrap();
     }
 }
