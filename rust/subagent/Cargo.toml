@@ -1,0 +1,13 @@
+[package]
+name = "subagent"
+version = "0.0.1"
+edition = "2024"
+publish = false
+description = "Flue-style session.task(): focused one-shot child agents sharing parent's sandbox + tools but with their own message history."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+actor = { path = "../actor" }
+harness = { path = "../harness" }

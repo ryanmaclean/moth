@@ -1,0 +1,15 @@
+[package]
+name = "mcp_server"
+version = "0.0.1"
+edition = "2024"
+publish = false
+description = "Model Context Protocol server. Exposes a harness::Tool registry as MCP-callable tools over stdio."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+actor = { path = "../actor" }
+anthropic = { path = "../anthropic" }
+harness = { path = "../harness" }
+wire = { path = "../wire" }
