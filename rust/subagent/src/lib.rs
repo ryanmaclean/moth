@@ -308,6 +308,9 @@ mod tests {
         drop(seen);
 
         parent_session.join().unwrap();
+        // Drop the test's residual Arc<HarnessState> so the Instance actor's
+        // last sender is released and `instance.join()` can return.
+        drop(state);
         instance.join().unwrap();
     }
 
@@ -337,41 +340,32 @@ mod tests {
 
     #[test]
     fn no_role_system_inherits_parent_default_system() {
-        let (instance, state_no_sys, _model, _sb) = parent_rig(
-            vec![vec![
-                ModelEvent::TextDelta("ok".into()),
-                ModelEvent::Stop { reason: Some("end_turn".into()) },
-            ]],
-            vec![],
-        );
-        // Rebuild state with a default_system set.
+        // Build state in a sub-scope so every Arc<HarnessState> + cloned
+        // Instance ActorRef drops before we try to `instance.join()`.
+        // (Shadowing a `let with_sys = ...; let with_sys = ...;` keeps the
+        // first binding alive until the enclosing fn ends, which silently
+        // blocks the join.)
+        let model: Arc<MockModel> = Arc::new(MockModel::single(vec![
+            ModelEvent::TextDelta("ok".into()),
+            ModelEvent::Stop { reason: Some("end_turn".into()) },
+        ]));
+        let (instance, state_no_sys, _model, _sb) = parent_rig(vec![], vec![]);
         let with_sys = Arc::new(HarnessState {
             name: state_no_sys.name.clone(),
-            model: state_no_sys.model.clone(),
+            model: model.clone() as Arc<dyn Model>,
             default_system: Some("parent system".into()),
             default_max_tokens: state_no_sys.default_max_tokens,
             instance: state_no_sys.instance.clone(),
             tools: state_no_sys.tools.clone(),
         });
-        let model: Arc<MockModel> = Arc::new(MockModel::single(vec![
-            ModelEvent::TextDelta("ok".into()),
-            ModelEvent::Stop { reason: Some("end_turn".into()) },
-        ]));
-        // Replace the model on the cloned state via a new state.
-        let with_sys = Arc::new(HarnessState {
-            name: with_sys.name.clone(),
-            model: model.clone() as Arc<dyn Model>,
-            default_system: with_sys.default_system.clone(),
-            default_max_tokens: with_sys.default_max_tokens,
-            instance: with_sys.instance.clone(),
-            tools: with_sys.tools.clone(),
-        });
+        drop(state_no_sys); // release its Instance ActorRef clone.
 
         let task = spawn_task(with_sys, "task".into(), None);
         task.join().unwrap();
 
         let seen = model.seen.lock().unwrap();
         assert_eq!(seen[0].system.as_deref(), Some("parent system"));
+        drop(seen);
 
         instance.join().unwrap();
     }
@@ -411,6 +405,10 @@ mod tests {
         // Parent's default_system is still "parent system".
         assert_eq!(parent_state.default_system.as_deref(), Some("parent system"));
 
+        // Drop leftover Arcs holding clones of the Instance ActorRef so
+        // `instance.join()` can return.
+        drop(state_no_sys);
+        drop(parent_state);
         instance.join().unwrap();
     }
 
@@ -665,6 +663,8 @@ mod tests {
             .collect();
 
         assert_eq!(parent_tool_ptrs, child_tool_ptrs);
+        drop(state);
+        drop(child);
         instance.join().unwrap();
     }
 
@@ -704,6 +704,7 @@ mod tests {
         assert_eq!(*recorded, vec!["a".to_string()]);
         drop(recorded);
 
+        drop(state);
         instance.join().unwrap();
     }
 
@@ -736,6 +737,8 @@ mod tests {
         let seen = model.seen.lock().unwrap();
         assert_eq!(seen[0].max_tokens, 12345);
 
+        drop(seen);
+        drop(state_no_sys);
         instance.join().unwrap();
     }
 
