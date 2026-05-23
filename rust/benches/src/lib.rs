@@ -12,6 +12,8 @@ mod bench_helper;
 #[cfg(test)]
 mod audit_bench;
 #[cfg(test)]
+mod history_bench;
+#[cfg(test)]
 mod json_bench;
 #[cfg(test)]
 mod shell_bench;

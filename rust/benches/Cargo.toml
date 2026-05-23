@@ -13,3 +13,4 @@ wire = { path = "../wire" }
 audit = { path = "../audit" }
 anthropic = { path = "../anthropic" }
 vshell = { path = "../vshell" }
+harness = { path = "../harness" }

@@ -10,6 +10,7 @@ mod http;
 pub mod json;
 mod parse;
 
+use std::sync::Arc;
 use std::sync::mpsc::TryRecvError;
 
 use wire::SseFramer;
@@ -51,11 +52,11 @@ pub struct Message {
 }
 
 impl Message {
-    pub fn user_text(s: impl Into<String>) -> Self {
+    pub fn user_text(s: impl Into<Arc<str>>) -> Self {
         Self { role: Role::User, content: vec![ContentBlock::Text(s.into())] }
     }
 
-    pub fn assistant_text(s: impl Into<String>) -> Self {
+    pub fn assistant_text(s: impl Into<Arc<str>>) -> Self {
         Self { role: Role::Assistant, content: vec![ContentBlock::Text(s.into())] }
     }
 }
@@ -63,10 +64,14 @@ impl Message {
 /// One block in a `Message::content` list. `ToolUse::input` is a raw JSON
 /// value spliced into the wire payload verbatim; the caller is responsible
 /// for it being valid JSON (typically `{"command":"..."}` for the bash tool).
+///
+/// Payloads are `Arc<str>` so callers (the harness in particular) can clone
+/// a `Vec<Message>` cheaply between turns — each block clone is an atomic
+/// refcount bump rather than a deep String copy.
 pub enum ContentBlock {
-    Text(String),
-    ToolUse { id: String, name: String, input: String },
-    ToolResult { tool_use_id: String, content: String, is_error: bool },
+    Text(Arc<str>),
+    ToolUse { id: Arc<str>, name: Arc<str>, input: Arc<str> },
+    ToolResult { tool_use_id: Arc<str>, content: Arc<str>, is_error: bool },
 }
 
 #[derive(Clone, Copy)]

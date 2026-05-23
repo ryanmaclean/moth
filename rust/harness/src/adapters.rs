@@ -57,6 +57,9 @@ fn map_message(m: ChatMessage) -> anthropic::Message {
 }
 
 fn map_block(b: ContentBlock) -> anthropic::ContentBlock {
+    // Field types are identical (`Arc<str>`) so each arm is a move — no
+    // String allocations, no atomic ops beyond what the harness already
+    // accumulated when the block was first constructed.
     match b {
         ContentBlock::Text(s) => anthropic::ContentBlock::Text(s),
         ContentBlock::ToolUse { id, name, input } => {

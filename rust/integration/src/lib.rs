@@ -124,7 +124,7 @@ fn happy_path_bash_tool() {
     let result_block = &seen[1].messages[2].content[0];
     match result_block {
         ContentBlock::ToolResult { content, is_error, .. } => {
-            assert_eq!(content, "hi\n");
+            assert_eq!(&**content, "hi\n");
             assert!(!is_error);
         }
         other => panic!("expected ToolResult, got {other:?}"),
@@ -237,7 +237,7 @@ fn fstools_write_read_edit_read_roundtrip() {
     let result_for = |req_idx: usize| -> (String, bool) {
         match &seen[req_idx].messages.last().unwrap().content[0] {
             ContentBlock::ToolResult { content, is_error, .. } => {
-                (content.clone(), *is_error)
+                (content.to_string(), *is_error)
             }
             other => panic!("turn {req_idx} expected ToolResult, got {other:?}"),
         }
@@ -419,7 +419,7 @@ read line; printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"
     match &seen[1].messages[2].content[0] {
         ContentBlock::ToolResult { content, is_error, .. } => {
             assert!(!is_error);
-            assert_eq!(content, "mcp says hi");
+            assert_eq!(&**content, "mcp says hi");
         }
         other => panic!("expected ToolResult, got {other:?}"),
     }

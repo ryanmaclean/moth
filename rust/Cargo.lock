@@ -28,6 +28,7 @@ version = "0.0.1"
 dependencies = [
  "anthropic",
  "audit",
+ "harness",
  "vshell",
  "wire",
 ]

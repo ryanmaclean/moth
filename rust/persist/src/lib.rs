@@ -474,43 +474,46 @@ fn parse_block(v: &Json) -> Result<ContentBlock, String> {
             let text = v
                 .get("text")
                 .and_then(Json::as_str)
-                .ok_or_else(|| "text: missing text".to_string())?
-                .to_string();
-            Ok(ContentBlock::Text(text))
+                .ok_or_else(|| "text: missing text".to_string())?;
+            Ok(ContentBlock::Text(text.into()))
         }
         "tool_use" => {
             let id = v
                 .get("id")
                 .and_then(Json::as_str)
-                .ok_or_else(|| "tool_use: missing id".to_string())?
-                .to_string();
+                .ok_or_else(|| "tool_use: missing id".to_string())?;
             let name = v
                 .get("name")
                 .and_then(Json::as_str)
-                .ok_or_else(|| "tool_use: missing name".to_string())?
-                .to_string();
+                .ok_or_else(|| "tool_use: missing name".to_string())?;
             let input = v
                 .get("input")
                 .ok_or_else(|| "tool_use: missing input".to_string())?;
-            Ok(ContentBlock::ToolUse { id, name, input: json_to_string(input) })
+            Ok(ContentBlock::ToolUse {
+                id: id.into(),
+                name: name.into(),
+                input: json_to_string(input).into(),
+            })
         }
         "tool_result" => {
             let tool_use_id = v
                 .get("tool_use_id")
                 .and_then(Json::as_str)
-                .ok_or_else(|| "tool_result: missing tool_use_id".to_string())?
-                .to_string();
+                .ok_or_else(|| "tool_result: missing tool_use_id".to_string())?;
             let content = v
                 .get("content")
                 .and_then(Json::as_str)
-                .ok_or_else(|| "tool_result: missing content".to_string())?
-                .to_string();
+                .ok_or_else(|| "tool_result: missing content".to_string())?;
             let is_error = match v.get("is_error") {
                 Some(Json::Bool(b)) => *b,
                 None => false,
                 _ => return Err("tool_result: is_error not bool".into()),
             };
-            Ok(ContentBlock::ToolResult { tool_use_id, content, is_error })
+            Ok(ContentBlock::ToolResult {
+                tool_use_id: tool_use_id.into(),
+                content: content.into(),
+                is_error,
+            })
         }
         other => Err(format!("unknown block type {other:?}")),
     }
@@ -599,10 +602,10 @@ mod tests {
         let loaded = store.load("s1").unwrap().expect("Some");
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[0].role, Role::User);
-        assert!(matches!(&loaded[0].content[0], ContentBlock::Text(t) if t == "hi"));
+        assert!(matches!(&loaded[0].content[0], ContentBlock::Text(t) if &**t == "hi"));
         assert_eq!(loaded[1].role, Role::Assistant);
         assert!(
-            matches!(&loaded[1].content[0], ContentBlock::Text(t) if t == "hello there")
+            matches!(&loaded[1].content[0], ContentBlock::Text(t) if &**t == "hello there")
         );
         cleanup(&root);
     }
@@ -638,16 +641,16 @@ mod tests {
         assert_eq!(loaded.len(), 3);
         match &loaded[1].content[1] {
             ContentBlock::ToolUse { id, name, input } => {
-                assert_eq!(id, "tu_1");
-                assert_eq!(name, "bash");
-                assert_eq!(input, r#"{"command":"ls /tmp"}"#);
+                assert_eq!(&**id, "tu_1");
+                assert_eq!(&**name, "bash");
+                assert_eq!(&**input, r#"{"command":"ls /tmp"}"#);
             }
             other => panic!("expected ToolUse, got {other:?}"),
         }
         match &loaded[2].content[0] {
             ContentBlock::ToolResult { tool_use_id, content, is_error } => {
-                assert_eq!(tool_use_id, "tu_1");
-                assert_eq!(content, "file1\nfile2");
+                assert_eq!(&**tool_use_id, "tu_1");
+                assert_eq!(&**content, "file1\nfile2");
                 assert!(!is_error);
             }
             other => panic!("expected ToolResult, got {other:?}"),
@@ -747,9 +750,9 @@ mod tests {
         let a = store.load("a").unwrap().unwrap();
         let b = store.load("b").unwrap().unwrap();
         let c = store.load("c").unwrap().unwrap();
-        assert!(matches!(&a[0].content[0], ContentBlock::Text(t) if t == "alpha"));
-        assert!(matches!(&b[0].content[0], ContentBlock::Text(t) if t == "beta"));
-        assert!(matches!(&c[0].content[0], ContentBlock::Text(t) if t == "gamma"));
+        assert!(matches!(&a[0].content[0], ContentBlock::Text(t) if &**t == "alpha"));
+        assert!(matches!(&b[0].content[0], ContentBlock::Text(t) if &**t == "beta"));
+        assert!(matches!(&c[0].content[0], ContentBlock::Text(t) if &**t == "gamma"));
         // Cross-check: a's log path is distinct from b's.
         assert!(root.join("a.log.jsonl").exists());
         assert!(root.join("b.log.jsonl").exists());
@@ -836,9 +839,9 @@ mod tests {
             .unwrap();
         let loaded = store.load("s").unwrap().unwrap();
         assert_eq!(loaded.len(), 3);
-        assert!(matches!(&loaded[0].content[0], ContentBlock::Text(t) if t == "first"));
-        assert!(matches!(&loaded[1].content[0], ContentBlock::Text(t) if t == "second"));
-        assert!(matches!(&loaded[2].content[0], ContentBlock::Text(t) if t == "ack"));
+        assert!(matches!(&loaded[0].content[0], ContentBlock::Text(t) if &**t == "first"));
+        assert!(matches!(&loaded[1].content[0], ContentBlock::Text(t) if &**t == "second"));
+        assert!(matches!(&loaded[2].content[0], ContentBlock::Text(t) if &**t == "ack"));
         cleanup(&root);
     }
 
@@ -850,7 +853,7 @@ mod tests {
         store.append("esc", &[ChatMessage::user(weird)]).unwrap();
         let loaded = store.load("esc").unwrap().unwrap();
         if let ContentBlock::Text(t) = &loaded[0].content[0] {
-            assert_eq!(t, weird);
+            assert_eq!(&**t, weird);
         } else {
             panic!("expected text block");
         }
@@ -893,7 +896,7 @@ mod tests {
         match &loaded[0].content[0] {
             ContentBlock::ToolUse { input, .. } => {
                 assert_eq!(
-                    input,
+                    &**input,
                     r#"{"path":"/tmp/f","edits":[{"old":"a","new":"b"}],"flag":true}"#
                 );
             }
@@ -919,7 +922,7 @@ mod tests {
         match &loaded[0].content[0] {
             ContentBlock::ToolResult { is_error, content, .. } => {
                 assert!(*is_error);
-                assert_eq!(content, "boom");
+                assert_eq!(&**content, "boom");
             }
             other => panic!("expected ToolResult, got {other:?}"),
         }
@@ -940,7 +943,7 @@ mod tests {
         assert!(!root.join("s.log.jsonl").exists());
         let loaded = store.load("s").unwrap().unwrap();
         assert_eq!(loaded.len(), 1);
-        assert!(matches!(&loaded[0].content[0], ContentBlock::Text(t) if t == "compacted-summary"));
+        assert!(matches!(&loaded[0].content[0], ContentBlock::Text(t) if &**t == "compacted-summary"));
         cleanup(&root);
     }
 
@@ -980,7 +983,7 @@ mod tests {
         fs::write(root.join("old.json"), legacy_body).unwrap();
         let loaded = store.load("old").unwrap().unwrap();
         assert_eq!(loaded.len(), 1);
-        assert!(matches!(&loaded[0].content[0], ContentBlock::Text(t) if t == "old"));
+        assert!(matches!(&loaded[0].content[0], ContentBlock::Text(t) if &**t == "old"));
         // Migration was actually performed.
         assert!(!root.join("old.json").exists());
         assert!(root.join("old.snapshot.json").exists());

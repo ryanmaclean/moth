@@ -359,7 +359,9 @@ impl Session {
                     }
                     Ok(ModelEvent::ToolUseStart { id, name }) => {
                         if !current_text.is_empty() {
-                            blocks.push(ContentBlock::Text(std::mem::take(&mut current_text)));
+                            blocks.push(ContentBlock::Text(
+                                Arc::from(std::mem::take(&mut current_text)),
+                            ));
                         }
                         if !emit(events, StreamEvent::ToolUseStart {
                             id: id.clone(),
@@ -381,7 +383,11 @@ impl Session {
                     }
                     Ok(ModelEvent::BlockStop) => {
                         if let Some((id, name, input)) = current_tool.take() {
-                            blocks.push(ContentBlock::ToolUse { id, name, input });
+                            blocks.push(ContentBlock::ToolUse {
+                                id: Arc::from(id),
+                                name: Arc::from(name),
+                                input: Arc::from(input),
+                            });
                         }
                         if !emit(events, StreamEvent::BlockStop) {
                             cancelled = true;
@@ -400,13 +406,22 @@ impl Session {
 
             // Flush any pending blocks the stream didn't terminate cleanly.
             if !current_text.is_empty() {
-                blocks.push(ContentBlock::Text(std::mem::take(&mut current_text)));
+                blocks.push(ContentBlock::Text(
+                    Arc::from(std::mem::take(&mut current_text)),
+                ));
             }
             if let Some((id, name, input)) = current_tool.take() {
-                blocks.push(ContentBlock::ToolUse { id, name, input });
+                blocks.push(ContentBlock::ToolUse {
+                    id: Arc::from(id),
+                    name: Arc::from(name),
+                    input: Arc::from(input),
+                });
             }
 
-            let tool_uses: Vec<(String, String, String)> = blocks
+            // Tool-use bookkeeping: collect `Arc<str>` clones (refcount bumps,
+            // not String copies) so we can iterate without re-borrowing
+            // `blocks` after it's been moved into `self.history` below.
+            let tool_uses: Vec<(Arc<str>, Arc<str>, Arc<str>)> = blocks
                 .iter()
                 .filter_map(|b| match b {
                     ContentBlock::ToolUse { id, name, input } => {
@@ -447,8 +462,8 @@ impl Session {
                 let block = self.execute_tool(&id, &name, &input);
                 if let ContentBlock::ToolResult { tool_use_id, content, is_error } = &block
                     && !emit(events, StreamEvent::ToolResult {
-                        tool_use_id: tool_use_id.clone(),
-                        content: content.clone(),
+                        tool_use_id: tool_use_id.to_string(),
+                        content: content.to_string(),
                         is_error: *is_error,
                     })
                 {
@@ -489,7 +504,7 @@ impl Session {
             );
             return ContentBlock::ToolResult {
                 tool_use_id: id.into(),
-                content: format!("unknown tool: {name}"),
+                content: format!("unknown tool: {name}").into(),
                 is_error: true,
             };
         };
@@ -517,7 +532,7 @@ impl Session {
                 }
                 ContentBlock::ToolResult {
                     tool_use_id: id.into(),
-                    content,
+                    content: content.into(),
                     is_error: false,
                 }
             }
@@ -527,7 +542,7 @@ impl Session {
                 }
                 ContentBlock::ToolResult {
                     tool_use_id: id.into(),
-                    content: e.0,
+                    content: e.0.into(),
                     is_error: true,
                 }
             }
@@ -843,7 +858,7 @@ mod tests {
         assert_eq!(second.messages.len(), 3);
         assert!(matches!(
             &second.messages[1].content[0],
-            ContentBlock::ToolUse { name, .. } if name == "bash"
+            ContentBlock::ToolUse { name, .. } if &**name == "bash"
         ));
         assert!(matches!(
             &second.messages[2].content[0],

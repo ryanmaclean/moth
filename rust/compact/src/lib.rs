@@ -511,8 +511,8 @@ mod tests {
         assert_eq!(final_assist.role, Role::Assistant);
         match (&penult_user.content[0], &final_assist.content[0]) {
             (ContentBlock::Text(a), ContentBlock::Text(b)) => {
-                assert_eq!(a, "UNIQUE-PENULTIMATE-USER");
-                assert_eq!(b, "UNIQUE-FINAL-ASSISTANT");
+                assert_eq!(&**a, "UNIQUE-PENULTIMATE-USER");
+                assert_eq!(&**b, "UNIQUE-FINAL-ASSISTANT");
             }
             _ => panic!("expected text blocks"),
         }

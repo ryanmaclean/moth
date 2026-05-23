@@ -26,6 +26,7 @@ pub mod json;
 mod parse;
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::sync::mpsc::TryRecvError;
 
 use wire::SseFramer;
@@ -83,11 +84,11 @@ pub struct Message {
 }
 
 impl Message {
-    pub fn user_text(s: impl Into<String>) -> Self {
+    pub fn user_text(s: impl Into<Arc<str>>) -> Self {
         Self { role: Role::User, content: vec![ContentBlock::Text(s.into())] }
     }
 
-    pub fn assistant_text(s: impl Into<String>) -> Self {
+    pub fn assistant_text(s: impl Into<Arc<str>>) -> Self {
         Self { role: Role::Assistant, content: vec![ContentBlock::Text(s.into())] }
     }
 }
@@ -95,10 +96,14 @@ impl Message {
 /// `ContentBlock::ToolUse::input` is a raw JSON value (typically the args
 /// JSON the model produced) and is spliced into the payload verbatim — the
 /// caller is responsible for it being valid JSON.
+///
+/// Payloads are `Arc<str>` so callers can clone a request's `Vec<Message>`
+/// cheaply — each block clone is an atomic refcount bump rather than a deep
+/// String copy.
 pub enum ContentBlock {
-    Text(String),
-    ToolUse { id: String, name: String, input: String },
-    ToolResult { tool_use_id: String, content: String },
+    Text(Arc<str>),
+    ToolUse { id: Arc<str>, name: Arc<str>, input: Arc<str> },
+    ToolResult { tool_use_id: Arc<str>, content: Arc<str> },
 }
 
 #[derive(Clone, Copy)]
@@ -363,12 +368,12 @@ fn write_message(s: &mut String, m: &Message, first: &mut bool) {
     // are unusual but technically expressible — we serialize text into
     // `content` and silently drop ToolResult here; well-formed callers
     // shouldn't mix.
-    let texts: Vec<&String> = m
+    let texts: Vec<&Arc<str>> = m
         .content
         .iter()
         .filter_map(|b| if let ContentBlock::Text(t) = b { Some(t) } else { None })
         .collect();
-    let tool_calls: Vec<(&String, &String, &String)> = m
+    let tool_calls: Vec<(&Arc<str>, &Arc<str>, &Arc<str>)> = m
         .content
         .iter()
         .filter_map(|b| {
