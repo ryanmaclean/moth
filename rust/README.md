@@ -6,6 +6,42 @@ completion signal, structured output) and Flue (instance/harness/session
 hierarchy, virtual sandbox default, skills + roles, declarative triggers)
 into a build with a small dependency footprint.
 
+## Quickstart
+
+New here? [`QUICKSTART.md`](./QUICKSTART.md) walks `git clone` to first
+prompt in about five minutes — install, provider switch, MCP, sessions,
+`agent serve`, and Claude Desktop wiring. Runnable shell examples live
+under [`examples/`](./examples/).
+
+## Install
+
+**Cargo (from source).** Requires Rust ≥ 1.85 and a C toolchain
+(`build-essential` on Debian, `xcode-select --install` on macOS):
+
+```bash
+cargo install --locked --offline --frozen --path rust/cli --root ~/.local
+# binary at ~/.local/bin/agent
+```
+
+The vendored tree at `rust/vendor/` is the build's only source of
+dependencies — `--offline --frozen --locked` together guarantee no
+network fetches and pin every transitive crate to the lockfile.
+
+**Docker.** Multi-stage build, distroless runtime, 48 MB final image:
+
+```bash
+docker build -t agent rust/
+docker run --rm -e ANTHROPIC_API_KEY agent run "hello"
+
+# Mount a workdir if the prompt should see local files:
+docker run --rm -e ANTHROPIC_API_KEY \
+  -v "$PWD:/work" -w /work \
+  agent run --sessions /work/.agent "summarise README.md"
+```
+
+**Release tarballs.** Planned. None published yet — build from source
+for now.
+
 ## Status
 
 Production-grade. 19 crates, 592 inline tests across the workspace;
