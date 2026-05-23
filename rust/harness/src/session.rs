@@ -29,7 +29,12 @@ use crate::sandbox::{SandboxError, ShellResult};
 use crate::tools::{Tool, ToolCtx, default_tools};
 
 const DEFAULT_MAX_TOKENS: u32 = 4096;
-const MAX_TURNS_PER_PROMPT: usize = 16;
+/// Hard cap on iteration loop turns per prompt. 16 was too tight for any
+/// real coding-agent dogfood (e.g. fixing a failing test usually needs
+/// read → propose → patch → cargo build → patch again → cargo test ≈ 6
+/// turns; anything iterative blows past it). 64 gives breathing room for
+/// real work while still bounding the worst case.
+const MAX_TURNS_PER_PROMPT: usize = 64;
 
 /// Callback that may shorten `messages` (typically by summarising older
 /// turns). Called by the iteration loop BEFORE each turn. Implementations
