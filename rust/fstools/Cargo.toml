@@ -12,5 +12,8 @@ path = "src/lib.rs"
 anthropic = { path = "../anthropic" }
 harness = { path = "../harness" }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 actor = { path = "../actor" }

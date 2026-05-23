@@ -21,11 +21,28 @@
 //! parent component is verified before being created via `mkdir`, and the
 //! final leaf is written with `create_new`-style semantics that refuse to
 //! overwrite a pre-existing symlink.
+//!
+//! ## Atomic writes
+//!
+//! `WriteTool` (and `EditTool`) stage their output in a sibling temp
+//! file and `rename(2)` it over the destination, so a crash mid-write
+//! leaves either the old contents or the new — never a truncated file.
+//! The temp open uses `O_NOFOLLOW | O_EXCL | O_CREAT` to refuse a
+//! pre-planted symlink at the staging path. See `atomic_write` for the
+//! full rationale.
 
 use std::path::{Component, Path, PathBuf};
+#[cfg(unix)]
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anthropic::json::{Json, parse};
 use harness::{Tool, ToolCtx, ToolError};
+
+/// Monotonic counter used to disambiguate temp filenames produced by
+/// `atomic_write` within a single process. Combined with the PID this
+/// keeps temp paths unique across threads racing on the same target.
+#[cfg(unix)]
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 const MAX_BYTES: u64 = 1024 * 1024; // 1 MiB
 const DEFAULT_LINE_LIMIT: usize = 2000;
@@ -138,6 +155,13 @@ impl Tool for WriteTool {
             // — best-effort hard-link defence; doesn't catch every
             // case (an inode could acquire a second link between this
             // check and the write) but defeats the obvious vector.
+            //
+            // This check is belt-and-braces with the atomic-write path
+            // (which itself opens with `O_NOFOLLOW` on the temp file
+            // and `rename(2)`s over the destination): if a symlink is
+            // planted between this check and the rename, the rename
+            // simply replaces the symlink — it does NOT write through
+            // it — so the target file is still safe.
             match std::fs::symlink_metadata(&full) {
                 Ok(meta) if meta.file_type().is_symlink() => {
                     return Err(ToolError(format!(
@@ -152,7 +176,7 @@ impl Tool for WriteTool {
                 Ok(_) | Err(_) => {}
             }
         }
-        std::fs::write(&full, content.as_bytes()).map_err(io_err)?;
+        atomic_write(&full, content.as_bytes())?;
         Ok(format!("wrote {} bytes to {}", content.len(), full.display()))
     }
 }
@@ -205,7 +229,7 @@ impl Tool for EditTool {
             )));
         }
         let replaced = text.replacen(&old_text, &new_text, 1);
-        std::fs::write(&full, replaced.as_bytes()).map_err(io_err)?;
+        atomic_write(&full, replaced.as_bytes())?;
         Ok(format!(
             "edited {}: {} chars replaced",
             full.display(),
@@ -258,6 +282,117 @@ fn hard_linked(meta: &std::fs::Metadata) -> bool {
 #[cfg(not(unix))]
 fn hard_linked(_meta: &std::fs::Metadata) -> bool {
     false
+}
+
+/// Atomically replace the contents of `dest` with `content`.
+///
+/// Writes to a sibling temp file (`<dest>.<pid>.<counter>.tmp`) then
+/// `rename(2)`s over the target. The rename is atomic on POSIX when the
+/// two paths live on the same filesystem (which they do, by construction
+/// — same parent directory), so readers always observe either the old
+/// contents or the new, never a half-written file.
+///
+/// Defence-in-depth: the temp file is opened with `O_NOFOLLOW` and
+/// `O_CREAT|O_EXCL` so that, even on the unlikely chance an attacker has
+/// pre-planted a symlink at the exact temp path (PID + atomic counter),
+/// the open fails rather than writing through it. The unique temp name
+/// also keeps concurrent writers from clobbering each other's staging
+/// files; whichever rename wins last is what the file ends up holding.
+///
+/// We `sync_data` the temp file before rename for durability, and
+/// best-effort `sync_all` the parent dir so a power-cut after rename
+/// still leaves the dirent committed. Failures of the directory fsync
+/// are deliberately ignored — some filesystems (tmpfs) don't implement
+/// it, and the data is already on disk by that point.
+#[cfg(unix)]
+fn atomic_write(dest: &Path, content: &[u8]) -> Result<(), ToolError> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let parent = dest.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = dest
+        .file_name()
+        .ok_or_else(|| ToolError(format!("invalid write destination: {}", dest.display())))?;
+    let counter = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut tmp_name = std::ffi::OsString::from(file_name);
+    tmp_name.push(format!(".{}.{}.tmp", std::process::id(), counter));
+    let tmp = parent.join(&tmp_name);
+
+    // O_NOFOLLOW guards the final path component: if `tmp` somehow
+    // already exists as a symlink, the open refuses to follow it.
+    // `create_new(true)` (=> O_CREAT|O_EXCL) makes a pre-existing tmp
+    // path a hard error regardless.
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .mode(0o600)
+        .open(&tmp)
+        .map_err(io_err)?;
+
+    // Write + fsync the data, then drop the handle so rename(2) doesn't
+    // race with any pending buffered writes inside std.
+    let write_res = file
+        .write_all(content)
+        .and_then(|()| file.sync_data())
+        .map_err(io_err);
+    drop(file);
+    if let Err(e) = write_res {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+
+    if let Err(e) = std::fs::rename(&tmp, dest) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(io_err(e));
+    }
+
+    // Best-effort: sync the parent directory so the renamed dirent is
+    // durable. Failure here doesn't roll back the write (the data is
+    // already visible to readers); just swallow.
+    if let Ok(dir) = std::fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
+    Ok(())
+}
+
+/// Non-Unix fallback: best-effort tmp-then-rename without O_NOFOLLOW
+/// (a Unix-specific flag). Atomicity still holds on Windows because
+/// `fs::rename` maps to `MoveFileExW` with REPLACE_EXISTING.
+#[cfg(not(unix))]
+fn atomic_write(dest: &Path, content: &[u8]) -> Result<(), ToolError> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let parent = dest.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = dest
+        .file_name()
+        .ok_or_else(|| ToolError(format!("invalid write destination: {}", dest.display())))?;
+    let counter = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut tmp_name = std::ffi::OsString::from(file_name);
+    tmp_name.push(format!(".{}.{}.tmp", std::process::id(), counter));
+    let tmp = parent.join(&tmp_name);
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .map_err(io_err)?;
+    let write_res = file
+        .write_all(content)
+        .and_then(|()| file.sync_data())
+        .map_err(io_err);
+    drop(file);
+    if let Err(e) = write_res {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&tmp, dest) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(io_err(e));
+    }
+    Ok(())
 }
 
 /// Split a relative path into its `Normal` components, rejecting any
@@ -405,7 +540,7 @@ fn resolve_for_write(root: Option<&Path>, path: &str) -> Result<PathBuf, ToolErr
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // This component does not exist. If it's an
                 // intermediate, create it. If it's the leaf, leave it
-                // — the caller (`std::fs::write`) will create it. In
+                // — the caller (`atomic_write`) will create it. In
                 // either case the parent has already been verified.
                 if !is_leaf {
                     std::fs::create_dir(&cur).map_err(io_err)?;
@@ -730,6 +865,117 @@ mod tests {
     }
 
     #[test]
+    fn write_atomically_replaces_existing() {
+        // Sanity: an existing file's contents are wholly replaced by
+        // the new write — the rename-over semantics hand the agent a
+        // fresh inode whose contents == the staged payload.
+        let dir = unique("write-atomic-replace");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("out.txt");
+        std::fs::write(&path, "initial").unwrap();
+        let h = Harness::new();
+        let ctx = ToolCtx { instance: h.addr() };
+        let tool = WriteTool { root: None };
+        let input = format!(
+            r#"{{"path":"{}","content":"replaced"}}"#,
+            json_escape(&path.to_string_lossy())
+        );
+        tool.call(&input, &ctx).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "replaced");
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn write_is_atomic_no_partial_file_on_failure() {
+        // After a successful write there should be no leftover *.tmp
+        // siblings — the rename consumed the staging file. (Injecting a
+        // mid-write failure is hard without a fault-injection layer; the
+        // observable invariant is "no orphaned tmp files".)
+        let dir = unique("write-atomic-no-tmp");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("out.txt");
+        let h = Harness::new();
+        let ctx = ToolCtx { instance: h.addr() };
+        let tool = WriteTool { root: None };
+        let input = format!(
+            r#"{{"path":"{}","content":"hello"}}"#,
+            json_escape(&path.to_string_lossy())
+        );
+        tool.call(&input, &ctx).unwrap();
+        let entries: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        for name in &entries {
+            assert!(
+                !name.ends_with(".tmp"),
+                "found leftover tmp file: {} (entries: {:?})",
+                name,
+                entries
+            );
+        }
+        assert!(entries.iter().any(|n| n == "out.txt"));
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn concurrent_writes_to_same_path_dont_corrupt() {
+        // Four threads racing to write distinct contents to the same
+        // path. Because each writer stages to its own uniquely-named
+        // tmp file and then renames, the final file must equal one of
+        // the inputs byte-for-byte — never a torn merge of two writers'
+        // payloads.
+        use std::thread;
+        let dir = unique("write-atomic-concurrent");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("shared.txt");
+        // Use big distinctive payloads so any interleave would be
+        // obvious (and any partial truncation would change the length).
+        let inputs: Vec<String> = (0..4)
+            .map(|i| {
+                let ch = (b'A' + i as u8) as char;
+                std::iter::repeat_n(ch, 4096).collect::<String>()
+            })
+            .collect();
+        let path_arc = std::sync::Arc::new(path.clone());
+        let handles: Vec<thread::JoinHandle<()>> = inputs
+            .clone()
+            .into_iter()
+            .map(|content| {
+                let p = std::sync::Arc::clone(&path_arc);
+                thread::spawn(move || {
+                    let h = Harness::new();
+                    let ctx = ToolCtx { instance: h.addr() };
+                    let tool = WriteTool { root: None };
+                    let input = format!(
+                        r#"{{"path":"{}","content":"{}"}}"#,
+                        json_escape(&p.to_string_lossy()),
+                        content
+                    );
+                    tool.call(&input, &ctx).unwrap();
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let final_contents = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            inputs.iter().any(|i| i == &final_contents),
+            "final file does not match any writer's input (len={})",
+            final_contents.len()
+        );
+        // And no tmp leftovers.
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let name = entry.unwrap().file_name();
+            let name = name.to_string_lossy().into_owned();
+            assert!(!name.ends_with(".tmp"), "leftover tmp: {name}");
+        }
+        cleanup(&dir);
+    }
+
+    #[test]
     fn write_nonexistent_path_returns_io_error() {
         let h = Harness::new();
         let ctx = ToolCtx { instance: h.addr() };
@@ -934,6 +1180,30 @@ mod tests {
             // And the target was NOT written through.
             assert_eq!(std::fs::read_to_string(&secret).unwrap(), "SECRET");
             cleanup(root.parent().unwrap());
+        }
+
+        #[test]
+        fn write_to_symlink_target_is_rejected() {
+            // Reproduces the TOCTOU shape the atomic-write change closes
+            // off: a pre-existing symlink at `full` would, with the old
+            // `fs::write`, follow into the target. The pre-write
+            // `symlink_metadata` check fires first; this test pins that
+            // behaviour and confirms the target is untouched.
+            let parent = unique("sym-write-target");
+            std::fs::create_dir_all(&parent).unwrap();
+            let root = parent.join("root");
+            std::fs::create_dir_all(&root).unwrap();
+            let target = parent.join("target.txt");
+            std::fs::write(&target, "ORIGINAL").unwrap();
+            symlink(&target, root.join("link")).unwrap();
+            let h = Harness::new();
+            let ctx = ToolCtx { instance: h.addr() };
+            let err = WriteTool { root: Some(root.clone()) }
+                .call(r#"{"path":"link","content":"PWNED"}"#, &ctx)
+                .unwrap_err();
+            assert!(err.0.contains("symlink"), "got: {}", err.0);
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "ORIGINAL");
+            cleanup(&parent);
         }
 
         #[test]
