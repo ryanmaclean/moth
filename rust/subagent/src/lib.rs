@@ -83,6 +83,10 @@ fn child_state(
         // benefit from history-trimming, even though their own history
         // starts empty (they may run many internal turns).
         compactor: parent.compactor.clone(),
+        // Subagents share the parent's metrics emitter so all turns show
+        // up in the same dashboard. A subagent timer is still tagged the
+        // same way — no special "subagent" outcome.
+        metrics: parent.metrics.clone(),
     })
 }
 
@@ -362,6 +366,7 @@ mod tests {
             instance: state_no_sys.instance.clone(),
             tools: state_no_sys.tools.clone(),
             compactor: None,
+            metrics: Arc::new(metrics::Client::disabled()),
         });
         drop(state_no_sys); // release its Instance ActorRef clone.
 
@@ -390,6 +395,7 @@ mod tests {
             instance: state_no_sys.instance.clone(),
             tools: state_no_sys.tools.clone(),
             compactor: None,
+            metrics: Arc::new(metrics::Client::disabled()),
         });
 
         // Spawn a sub with an override.
@@ -405,6 +411,7 @@ mod tests {
             instance: parent_state.instance.clone(),
             tools: parent_state.tools.clone(),
             compactor: None,
+            metrics: Arc::new(metrics::Client::disabled()),
         });
         let task = spawn_task(sub_state, "x".into(), Some("ROLE".into()));
         task.join().unwrap();
@@ -737,6 +744,7 @@ mod tests {
             instance: state_no_sys.instance.clone(),
             tools: state_no_sys.tools.clone(),
             compactor: None,
+            metrics: Arc::new(metrics::Client::disabled()),
         });
 
         let task = spawn_task(parent, "go".into(), None);

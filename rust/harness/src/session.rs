@@ -47,6 +47,10 @@ pub struct HarnessState {
     /// Optional compaction callback. The Session invokes it between turns
     /// so a long history can be summarised before the next ModelRequest.
     pub compactor: Option<Arc<CompactFn>>,
+    /// Metrics emitter. Defaults to `metrics::Client::disabled()` so call
+    /// sites never need a conditional. Install a real one via
+    /// `with_metrics` when `DOGSTATSD_ADDR` is set.
+    pub metrics: Arc<metrics::Client>,
 }
 
 impl HarnessState {
@@ -63,6 +67,7 @@ impl HarnessState {
             instance,
             tools: default_tools(),
             compactor: None,
+            metrics: Arc::new(metrics::Client::disabled()),
         }
     }
 
@@ -78,6 +83,11 @@ impl HarnessState {
 
     pub fn with_compactor(mut self, c: Arc<CompactFn>) -> Self {
         self.compactor = Some(c);
+        self
+    }
+
+    pub fn with_metrics(mut self, m: Arc<metrics::Client>) -> Self {
+        self.metrics = m;
         self
     }
 
@@ -236,6 +246,14 @@ impl Session {
         let mut response_text = String::new();
         let mut completed = false;
         let mut turns = 0;
+        // RAII guard: emits the prompt duration + outcome tag on every exit
+        // path (success / error / cancel / panic) so we never accidentally
+        // miss a measurement. `set_outcome` is called immediately before
+        // each return; if the fn panics, the guard fires with the default
+        // "dropped" outcome so a panic is still observable as a metric.
+        let metrics = self.harness.metrics.clone();
+        metrics.count("agent.prompt.started", 1, &[]);
+        let outcome = PromptOutcomeGuard::new(&metrics);
 
         // Closure: emit + detect cancellation. Returns false if the receiver
         // dropped, true to keep going. No-op if there's no receiver.
@@ -249,6 +267,7 @@ impl Session {
         loop {
             turns += 1;
             if turns > MAX_TURNS_PER_PROMPT {
+                outcome.set("turn_limit");
                 return Err(SessionError::TurnLimitExceeded);
             }
 
@@ -322,7 +341,10 @@ impl Session {
                     Ok(ModelEvent::Stop { reason }) => {
                         stop_reason = reason;
                     }
-                    Err(e) => return Err(SessionError::Model(e.0)),
+                    Err(e) => {
+                        outcome.set("model_error");
+                        return Err(SessionError::Model(e.0));
+                    }
                 }
             }
 
@@ -354,6 +376,7 @@ impl Session {
                     eprintln!("session store save failed for {}: {}", self.name, e);
                 }
                 let _ = emit(events, StreamEvent::Cancelled);
+                outcome.set("cancelled");
                 return Ok(None);
             }
 
@@ -366,6 +389,7 @@ impl Session {
                 {
                     eprintln!("session store save failed for {}: {}", self.name, e);
                 }
+                outcome.set("cancelled");
                 return Ok(None);
             }
 
@@ -396,6 +420,7 @@ impl Session {
                         eprintln!("session store save failed for {}: {}", self.name, e);
                     }
                     let _ = emit(events, StreamEvent::Cancelled);
+                    outcome.set("cancelled");
                     return Ok(None);
                 }
                 results.push(block);
@@ -413,12 +438,21 @@ impl Session {
             eprintln!("session store save failed for {}: {}", self.name, e);
         }
 
+        // Successful exit. Turn count is reported separately as a histogram.
+        metrics.histogram("agent.prompt.turns", turns as f64, &[]);
+        outcome.set("ok");
+
         Ok(Some(PromptResult { text: response_text, structured, completed, turns }))
     }
 
     fn execute_tool(&self, id: &str, name: &str, input: &str) -> ContentBlock {
         let tool = self.harness.tools.iter().find(|t| t.name() == name);
         let Some(tool) = tool else {
+            self.harness.metrics.count(
+                "agent.tool.calls",
+                1,
+                &[("name", name), ("outcome", "unknown")],
+            );
             return ContentBlock::ToolResult {
                 tool_use_id: id.into(),
                 content: format!("unknown tool: {name}"),
@@ -426,18 +460,77 @@ impl Session {
             };
         };
         let ctx = ToolCtx { instance: &self.harness.instance };
-        match tool.call(input, &ctx) {
-            Ok(content) => ContentBlock::ToolResult {
-                tool_use_id: id.into(),
-                content,
-                is_error: false,
-            },
-            Err(e) => ContentBlock::ToolResult {
-                tool_use_id: id.into(),
-                content: e.0,
-                is_error: true,
-            },
+        let tool_started = std::time::Instant::now();
+        let result = tool.call(input, &ctx);
+        let elapsed_ms = tool_started.elapsed().as_secs_f64() * 1000.0;
+        let outcome = if result.is_ok() { "ok" } else { "error" };
+        self.harness.metrics.count(
+            "agent.tool.calls",
+            1,
+            &[("name", name), ("outcome", outcome)],
+        );
+        self.harness.metrics.timer(
+            "agent.tool.duration_ms",
+            elapsed_ms,
+            &[("name", name), ("outcome", outcome)],
+        );
+        match result {
+            Ok(content) => {
+                // Audit blocks surface as "blocked by audit: [...]" — count
+                // them separately so dashboards can plot security signal.
+                if content.contains("blocked by audit") {
+                    self.harness.metrics.count("agent.audit.blocked", 1, &[("name", name)]);
+                }
+                ContentBlock::ToolResult {
+                    tool_use_id: id.into(),
+                    content,
+                    is_error: false,
+                }
+            }
+            Err(e) => {
+                if e.0.contains("blocked by audit") {
+                    self.harness.metrics.count("agent.audit.blocked", 1, &[("name", name)]);
+                }
+                ContentBlock::ToolResult {
+                    tool_use_id: id.into(),
+                    content: e.0,
+                    is_error: true,
+                }
+            }
         }
+    }
+}
+
+/// RAII guard that emits `agent.prompt.duration_ms` tagged with the final
+/// outcome on every exit path. Default outcome is `"dropped"` so a panic
+/// still produces a measurement.
+struct PromptOutcomeGuard<'a> {
+    metrics: &'a metrics::Client,
+    start: std::time::Instant,
+    outcome: std::cell::Cell<&'static str>,
+}
+
+impl<'a> PromptOutcomeGuard<'a> {
+    fn new(metrics: &'a metrics::Client) -> Self {
+        Self {
+            metrics,
+            start: std::time::Instant::now(),
+            outcome: std::cell::Cell::new("dropped"),
+        }
+    }
+    fn set(&self, o: &'static str) {
+        self.outcome.set(o);
+    }
+}
+
+impl<'a> Drop for PromptOutcomeGuard<'a> {
+    fn drop(&mut self) {
+        let ms = self.start.elapsed().as_secs_f64() * 1000.0;
+        self.metrics.timer(
+            "agent.prompt.duration_ms",
+            ms,
+            &[("outcome", self.outcome.get())],
+        );
     }
 }
 
@@ -1081,6 +1174,80 @@ mod tests {
         assert_eq!(seen.len(), 2);
         assert_eq!(seen[0].len(), 1);     // just `one`
         assert_eq!(seen[1].len(), 3);     // user(one), assistant(first), user(two)
+
+        sess.join().unwrap();
+        inst.join().unwrap();
+    }
+
+    #[test]
+    fn metrics_emit_for_prompt_outcome_and_tool_calls() {
+        use std::net::UdpSocket;
+
+        // Bind a UDP receiver on loopback, point a metrics::Client at it,
+        // run a prompt that fires a tool call, then drain the socket and
+        // grep for the expected metric lines.
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver
+            .set_read_timeout(Some(std::time::Duration::from_millis(200)))
+            .unwrap();
+        let addr = receiver.local_addr().unwrap().to_string();
+        let client = std::sync::Arc::new(metrics::Client::new(addr).unwrap());
+
+        let sandbox: Box<dyn crate::sandbox::Sandbox> = Box::new(MockSandbox::new(vec![
+            crate::sandbox::ShellResult {
+                exit_code: 0,
+                stdout: b"ok\n".to_vec(),
+                stderr: Vec::new(),
+            },
+        ]));
+        let inst = spawn(Instance::new("ci", sandbox));
+        let model = Arc::new(MockModel::new(vec![
+            vec![
+                ModelEvent::ToolUseStart { id: "t1".into(), name: "bash".into() },
+                ModelEvent::ToolUseInputDelta(r#"{"command":"true"}"#.into()),
+                ModelEvent::BlockStop,
+                ModelEvent::Stop { reason: Some("tool_use".into()) },
+            ],
+            vec![
+                ModelEvent::TextDelta("done".into()),
+                ModelEvent::Stop { reason: Some("end_turn".into()) },
+            ],
+        ]));
+        let state = Arc::new(
+            HarnessState::new("m", model as Arc<dyn Model>, inst.addr.clone())
+                .with_metrics(client),
+        );
+        let sess = spawn(Session::new("s", state));
+
+        let _ = sess
+            .addr
+            .ask(|reply| SessionMsg::Prompt {
+                text: "go".into(),
+                structured_output_tag: None,
+                reply,
+            })
+            .unwrap()
+            .unwrap();
+
+        // Drain everything that arrived in the window. Each emit is one
+        // datagram; we expect at least started/duration/turns + a tool
+        // call counter + a tool duration timer.
+        let mut got: Vec<String> = Vec::new();
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = receiver.recv(&mut buf) {
+            got.push(String::from_utf8_lossy(&buf[..n]).into_owned());
+        }
+        let blob = got.join("\n");
+        assert!(blob.contains("agent.prompt.started:1|c"), "missing started: {blob}");
+        assert!(
+            blob.contains("agent.prompt.duration_ms:") && blob.contains("#outcome:ok"),
+            "missing ok-tagged prompt timer: {blob}"
+        );
+        assert!(blob.contains("agent.prompt.turns:2|h"), "missing turns histogram: {blob}");
+        assert!(
+            blob.contains("agent.tool.calls:1|c") && blob.contains("name:bash"),
+            "missing tool call counter: {blob}"
+        );
 
         sess.join().unwrap();
         inst.join().unwrap();

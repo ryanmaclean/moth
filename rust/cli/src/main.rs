@@ -30,19 +30,26 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// streaming receiver, which propagates as a cancellation through the
 /// session iteration loop.
 static CANCEL: AtomicBool = AtomicBool::new(false);
+/// Set by SIGTERM (`agent serve`). The server loop polls this; when true
+/// it stops accepting new connections, drains in-flight, and returns.
+pub(crate) static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn sigint_handler(_: libc::c_int) {
     CANCEL.store(true, Ordering::SeqCst);
 }
 
-/// Install a SIGINT handler that flips `CANCEL`. Repeated SIGINTs after
-/// the first hit the default handler (SIG_DFL), so a second Ctrl-C
-/// terminates the process if the agent is stuck.
-fn install_sigint() {
+extern "C" fn sigterm_handler(_: libc::c_int) {
+    SHUTDOWN.store(true, Ordering::SeqCst);
+}
+
+/// Install signal handlers. SIGINT (Ctrl-C) flips `CANCEL` for in-flight
+/// prompts; SIGTERM (K8s preStop, supervisord, systemd) flips `SHUTDOWN`
+/// so the server drains gracefully. Both are one-shot — a second signal
+/// hits the default handler and force-quits.
+fn install_signals() {
     unsafe {
-        // Set the C-side handler. After the first signal we restore
-        // SIG_DFL so the user can force-quit with a second Ctrl-C.
         libc::signal(libc::SIGINT, sigint_handler as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGTERM, sigterm_handler as *const () as libc::sighandler_t);
     }
 }
 
@@ -58,7 +65,7 @@ const DEFAULT_ANTHROPIC_MODEL: &str = "claude-haiku-4-5";
 const DEFAULT_OPENAI_MODEL: &str = "gpt-4o-mini";
 
 fn main() -> ExitCode {
-    install_sigint();
+    install_signals();
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
         return usage_and_exit(2);
@@ -418,8 +425,14 @@ fn run_cmd(mut args: Vec<String>) -> ExitCode {
 
     let sandbox: Box<dyn Sandbox> = Box::new(AuditedShell::new(vshell::VShell::new()));
     let inst = spawn(Instance::new("cli", sandbox));
-    let mut state_build =
-        HarnessState::new("default", model.clone(), inst.addr.clone()).with_tools(tools);
+    let metrics_client = Arc::new(
+        metrics::Client::from_env()
+            .with_prefix("agent")
+            .with_tag("provider", if common.openai { "openai" } else { "anthropic" }),
+    );
+    let mut state_build = HarnessState::new("default", model.clone(), inst.addr.clone())
+        .with_tools(tools)
+        .with_metrics(metrics_client);
     if let Some(budget) = common.compact_budget {
         let compactor = compact::Compactor::new(model.clone(), budget);
         let cb: Arc<harness::CompactFn> = Arc::new(move |msgs| {
@@ -635,7 +648,36 @@ fn serve_cmd(mut args: Vec<String>) -> ExitCode {
     );
 
     eprintln!("serving on {addr}");
-    let result = srv.serve_with(&addr, ServerConfig::default());
+    // Bind first so binding errors don't get mixed up with shutdown state.
+    let listener = match std::net::TcpListener::bind(&addr) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("bind {addr}: {e}");
+            drop(mcp_clients);
+            return ExitCode::from(1);
+        }
+    };
+    // Bridge the process-wide SHUTDOWN flag (set by SIGTERM) into the
+    // server's typed Arc<AtomicBool>. The poll thread is cheap (one
+    // 50ms tick) and exits when the server returns.
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_clone = shutdown.clone();
+    let bridge = std::thread::spawn(move || {
+        while !shutdown_clone.load(Ordering::Acquire) {
+            if SHUTDOWN.load(Ordering::Acquire) {
+                shutdown_clone.store(true, Ordering::Release);
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    });
+    let result = srv.serve_listener_with_shutdown(
+        listener,
+        ServerConfig::default(),
+        shutdown.clone(),
+    );
+    shutdown.store(true, Ordering::Release); // stop the bridge thread
+    let _ = bridge.join();
     drop(mcp_clients);
     match result {
         Ok(()) => ExitCode::SUCCESS,

@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, ErrorKind, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -132,10 +132,46 @@ impl Server {
 
     /// Drive an already-bound listener with a caller-supplied config.
     pub fn serve_listener_with(self, listener: TcpListener, cfg: ServerConfig) -> io::Result<()> {
+        self.serve_listener_with_shutdown(listener, cfg, Arc::new(AtomicBool::new(false)))
+    }
+
+    /// Same as [`serve_listener_with`] but checks `shutdown` between
+    /// accepts. Set it to `true` from a signal handler (SIGTERM) to stop
+    /// accepting new connections; in-flight requests finish naturally,
+    /// then the call returns. Non-blocking accept with a short poll lets
+    /// the shutdown flag take effect within ~50ms of being set.
+    pub fn serve_listener_with_shutdown(
+        self,
+        listener: TcpListener,
+        cfg: ServerConfig,
+        shutdown: Arc<AtomicBool>,
+    ) -> io::Result<()> {
+        listener.set_nonblocking(true)?;
         let shared = Arc::new(self);
         let active = Arc::new(AtomicUsize::new(0));
-        for conn in listener.incoming() {
-            let stream = conn?;
+        loop {
+            if shutdown.load(Ordering::Acquire) {
+                // Drain: wait for in-flight workers to drop their slot.
+                // Bound the wait at 30s so a stuck handler can't hang
+                // process exit indefinitely; orchestrators that want
+                // longer drains should configure preStop separately.
+                let deadline = std::time::Instant::now()
+                    + std::time::Duration::from_secs(30);
+                while active.load(Ordering::Acquire) > 0
+                    && std::time::Instant::now() < deadline
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                return Ok(());
+            }
+            let stream = match listener.accept() {
+                Ok((s, _)) => s,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             // Enforce the connection cap before spawning. We use a load /
             // compare-exchange pair rather than fetch_add+rollback so we
             // never even momentarily exceed the cap from another thread's
@@ -172,7 +208,6 @@ impl Server {
                 // Lost the race; retry the load.
             }
         }
-        Ok(())
     }
 
     fn handle_connection(&self, mut stream: TcpStream, cfg: &ServerConfig) -> io::Result<()> {

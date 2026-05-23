@@ -12,6 +12,7 @@ path = "src/lib.rs"
 actor = { path = "../actor" }
 anthropic = { path = "../anthropic" }
 audit = { path = "../audit" }
+metrics = { path = "../metrics" }
 openai = { path = "../openai" }
 vshell = { path = "../vshell" }
 wire = { path = "../wire" }

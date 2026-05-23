@@ -54,6 +54,7 @@ dependencies = [
  "libc",
  "mcp",
  "mcp_server",
+ "metrics",
  "persist",
  "runlog",
  "server",
@@ -135,6 +136,7 @@ dependencies = [
  "actor",
  "anthropic",
  "audit",
+ "metrics",
  "openai",
  "vshell",
  "wire",
@@ -279,6 +281,7 @@ version = "0.0.1"
 dependencies = [
  "actor",
  "harness",
+ "metrics",
 ]
 
 [[package]]
