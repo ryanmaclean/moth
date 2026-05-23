@@ -9,6 +9,11 @@
 //! POST /agents/chat/<id> opens a Session per id (in-memory) and
 //! streams model events back as SSE frames.
 //!
+//! `agent doctor` — smoke-check provider config, env paths, and network
+//! reachability before a real run. Prints a small report and exits with
+//! 0 if a provider key is set and its host is reachable, 1 if no key is
+//! set, 2 if a key is set but the network probe failed.
+//!
 //! Env:
 //!   ANTHROPIC_API_KEY     anthropic provider (default)
 //!   OPENAI_API_KEY        openai provider
@@ -18,6 +23,8 @@
 //!                         (defaults to current dir)
 //!   SESSIONS_DIR          enable file-backed session persistence at this dir
 //!                         (or pass --sessions DIR)
+
+mod doctor;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -56,8 +63,8 @@ fn install_signals() {
 use actor::spawn;
 use git::{AgentStatus, Branch, BranchStrategy, HeadStrategy, MergeToHeadStrategy};
 use harness::{
-    AnthropicModel, AuditedShell, BashTool, HarnessState, Instance, Model, OpenAiModel,
-    Sandbox, Session, SessionMsg, SessionStore, Tool,
+    AnthropicModel, AuditedShell, BashTool, HarnessState, Instance, MockModel, Model,
+    ModelEvent, OpenAiModel, Sandbox, Session, SessionMsg, SessionStore, Tool,
 };
 use server::{AgentHandler, EventSink, HandlerError, Server, ServerConfig};
 
@@ -74,6 +81,7 @@ fn main() -> ExitCode {
         "run" => run_cmd(args),
         "serve" => serve_cmd(args),
         "mcp-serve" => mcp_serve_cmd(args),
+        "doctor" => doctor::doctor_cmd(args),
         "-h" | "--help" | "help" => usage_and_exit(0),
         "-V" | "--version" | "version" => {
             println!("agent {}", env!("CARGO_PKG_VERSION"));
@@ -101,7 +109,9 @@ fn usage_and_exit(code: u8) -> ExitCode {
         agent serve [opts]                 long-running HTTP/1.1 + SSE server\n    \
           example: agent serve --addr 0.0.0.0:3583\n  \
         agent mcp-serve [opts]             speak MCP over stdio\n    \
-          example: agent mcp-serve\n\n\
+          example: agent mcp-serve\n  \
+        agent doctor [--mcp 'CMD ARGS']    smoke-check config + network\n    \
+          example: agent doctor\n\n\
         opts:\n  \
         --openai                     use OpenAI-compatible provider\n  \
         --model NAME                 model id\n  \
@@ -112,6 +122,8 @@ fn usage_and_exit(code: u8) -> ExitCode {
         --runlog DIR                 tee every StreamEvent to <DIR>/<run_id>.jsonl (or RUNLOG_DIR env)\n  \
         --task-tool                  expose a 'task' tool to the LLM (Flue-style session.task)\n  \
         --branch-strategy STRATEGY   [run] head | merge-to-head | branch:NAME\n  \
+        --mock                       [run] stub model with a canned response; no API key required\n  \
+        --mock-script PATH           [run] load scripted turns from a JSON file (implies --mock)\n  \
         --addr HOST:PORT             [serve] bind address (default 0.0.0.0:3583)\n\n\
         Run `agent <subcommand> --help` for subcommand-specific help.";
     eprintln!("{m}");
@@ -136,11 +148,19 @@ fn print_run_help() {
         --runlog DIR                 tee every StreamEvent to <DIR>/<run_id>.jsonl\n  \
         --task-tool                  expose a 'task' tool so the LLM can spawn subagents\n  \
         --compact-budget N           auto-compact history when over N tokens\n  \
-        --branch-strategy STRATEGY   head | merge-to-head | branch:NAME\n\n\
+        --branch-strategy STRATEGY   head | merge-to-head | branch:NAME\n  \
+        --mock                       stub the model with a canned response; no API key\n                               \
+                              required. Useful for CI, demos, and verifying the\n                               \
+                              tool/sandbox wiring without burning quota.\n  \
+        --mock-script PATH           load scripted turns from a JSON file (implies --mock).\n                               \
+                              Format: {\"turns\":[[{\"type\":\"text_delta\",\"delta\":\"hi\"},\n                               \
+                                       {\"type\":\"stop\",\"reason\":\"end_turn\"}]]}\n\n\
         examples:\n  \
         agent run \"explain this repo in 3 bullets\"\n  \
         agent run --openai --model gpt-4o-mini \"write a haiku\"\n  \
-        agent run --skill review --arg PR=123\n\n\
+        agent run --skill review --arg PR=123\n  \
+        agent run --mock \"hello\"                  # no API key required\n  \
+        agent run --mock-script ./script.json \"hi\"\n\n\
         env:\n  \
         ANTHROPIC_API_KEY            required for the default Anthropic provider\n  \
         OPENAI_API_KEY               required with --openai\n  \
@@ -319,6 +339,172 @@ fn open_store(dir: Option<&PathBuf>) -> Result<Option<Arc<dyn SessionStore>>, St
     Ok(Some(Arc::new(store)))
 }
 
+/// Cap on the user prompt echoed back by `--mock` (without a script). 80
+/// chars matches the documented behaviour; truncated input is suffixed
+/// with `...` so the cut is visible in logs.
+const MOCK_ECHO_LIMIT: usize = 80;
+
+/// Truncate `s` to at most `MOCK_ECHO_LIMIT` Unicode chars (not bytes —
+/// we don't want to slice mid-codepoint), appending `...` if anything
+/// was dropped.
+fn truncate_for_mock(s: &str) -> String {
+    let mut out = String::new();
+    let mut truncated = false;
+    for (n, c) in s.chars().enumerate() {
+        if n == MOCK_ECHO_LIMIT {
+            truncated = true;
+            break;
+        }
+        out.push(c);
+    }
+    if truncated {
+        out.push_str("...");
+    }
+    out
+}
+
+/// Build a `MockModel` that, on every call, emits a single `TextDelta`
+/// echoing the user's prompt (truncated to 80 chars) followed by
+/// `Stop { reason: "end_turn" }`. The same canned turn replays on every
+/// call since `MockModel` cycles when its scripts list is exhausted.
+fn build_mock_canned(prompt: &str) -> MockModel {
+    let echo = format!("[mock] received: {}\n", truncate_for_mock(prompt));
+    MockModel::single(vec![
+        ModelEvent::TextDelta(echo),
+        ModelEvent::Stop { reason: Some("end_turn".into()) },
+    ])
+}
+
+/// Compute (line, col), both 1-indexed, for a byte offset into `src`.
+/// `pos` is clamped to `src.len()`.
+fn line_col(src: &str, pos: usize) -> (usize, usize) {
+    let p = pos.min(src.len());
+    let mut line = 1usize;
+    let mut col = 1usize;
+    for b in &src.as_bytes()[..p] {
+        if *b == b'\n' {
+            line += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+    }
+    (line, col)
+}
+
+/// Extract the trailing `at <pos>` byte offset that `anthropic::json`
+/// embeds in its error messages, if any. Returns `None` for errors that
+/// don't carry a position.
+fn extract_pos(msg: &str) -> Option<usize> {
+    let mut last = None;
+    for token in msg.split_whitespace() {
+        if let Ok(n) =
+            token.trim_end_matches(|c: char| !c.is_ascii_digit()).parse::<usize>()
+        {
+            last = Some(n);
+        }
+    }
+    last
+}
+
+/// Load a mock script from disk. The file is JSON of the form:
+///
+/// ```text
+/// {"turns":[[{"type":"text_delta","delta":"hi"},
+///            {"type":"stop","reason":"end_turn"}]]}
+/// ```
+///
+/// Supported event `type` values: `text_delta`, `tool_use_start`,
+/// `tool_use_input_delta`, `block_stop`, `stop`. Errors are formatted as
+/// `path:line:col: <message>` so editors can jump straight to the bad
+/// token.
+fn load_mock_script(path: &std::path::Path) -> Result<Vec<Vec<ModelEvent>>, String> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| format!("{}: read: {e}", path.display()))?;
+    let parsed = anthropic::json::parse(raw.as_bytes()).map_err(|e| {
+        let msg = format!("{e}");
+        let (line, col) = match extract_pos(&msg) {
+            Some(p) => line_col(&raw, p),
+            None => (1, 1),
+        };
+        format!("{}:{line}:{col}: {msg}", path.display())
+    })?;
+    let turns = match parsed.get("turns") {
+        Some(anthropic::json::Json::Arr(t)) => t,
+        _ => {
+            return Err(format!(
+                "{}: top-level key 'turns' must be an array",
+                path.display()
+            ));
+        }
+    };
+    let mut out: Vec<Vec<ModelEvent>> = Vec::with_capacity(turns.len());
+    for (ti, turn_json) in turns.iter().enumerate() {
+        let events = match turn_json {
+            anthropic::json::Json::Arr(e) => e,
+            _ => {
+                return Err(format!(
+                    "{}: turns[{ti}] must be an array of events",
+                    path.display()
+                ));
+            }
+        };
+        let mut turn = Vec::with_capacity(events.len());
+        for (ei, ev) in events.iter().enumerate() {
+            turn.push(
+                parse_event(ev)
+                    .map_err(|e| format!("{}: turns[{ti}][{ei}]: {e}", path.display()))?,
+            );
+        }
+        out.push(turn);
+    }
+    Ok(out)
+}
+
+/// Decode one `{"type":...}` event object into a `ModelEvent`.
+fn parse_event(j: &anthropic::json::Json) -> Result<ModelEvent, String> {
+    let ty = j
+        .get("type")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing 'type' string field".to_string())?;
+    match ty {
+        "text_delta" => {
+            let s = j
+                .get("delta")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "text_delta: missing 'delta' string".to_string())?;
+            Ok(ModelEvent::TextDelta(s.to_string()))
+        }
+        "tool_use_start" => {
+            let id = j
+                .get("id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "tool_use_start: missing 'id'".to_string())?;
+            let name = j
+                .get("name")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "tool_use_start: missing 'name'".to_string())?;
+            Ok(ModelEvent::ToolUseStart {
+                id: id.to_string(),
+                name: name.to_string(),
+            })
+        }
+        "tool_use_input_delta" => {
+            let s = j
+                .get("delta")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "tool_use_input_delta: missing 'delta'".to_string())?;
+            Ok(ModelEvent::ToolUseInputDelta(s.to_string()))
+        }
+        "block_stop" => Ok(ModelEvent::BlockStop),
+        "stop" => {
+            let reason = j.get("reason").and_then(|v| v.as_str()).map(|s| s.to_string());
+            Ok(ModelEvent::Stop { reason })
+        }
+        other => Err(format!("unknown event type: {other:?}")),
+    }
+}
+
 /// Error returned by `build_model` when the provider's API key env var is
 /// absent. Callers print the dedicated hint via `print_missing_key_error`
 /// instead of treating it as a plain string error so the user gets a
@@ -438,6 +624,11 @@ fn run_cmd(mut args: Vec<String>) -> ExitCode {
     let mut skill_name: Option<String> = None;
     let mut skill_args: HashMap<String, String> = HashMap::new();
     let mut strategy_spec: Option<String> = None;
+    // --mock / --mock-script. Either flag enables mock mode and skips the
+    // API-key check; --mock-script additionally loads scripted turns from
+    // disk in place of the canned echo response.
+    let mut mock: bool = false;
+    let mut mock_script_path: Option<PathBuf> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -465,6 +656,20 @@ fn run_cmd(mut args: Vec<String>) -> ExitCode {
                     strategy_spec = Some(args.remove(i));
                 }
             }
+            "--mock" => {
+                mock = true;
+                args.remove(i);
+            }
+            "--mock-script" => {
+                args.remove(i);
+                if i < args.len() {
+                    mock = true;
+                    mock_script_path = Some(PathBuf::from(args.remove(i)));
+                } else {
+                    eprintln!("--mock-script requires a PATH argument");
+                    return ExitCode::from(2);
+                }
+            }
             _ => i += 1,
         }
     }
@@ -473,14 +678,6 @@ fn run_cmd(mut args: Vec<String>) -> ExitCode {
         Ok(s) => s,
         Err(e) => {
             eprintln!("{e}");
-            return ExitCode::from(2);
-        }
-    };
-
-    let model = match build_model(&common) {
-        Ok(m) => m,
-        Err(MissingApiKey) => {
-            print_missing_key_error(common.openai);
             return ExitCode::from(2);
         }
     };
@@ -496,6 +693,32 @@ fn run_cmd(mut args: Vec<String>) -> ExitCode {
         (None, p) if !p.is_empty() => p,
         (None, _) => {
             return usage_and_exit(2);
+        }
+    };
+
+    // Model build: --mock bypasses the API-key check entirely. With a
+    // script path we load + parse here (so a bad script aborts before any
+    // sandbox/MCP wiring happens); otherwise the canned echo turn is
+    // synthesised from the user's prompt.
+    let model: Arc<dyn Model> = if mock {
+        let mm = match mock_script_path.as_deref() {
+            Some(p) => match load_mock_script(p) {
+                Ok(turns) => MockModel::new(turns),
+                Err(e) => {
+                    eprintln!("{e}");
+                    return ExitCode::from(2);
+                }
+            },
+            None => build_mock_canned(&prompt),
+        };
+        Arc::new(mm)
+    } else {
+        match build_model(&common) {
+            Ok(m) => m,
+            Err(MissingApiKey) => {
+                print_missing_key_error(common.openai);
+                return ExitCode::from(2);
+            }
         }
     };
 
@@ -686,6 +909,17 @@ fn run_cmd(mut args: Vec<String>) -> ExitCode {
     }
 
     let _ = sess.join();
+    // `state` (and the optional `task_tool`, which retains a parent-state
+    // clone) hold extra `ActorRef<InstanceMsg>` clones via
+    // `HarnessState::instance`. The instance actor only stops once
+    // every sender is dropped, so we must drop those handles BEFORE
+    // `inst.join()` — otherwise the join blocks forever. This surfaced
+    // as a hang under `--mock` (where the Session finishes before any
+    // other Arc holder); the real-provider path didn't hit it because
+    // the model call took long enough that other ordering hid the
+    // deadlock.
+    drop(task_tool);
+    drop(state);
     let _ = inst.join();
     // Close the runlog channel so the drainer thread exits.
     drop(log_tx);

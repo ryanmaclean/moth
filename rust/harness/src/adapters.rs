@@ -216,7 +216,7 @@ impl<S: Sandbox> Sandbox for AuditedShell<S> {
 mod tests {
     use super::*;
     use crate::instance::{Instance, InstanceMsg};
-    use crate::model::MockModel;
+    use crate::mock::MockModel;
     use crate::session::{HarnessState, Session, SessionMsg};
     use actor::spawn;
     use std::sync::Arc;

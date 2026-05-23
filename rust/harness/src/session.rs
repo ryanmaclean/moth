@@ -587,7 +587,7 @@ impl<'a> Drop for PromptOutcomeGuard<'a> {
 mod tests {
     use super::*;
     use crate::instance::Instance;
-    use crate::model::MockModel;
+    use crate::mock::MockModel;
     use crate::sandbox::MockSandbox;
     use actor::spawn;
 

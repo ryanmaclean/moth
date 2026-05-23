@@ -12,6 +12,7 @@
 
 mod adapters;
 mod instance;
+pub mod mock;
 mod model;
 mod persist;
 mod sandbox;
@@ -19,10 +20,11 @@ mod session;
 mod tools;
 
 pub use adapters::{AnthropicModel, AuditedShell, OpenAiModel};
+pub use mock::MockModel;
 pub use persist::{SessionStore, StoreError};
 pub use instance::{Instance, InstanceMsg};
 pub use model::{
-    ChatMessage, ContentBlock, MockModel, Model, ModelError, ModelEvent, ModelRequest,
+    ChatMessage, ContentBlock, Model, ModelError, ModelEvent, ModelRequest,
     Role, ToolDef,
 };
 pub use sandbox::{MockSandbox, Sandbox, SandboxError, ShellResult};
