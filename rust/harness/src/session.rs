@@ -15,7 +15,7 @@
 //!      loop back to (2). Otherwise return.
 
 use std::sync::Arc;
-use std::sync::mpsc::{Sender, SyncSender};
+use std::sync::mpsc::SyncSender;
 
 use actor::{Actor, ActorRef};
 use wire::find_tag;
@@ -143,7 +143,12 @@ pub enum SessionMsg {
     PromptStream {
         text: String,
         structured_output_tag: Option<String>,
-        events: Sender<StreamEvent>,
+        /// Bounded sender — callers should use `sync_channel(cap)` so a
+        /// slow consumer applies backpressure to the iteration loop
+        /// instead of letting events queue without bound. Unbounded
+        /// callers can use `sync_channel(usize::MAX / 2)` but it's
+        /// almost always wrong.
+        events: SyncSender<StreamEvent>,
     },
     Shell {
         cmd: String,
@@ -224,7 +229,7 @@ impl Session {
         &mut self,
         text: String,
         structured_output_tag: Option<String>,
-        events: Option<&Sender<StreamEvent>>,
+        events: Option<&SyncSender<StreamEvent>>,
     ) -> Result<Option<PromptResult>, SessionError> {
         self.history.push(ChatMessage::user(text));
 
@@ -234,7 +239,7 @@ impl Session {
 
         // Closure: emit + detect cancellation. Returns false if the receiver
         // dropped, true to keep going. No-op if there's no receiver.
-        let emit = |evs: Option<&Sender<StreamEvent>>, ev: StreamEvent| -> bool {
+        let emit = |evs: Option<&SyncSender<StreamEvent>>, ev: StreamEvent| -> bool {
             match evs {
                 Some(tx) => tx.send(ev).is_ok(),
                 None => true,
@@ -868,7 +873,7 @@ mod tests {
 
     #[test]
     fn prompt_stream_emits_text_deltas_then_done() {
-        use std::sync::mpsc::channel;
+        use std::sync::mpsc::sync_channel;
 
         let (instance, session, _model, _sb) = rig(
             vec![vec![
@@ -879,7 +884,7 @@ mod tests {
             vec![],
         );
 
-        let (tx, rx) = channel::<StreamEvent>();
+        let (tx, rx) = sync_channel::<StreamEvent>(256);
         session
             .addr
             .send(SessionMsg::PromptStream {
@@ -913,7 +918,7 @@ mod tests {
 
     #[test]
     fn prompt_stream_cancellation_on_receiver_drop() {
-        use std::sync::mpsc::channel;
+        use std::sync::mpsc::sync_channel;
 
         // Long script — caller will drop the receiver after the first delta.
         let (instance, session, _model, _sb) = rig(
@@ -926,7 +931,7 @@ mod tests {
             vec![],
         );
 
-        let (tx, rx) = channel::<StreamEvent>();
+        let (tx, rx) = sync_channel::<StreamEvent>(256);
         session
             .addr
             .send(SessionMsg::PromptStream {
@@ -958,7 +963,7 @@ mod tests {
 
     #[test]
     fn prompt_stream_emits_tool_lifecycle_events() {
-        use std::sync::mpsc::channel;
+        use std::sync::mpsc::sync_channel;
 
         let (instance, session, _model, sandbox) = rig(
             vec![
@@ -983,7 +988,7 @@ mod tests {
             }],
         );
 
-        let (tx, rx) = channel::<StreamEvent>();
+        let (tx, rx) = sync_channel::<StreamEvent>(256);
         session
             .addr
             .send(SessionMsg::PromptStream {

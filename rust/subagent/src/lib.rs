@@ -34,7 +34,7 @@
 //! The returned `TaskHandle` wraps the worker thread's `JoinHandle`.
 
 use std::sync::Arc;
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::SyncSender;
 use std::thread::{self, JoinHandle};
 
 use actor::spawn;
@@ -131,7 +131,7 @@ pub fn spawn_task_streaming(
     parent_state: Arc<HarnessState>,
     prompt: String,
     role_system: Option<String>,
-    events: Sender<StreamEvent>,
+    events: SyncSender<StreamEvent>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let harness = child_state(&parent_state, role_system);
@@ -151,7 +151,7 @@ pub fn spawn_task_streaming(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::mpsc::channel;
+    use std::sync::mpsc::sync_channel;
 
     use actor::Spawned;
     use harness::{
@@ -466,7 +466,7 @@ mod tests {
             vec![],
         );
 
-        let (tx, rx) = channel::<StreamEvent>();
+        let (tx, rx) = sync_channel::<StreamEvent>(256);
         let h = spawn_task_streaming(state, "go".into(), None, tx);
 
         let mut text = String::new();
@@ -513,7 +513,7 @@ mod tests {
         }];
         let (instance, state, _model, _sb) = parent_rig(scripts, responses);
 
-        let (tx, rx) = channel::<StreamEvent>();
+        let (tx, rx) = sync_channel::<StreamEvent>(256);
         let h = spawn_task_streaming(state, "go".into(), None, tx);
 
         let mut saw_start = false;
@@ -634,7 +634,7 @@ mod tests {
             .collect();
         let (instance, state, _model, _sb) = parent_rig(scripts, responses);
 
-        let (tx, rx) = channel::<StreamEvent>();
+        let (tx, rx) = sync_channel::<StreamEvent>(256);
         let h = spawn_task_streaming(state, "loop forever".into(), None, tx);
 
         let mut got_err = false;

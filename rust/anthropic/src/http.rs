@@ -69,6 +69,18 @@ extern "C" fn write_cb(
 }
 
 pub(crate) fn post_stream(api_key: &str, body: String) -> Result<Stream, Error> {
+    // Circuit-breaker check: fail fast if the host is in cooldown so we
+    // don't tie up a thread + curl handle for a known-down upstream.
+    let breaker_cfg = wire::retry::BreakerConfig::default();
+    match wire::retry::check("api.anthropic.com", &breaker_cfg) {
+        wire::retry::BreakerVerdict::Allow | wire::retry::BreakerVerdict::HalfOpenProbe => {}
+        wire::retry::BreakerVerdict::Open => {
+            return Err(Error::Http(
+                "circuit open for api.anthropic.com (recent upstream failures)".into(),
+            ));
+        }
+    }
+
     let (tx, rx) = std::sync::mpsc::sync_channel::<Chunk>(64);
 
     let url = CString::new(URL).map_err(|_| Error::Http("bad URL".into()))?;
@@ -93,6 +105,13 @@ pub(crate) fn post_stream(api_key: &str, body: String) -> Result<Stream, Error> 
                 &mut ctx,
             )
         };
+        // Vote the breaker. Network / 5xx-class errors are "retryable"
+        // and count toward the open threshold; clean status (200..300) is
+        // a success vote.
+        match &result {
+            Ok(_) => wire::retry::record_success("api.anthropic.com", &breaker_cfg),
+            Err(_) => wire::retry::record_failure("api.anthropic.com", &breaker_cfg),
+        }
         let _ = tx.send(Chunk::End(result));
     });
 

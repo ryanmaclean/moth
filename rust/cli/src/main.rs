@@ -440,7 +440,7 @@ fn run_cmd(mut args: Vec<String>) -> ExitCode {
     // Optional run log: tee every StreamEvent into <dir>/<run_id>.jsonl.
     let run_id = format!("run-{}", unix_ms_now());
     let runlog_handle = open_runlog(common.runlog_dir.as_ref(), &run_id);
-    let (log_tx, log_rx) = std::sync::mpsc::channel::<harness::StreamEvent>();
+    let (log_tx, log_rx) = std::sync::mpsc::sync_channel::<harness::StreamEvent>(1024);
     let log_thread = runlog_handle.as_ref().map(|r| {
         let r = r.clone();
         std::thread::spawn(move || {
@@ -449,7 +449,7 @@ fn run_cmd(mut args: Vec<String>) -> ExitCode {
     });
 
     // Use streaming so text deltas print to stdout as the model generates them.
-    let (tx, rx) = std::sync::mpsc::channel::<harness::StreamEvent>();
+    let (tx, rx) = std::sync::mpsc::sync_channel::<harness::StreamEvent>(256);
     if let Err(e) = sess.addr.send(SessionMsg::PromptStream {
         text: prompt,
         structured_output_tag: None,
@@ -673,7 +673,7 @@ impl AgentHandler for ChatHandler {
         // Streaming: forward each Session StreamEvent to the SSE client as
         // it arrives. Client-disconnect (sink.emit fails) propagates to the
         // session as a closed receiver, which triggers in-loop cancellation.
-        let (tx, rx) = std::sync::mpsc::channel::<harness::StreamEvent>();
+        let (tx, rx) = std::sync::mpsc::sync_channel::<harness::StreamEvent>(256);
         sess.addr
             .send(SessionMsg::PromptStream {
                 text: prompt,

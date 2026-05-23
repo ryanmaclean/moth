@@ -73,6 +73,17 @@ pub(crate) fn post_stream(
     base_url: &str,
     body: String,
 ) -> Result<Stream, Error> {
+    let host = host_of(base_url);
+    let breaker_cfg = wire::retry::BreakerConfig::default();
+    match wire::retry::check(&host, &breaker_cfg) {
+        wire::retry::BreakerVerdict::Allow | wire::retry::BreakerVerdict::HalfOpenProbe => {}
+        wire::retry::BreakerVerdict::Open => {
+            return Err(Error::Http(format!(
+                "circuit open for {host} (recent upstream failures)"
+            )));
+        }
+    }
+
     let (tx, rx) = std::sync::mpsc::sync_channel::<Chunk>(64);
 
     let full_url = join_url(base_url, PATH);
@@ -88,10 +99,29 @@ pub(crate) fn post_stream(
         let result = unsafe {
             run_easy(&url, &auth_header, &content_type, &accept, &body_c, &mut ctx)
         };
+        match &result {
+            Ok(_) => wire::retry::record_success(&host, &breaker_cfg),
+            Err(_) => wire::retry::record_failure(&host, &breaker_cfg),
+        }
         let _ = tx.send(Chunk::End(result));
     });
 
     Ok(Stream { rx, handle: Some(handle) })
+}
+
+/// Extract the host portion of `base_url` (e.g. "https://api.openai.com/v1"
+/// → "api.openai.com"). Defaults to the whole input if parsing fails so
+/// the breaker still keys consistently per caller-supplied URL.
+fn host_of(base_url: &str) -> String {
+    let after_scheme = base_url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(base_url);
+    after_scheme
+        .split(['/', ':', '?'])
+        .next()
+        .unwrap_or(base_url)
+        .to_string()
 }
 
 fn join_url(base: &str, path: &str) -> String {

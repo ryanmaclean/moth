@@ -762,7 +762,7 @@ fn streaming_emits_events_in_wire_order() {
         ]],
         None,
     );
-    let (tx, rx) = std::sync::mpsc::channel::<harness::StreamEvent>();
+    let (tx, rx) = std::sync::mpsc::sync_channel::<harness::StreamEvent>(256);
     rig.session
         .addr
         .send(harness::SessionMsg::PromptStream {
@@ -806,7 +806,7 @@ fn runlog_records_every_stream_event_to_disk() {
         ]],
         None,
     );
-    let (tx, rx) = std::sync::mpsc::channel::<harness::StreamEvent>();
+    let (tx, rx) = std::sync::mpsc::sync_channel::<harness::StreamEvent>(256);
     let drainer = {
         let log = log.clone();
         std::thread::spawn(move || log.drain(rx))
