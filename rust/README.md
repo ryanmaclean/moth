@@ -8,7 +8,7 @@ into a build with a small dependency footprint.
 
 ## Status
 
-Production-grade. 20 crates, 592 inline tests across the workspace;
+Production-grade. 19 crates, 592 inline tests across the workspace;
 one direct external dependency (`curl-sys`), all transitive deps fully
 vendored. Streaming + cancellation through the Session iteration loop;
 runlog audit trail; auto-compaction hook between turns; HTTP server
@@ -32,13 +32,12 @@ suite with measured numbers; cross-crate integration suite (16 default
 | `fstools/` | `read_file` / `write_file` / `edit_file` tools. Per-component canonicalisation + leaf `symlink_metadata` check makes them symlink-safe when a `root` is set. | `harness`, `anthropic` |
 | `tmpl/` | `{{KEY}}` substitution + `.agents/skills/<name>.md` + `.agents/roles/<name>.md` markdown loading. | `wire` |
 | `server/` | Hand-rolled HTTP/1.1 + SSE. Read/write timeouts, configurable connection cap (atomic counter), HTTP/1.1 keep-alive on non-streaming responses. | — |
-| `mcp/` | Model Context Protocol client (stdio + streamable-HTTP transports). Each remote tool implements `harness::Tool`. Session-id propagation, SSE response framing via `wire`, bearer auth. | `harness`, `wire`, `anthropic`, `curl-sys` |
+| `mcp/` | Model Context Protocol client + server. Client: stdio + streamable-HTTP transports, each remote tool implements `harness::Tool`. Server (`mcp::server::Server`): exposes a local `harness::Tool` registry over stdio JSON-RPC. | `actor`, `harness`, `wire`, `anthropic`, `curl-sys` |
 | `git/` | Branch strategies for code-editing agents: `HeadStrategy` (works in repo_root, refuses dirty tree), `MergeToHeadStrategy` (temp worktree + merge back on success, leave on failure), `Branch{name}` (named persistent branch). Shells out to `git(1)`. | — |
 | `integration/` | Cross-crate scenario tests. 12 whole-stack tests covering tool routing, audit blocking, fstools sandboxing, session persistence, MCP wiring, completion signal, turn cap, structured output extraction. | every crate it tests |
 | `benches/` | Microbenchmarks for the SIMD/parsing hot paths. `std::time::Instant`-based, no criterion. `cargo test -p benches --release -- --nocapture`. | `wire`, `audit`, `anthropic`, `vshell` |
 | `runlog/` | File-backed JSONL audit trail. Subscribes to `harness::StreamEvent` and writes one record per event. Atomic appends, mutex-guarded; ms-precision UNIX timestamps. | `harness`, `anthropic` |
 | `compact/` | Message-history compaction. Pure layer (`estimate_chars`, `split_for_compaction`) + model-driven `Compactor` that replaces older turns with a single synthetic summary message. Wires into `HarnessState::with_compactor`. | `harness` |
-| `mcp_server/` | Server side of MCP over stdio. Exposes `harness::Tool` as MCP-callable. `initialize`/`tools/list`/`tools/call`/`notifications/initialized` + standard JSON-RPC errors. | `harness`, `wire`, `anthropic` |
 | `subagent/` | Flue-style `session.task()`: spawn a focused child agent that shares the parent's sandbox + tools but starts with empty history. Optional role overlay. Streaming variant available. | `harness`, `actor` |
 | `persist/` | File-backed `SessionStore`. Atomic writes via tmp + rename. Version-tagged JSON; key validation rejects path-traversal. | `harness`, `anthropic` |
 | `harness/` | Instance + Session actors. `Model` / `Sandbox` / `Tool` / `SessionStore` traits. `AnthropicModel`, `OpenAiModel`, `AuditedShell<S>`, `BashTool`. Iteration loop with tool-use, completion signal, structured output, 16-turn cap, optional persistence hook. | `actor`, `wire`, `anthropic`, `openai`, `audit`, `vshell` |

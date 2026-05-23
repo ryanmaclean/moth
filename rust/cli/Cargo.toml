@@ -17,7 +17,6 @@ fstools = { path = "../fstools" }
 git = { path = "../git" }
 harness = { path = "../harness" }
 mcp = { path = "../mcp" }
-mcp_server = { path = "../mcp_server" }
 metrics = { path = "../metrics" }
 persist = { path = "../persist" }
 runlog = { path = "../runlog" }

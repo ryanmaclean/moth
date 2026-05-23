@@ -17,6 +17,7 @@
 //! built-ins.
 
 mod jsonrpc;
+pub mod server;
 mod transport;
 
 use std::sync::Arc;

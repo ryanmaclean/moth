@@ -55,7 +55,6 @@ dependencies = [
  "harness",
  "libc",
  "mcp",
- "mcp_server",
  "metrics",
  "persist",
  "runlog",
@@ -131,7 +130,6 @@ dependencies = [
  "fstools",
  "harness",
  "mcp",
- "mcp_server",
  "openai",
  "persist",
  "runlog",
@@ -166,16 +164,6 @@ dependencies = [
  "actor",
  "anthropic",
  "curl-sys",
- "harness",
- "wire",
-]
-
-[[package]]
-name = "mcp_server"
-version = "0.0.1"
-dependencies = [
- "actor",
- "anthropic",
  "harness",
  "wire",
 ]
