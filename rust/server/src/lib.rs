@@ -237,6 +237,20 @@ impl Server {
         req: Request,
         stream: &mut TcpStream,
     ) -> (ResponseKind, io::Result<()>) {
+        // Ops endpoints. GET-only, always cheap, never call handlers. Live
+        // here (not registered as `AgentHandler`s) because they're not
+        // tenant-specific and shouldn't surface in the handler map.
+        if req.method == "GET" {
+            return match req.path.split('?').next().unwrap_or(&req.path) {
+                "/healthz" => (ResponseKind::Buffered, write_ops(stream, "ok\n")),
+                "/readyz" => (ResponseKind::Buffered, write_ops(stream, "ok\n")),
+                // Any other GET is 405 — `/agents/*` is POST-only.
+                _ => (
+                    ResponseKind::Buffered,
+                    write_simple(stream, 405, "Method Not Allowed"),
+                ),
+            };
+        }
         let Some((name, id)) = parse_agent_path(&req.path) else {
             return (ResponseKind::Buffered, write_simple(stream, 404, "Not Found"));
         };
@@ -295,6 +309,7 @@ fn parse_agent_path(path: &str) -> Option<(&str, &str)> {
 }
 
 struct Request {
+    method: String,
     path: String,
     body: Vec<u8>,
     connection_close: bool,
@@ -319,13 +334,15 @@ fn parse_request<R: BufRead>(reader: &mut R) -> Result<Request, ParseError> {
         None => return Err(ParseError::Idle),
     };
     let mut parts = status.splitn(3, ' ');
-    let method = parts.next().ok_or(ParseError::Malformed)?;
+    let method = parts.next().ok_or(ParseError::Malformed)?.to_string();
     let path = parts.next().ok_or(ParseError::Malformed)?.to_string();
     let version = parts.next().ok_or(ParseError::Malformed)?;
     if !version.starts_with("HTTP/1.") {
         return Err(ParseError::Malformed);
     }
-    if method != "POST" {
+    // POST is the agent dispatch path; GET serves health/ops endpoints.
+    // Anything else is 405.
+    if method != "POST" && method != "GET" {
         return Err(ParseError::MethodNotAllowed);
     }
     // HTTP/1.0 defaults to Connection: close; HTTP/1.1 to keep-alive.
@@ -381,7 +398,7 @@ fn parse_request<R: BufRead>(reader: &mut R) -> Result<Request, ParseError> {
         }
     };
 
-    Ok(Request { path, body, connection_close })
+    Ok(Request { method, path, body, connection_close })
 }
 
 /// Read one CRLF-terminated line. With `allow_idle = true` (used only for
@@ -457,6 +474,19 @@ fn write_simple(w: &mut dyn Write, status: u16, reason: &str) -> io::Result<()> 
     write!(
         w,
         "HTTP/1.1 {status} {reason}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )?;
+    w.write_all(body)?;
+    w.flush()
+}
+
+/// 200 OK with a tiny body, no `Connection: close` — health checks
+/// benefit from keep-alive so liveness probes don't TIME_WAIT-flood.
+fn write_ops(w: &mut dyn Write, body_text: &str) -> io::Result<()> {
+    let body = body_text.as_bytes();
+    write!(
+        w,
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\n\r\n",
         body.len()
     )?;
     w.write_all(body)?;
@@ -574,6 +604,32 @@ mod tests {
         let req = b"POST /nope HTTP/1.1\r\nContent-Length: 0\r\n\r\n";
         let resp = send(addr, req);
         assert!(resp.starts_with(b"HTTP/1.1 404"));
+    }
+
+    #[test]
+    fn healthz_returns_200_ok() {
+        let (addr, _h) = spawn_server();
+        let req = b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n";
+        let resp = send(addr, req);
+        assert!(resp.starts_with(b"HTTP/1.1 200"));
+        assert!(resp.ends_with(b"ok\n"));
+    }
+
+    #[test]
+    fn readyz_returns_200_ok() {
+        let (addr, _h) = spawn_server();
+        let req = b"GET /readyz HTTP/1.1\r\nHost: x\r\n\r\n";
+        let resp = send(addr, req);
+        assert!(resp.starts_with(b"HTTP/1.1 200"));
+        assert!(resp.ends_with(b"ok\n"));
+    }
+
+    #[test]
+    fn healthz_with_query_string_still_matches() {
+        let (addr, _h) = spawn_server();
+        let req = b"GET /healthz?ts=1 HTTP/1.1\r\nHost: x\r\n\r\n";
+        let resp = send(addr, req);
+        assert!(resp.starts_with(b"HTTP/1.1 200"));
     }
 
     #[test]

@@ -5,6 +5,7 @@
 //! Zero dependencies.
 
 mod ndjson;
+pub mod retry;
 mod scan;
 mod sse;
 mod tag;

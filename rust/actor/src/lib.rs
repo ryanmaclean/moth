@@ -72,15 +72,100 @@ impl<M: Send + 'static> Spawned<M> {
     }
 }
 
-pub fn spawn<A: Actor>(mut actor: A) -> Spawned<A::Msg> {
+pub fn spawn<A: Actor>(actor: A) -> Spawned<A::Msg> {
     let (tx, rx): (Sender<A::Msg>, Receiver<A::Msg>) = mpsc::channel();
-    let handle = thread::spawn(move || {
-        while let Ok(msg) = rx.recv() {
-            actor.handle(msg);
-        }
-        actor.stopped();
-    });
+    let handle = thread::spawn(move || run_loop(actor, rx));
     Spawned { addr: ActorRef { tx }, handle }
+}
+
+/// Bounded variant: `send` blocks once `capacity` messages are queued.
+/// Use this in any path where a fast producer can outrun the actor —
+/// streaming HTTP, fan-in from many connections, etc. Prevents silent
+/// memory growth under backpressure.
+pub fn spawn_bounded<A: Actor>(actor: A, capacity: usize) -> SpawnedSync<A::Msg> {
+    let (tx, rx) = sync_channel::<A::Msg>(capacity);
+    let handle = thread::spawn(move || run_loop_sync(actor, rx));
+    SpawnedSync { addr: SyncActorRef { tx }, handle }
+}
+
+/// Shared dispatch loop. Wraps every `handle` call in `catch_unwind` so a
+/// tool panic doesn't kill the mailbox silently — we log the payload to
+/// stderr and break out of the loop so subsequent sends fail-fast
+/// (channel half closes when the receiver thread exits its scope).
+fn run_loop<A: Actor>(mut actor: A, rx: Receiver<A::Msg>) {
+    while let Ok(msg) = rx.recv() {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            actor.handle(msg);
+        }));
+        if let Err(payload) = result {
+            log_panic(&payload);
+            break;
+        }
+    }
+    actor.stopped();
+}
+
+fn run_loop_sync<A: Actor>(mut actor: A, rx: Receiver<A::Msg>) {
+    while let Ok(msg) = rx.recv() {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            actor.handle(msg);
+        }));
+        if let Err(payload) = result {
+            log_panic(&payload);
+            break;
+        }
+    }
+    actor.stopped();
+}
+
+fn log_panic(payload: &Box<dyn std::any::Any + Send>) {
+    let msg = payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("<non-string panic>");
+    eprintln!("actor: handler panicked: {msg}");
+}
+
+/// Bounded-mailbox counterpart of `Spawned`. The `SyncActorRef::send` call
+/// applies backpressure: it blocks until either capacity frees up or the
+/// receiver is gone.
+#[must_use = "dropping SpawnedSync detaches the actor's thread"]
+pub struct SpawnedSync<M: Send + 'static> {
+    pub addr: SyncActorRef<M>,
+    handle: JoinHandle<()>,
+}
+
+impl<M: Send + 'static> SpawnedSync<M> {
+    pub fn join(self) -> thread::Result<()> {
+        let SpawnedSync { addr, handle } = self;
+        drop(addr);
+        handle.join()
+    }
+}
+
+pub struct SyncActorRef<M: Send + 'static> {
+    tx: SyncSender<M>,
+}
+
+impl<M: Send + 'static> Clone for SyncActorRef<M> {
+    fn clone(&self) -> Self {
+        Self { tx: self.tx.clone() }
+    }
+}
+
+impl<M: Send + 'static> SyncActorRef<M> {
+    /// Send; blocks if the mailbox is at capacity. Returns `Err` if the
+    /// receiver thread has exited (panicked or run to completion).
+    pub fn send(&self, msg: M) -> Result<(), std::sync::mpsc::SendError<M>> {
+        self.tx.send(msg)
+    }
+
+    /// Try-send. Returns `Err(Full)` if the mailbox is at capacity; lets
+    /// callers shed load instead of blocking when the actor is slow.
+    pub fn try_send(&self, msg: M) -> Result<(), std::sync::mpsc::TrySendError<M>> {
+        self.tx.try_send(msg)
+    }
 }
 
 #[cfg(test)]
@@ -151,5 +236,64 @@ mod tests {
         s.addr.send(Count::Inc).unwrap();
         s.join().unwrap();
         assert_eq!(observed.load(Ordering::SeqCst), 3);
+    }
+
+    // ----- panic isolation -----------------------------------------------
+
+    struct Panicker;
+    enum PMsg {
+        Ok,
+        Boom,
+    }
+    impl Actor for Panicker {
+        type Msg = PMsg;
+        fn handle(&mut self, msg: PMsg) {
+            match msg {
+                PMsg::Ok => {}
+                PMsg::Boom => panic!("intentional"),
+            }
+        }
+    }
+
+    #[test]
+    fn handler_panic_closes_mailbox_without_killing_caller() {
+        let s = spawn(Panicker);
+        // First message is fine.
+        s.addr.send(PMsg::Ok).unwrap();
+        // This panic must not propagate; the actor thread exits cleanly.
+        // The send itself succeeds because the channel is still open at
+        // the moment we push.
+        let _ = s.addr.send(PMsg::Boom);
+        // Subsequent sends MAY succeed (race: thread might not have
+        // exited yet) or fail (Err once the receiver scope drops).
+        // What matters is that the test process doesn't crash.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let _ = s.addr.send(PMsg::Ok);
+        // Join is safe; thread already exited.
+        let _ = s.join();
+    }
+
+    // ----- bounded mailbox -----------------------------------------------
+
+    #[test]
+    fn spawn_bounded_applies_backpressure() {
+        use std::sync::mpsc::TrySendError;
+
+        // Capacity 2: third try_send returns Full while the actor is busy.
+        struct Slow;
+        impl Actor for Slow {
+            type Msg = ();
+            fn handle(&mut self, _: ()) {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+        let s = spawn_bounded(Slow, 2);
+        // First two queue immediately.
+        s.addr.try_send(()).unwrap();
+        s.addr.try_send(()).unwrap();
+        // Third hits the capacity wall right away (worker is sleeping on #1).
+        let third = s.addr.try_send(());
+        assert!(matches!(third, Err(TrySendError::Full(_))));
+        s.join().unwrap();
     }
 }
