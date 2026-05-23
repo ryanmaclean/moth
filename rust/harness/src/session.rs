@@ -101,11 +101,23 @@ pub struct Session {
     pub history: Vec<ChatMessage>,
     pub harness: Arc<HarnessState>,
     pub store: Option<Arc<dyn SessionStore>>,
+    /// Index of the first message in `history` that hasn't been persisted
+    /// yet. After each save-point we append `history[last_persisted_len..]`
+    /// to the store and bump this to `history.len()`. Compaction (which
+    /// rewrites `history` in place) must reset this to 0 — see the call to
+    /// `mark_history_replaced` in `run_prompt_inner`.
+    last_persisted_len: usize,
 }
 
 impl Session {
     pub fn new(name: impl Into<String>, harness: Arc<HarnessState>) -> Self {
-        Self { name: name.into(), history: Vec::new(), harness, store: None }
+        Self {
+            name: name.into(),
+            history: Vec::new(),
+            harness,
+            store: None,
+            last_persisted_len: 0,
+        }
     }
 
     /// Attach a persistence store and load any previous history under
@@ -118,8 +130,30 @@ impl Session {
             Ok(None) => {}
             Err(e) => eprintln!("session store load failed for {}: {}", self.name, e),
         }
+        // Anything loaded is already on disk — only future messages need
+        // appending.
+        self.last_persisted_len = self.history.len();
         self.store = Some(store);
         self
+    }
+
+    /// Persist the tail of `history` we haven't yet sent to the store. The
+    /// store is append-only, so we slice from `last_persisted_len` and bump
+    /// the cursor on success. On error we leave the cursor alone so the
+    /// next call retries from the same point.
+    fn persist_tail(&mut self) {
+        let Some(store) = self.store.as_ref() else {
+            return;
+        };
+        if self.last_persisted_len >= self.history.len() {
+            return;
+        }
+        let new = &self.history[self.last_persisted_len..];
+        if let Err(e) = store.append(&self.name, new) {
+            eprintln!("session store append failed for {}: {}", self.name, e);
+            return;
+        }
+        self.last_persisted_len = self.history.len();
     }
 }
 
@@ -275,7 +309,23 @@ impl Session {
             // The callback either summarises older turns or returns the
             // history unchanged. Implementations must not panic.
             if let Some(c) = &self.harness.compactor {
+                let before = self.history.len();
                 self.history = (c)(std::mem::take(&mut self.history));
+                // If compaction shortened or rewrote history, the store's
+                // append log is now stale. Push a snapshot and reset the
+                // cursor so subsequent appends are deltas against the new
+                // baseline.
+                if self.history.len() != before
+                    && let Some(store) = &self.store
+                {
+                    match store.snapshot(&self.name, &self.history) {
+                        Ok(()) => self.last_persisted_len = self.history.len(),
+                        Err(e) => eprintln!(
+                            "session store snapshot failed for {}: {}",
+                            self.name, e
+                        ),
+                    }
+                }
             }
 
             let req = ModelRequest {
@@ -370,11 +420,7 @@ impl Session {
 
             if cancelled {
                 // Persist partial history then surface Cancelled to the caller.
-                if let Some(store) = &self.store
-                    && let Err(e) = store.save(&self.name, &self.history)
-                {
-                    eprintln!("session store save failed for {}: {}", self.name, e);
-                }
+                self.persist_tail();
                 let _ = emit(events, StreamEvent::Cancelled);
                 outcome.set("cancelled");
                 return Ok(None);
@@ -384,11 +430,7 @@ impl Session {
             // lets observers (runlog, telemetry) checkpoint per turn.
             if !emit(events, StreamEvent::TurnComplete { turn: turns, stop_reason: stop_reason.clone() }) {
                 let _ = emit(events, StreamEvent::Cancelled);
-                if let Some(store) = &self.store
-                    && let Err(e) = store.save(&self.name, &self.history)
-                {
-                    eprintln!("session store save failed for {}: {}", self.name, e);
-                }
+                self.persist_tail();
                 outcome.set("cancelled");
                 return Ok(None);
             }
@@ -414,11 +456,7 @@ impl Session {
                     // and bail.
                     results.push(block);
                     self.history.push(ChatMessage { role: Role::User, content: results });
-                    if let Some(store) = &self.store
-                        && let Err(e) = store.save(&self.name, &self.history)
-                    {
-                        eprintln!("session store save failed for {}: {}", self.name, e);
-                    }
+                    self.persist_tail();
                     let _ = emit(events, StreamEvent::Cancelled);
                     outcome.set("cancelled");
                     return Ok(None);
@@ -432,11 +470,7 @@ impl Session {
             .as_deref()
             .and_then(|tag| find_tag(response_text.as_bytes(), tag.as_bytes()).map(<[u8]>::to_vec));
 
-        if let Some(store) = &self.store
-            && let Err(e) = store.save(&self.name, &self.history)
-        {
-            eprintln!("session store save failed for {}: {}", self.name, e);
-        }
+        self.persist_tail();
 
         // Successful exit. Turn count is reported separately as a histogram.
         metrics.histogram("agent.prompt.turns", turns as f64, &[]);
@@ -867,7 +901,7 @@ mod tests {
         let store = Arc::new(InMemoryStore::new());
         // Pre-seed: a prior conversation under name "resumed".
         store
-            .save(
+            .append(
                 "resumed",
                 &[
                     ChatMessage::user("hello?"),
@@ -910,8 +944,8 @@ mod tests {
             vec![ContentBlock::Text("hello?".into())]
         );
 
-        // Store saw a save call after the prompt.
-        assert!(*store.save_calls.lock().unwrap() >= 1);
+        // Store saw an append call after the prompt.
+        assert!(*store.append_calls.lock().unwrap() >= 1);
         let persisted = store.data.lock().unwrap().get("resumed").cloned().unwrap();
         // resumed 2 + new user + new assistant = 4
         assert_eq!(persisted.len(), 4);

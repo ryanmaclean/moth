@@ -75,6 +75,10 @@ fn main() -> ExitCode {
         "serve" => serve_cmd(args),
         "mcp-serve" => mcp_serve_cmd(args),
         "-h" | "--help" | "help" => usage_and_exit(0),
+        "-V" | "--version" | "version" => {
+            println!("agent {}", env!("CARGO_PKG_VERSION"));
+            ExitCode::SUCCESS
+        }
         other => {
             eprintln!("unknown subcommand: {other}");
             usage_and_exit(2)
@@ -644,7 +648,12 @@ fn serve_cmd(mut args: Vec<String>) -> ExitCode {
     let mut srv = Server::new();
     srv.register(
         "chat",
-        Box::new(ChatHandler { model, tools: Arc::new(tools), store }),
+        Box::new(ChatHandler {
+            model,
+            tools: Arc::new(tools),
+            store,
+            runlog_dir: common.runlog_dir.clone(),
+        }),
     );
 
     eprintln!("serving on {addr}");
@@ -695,10 +704,18 @@ struct ChatHandler {
     model: Arc<dyn Model>,
     tools: Arc<Vec<Arc<dyn Tool>>>,
     store: Option<Arc<dyn SessionStore>>,
+    /// Where per-request RunLog jsonl files land. `None` disables runlog.
+    runlog_dir: Option<PathBuf>,
 }
 
 impl AgentHandler for ChatHandler {
-    fn handle(&self, id: &str, body: &[u8], sink: &mut EventSink) -> Result<(), HandlerError> {
+    fn handle(
+        &self,
+        id: &str,
+        request_id: &str,
+        body: &[u8],
+        sink: &mut EventSink,
+    ) -> Result<(), HandlerError> {
         let prompt = parse_prompt(body).map_err(HandlerError)?;
         let _ = sink.emit(Some("start"), id);
 
@@ -711,6 +728,28 @@ impl AgentHandler for ChatHandler {
             sess_build = sess_build.with_store(s.clone());
         }
         let sess = spawn(sess_build);
+
+        // Optional RunLog: use the per-request correlation key as the
+        // `run_id` so the jsonl filename matches the `X-Request-ID`
+        // surfaced on the response. Every emitted record carries the
+        // same id in a dedicated field for log/metric joins.
+        let runlog = self.runlog_dir.as_ref().and_then(|dir| {
+            match runlog::RunLog::open_with_request_id(dir, request_id, request_id) {
+                Ok(r) => Some(Arc::new(r)),
+                Err(e) => {
+                    eprintln!("runlog: open {dir:?} failed: {e:?}; continuing without log");
+                    None
+                }
+            }
+        });
+        let (log_tx, log_rx) =
+            std::sync::mpsc::sync_channel::<harness::StreamEvent>(1024);
+        let log_thread = runlog.as_ref().map(|r| {
+            let r = r.clone();
+            std::thread::spawn(move || {
+                let _ = r.drain(log_rx);
+            })
+        });
 
         // Streaming: forward each Session StreamEvent to the SSE client as
         // it arrives. Client-disconnect (sink.emit fails) propagates to the
@@ -726,6 +765,9 @@ impl AgentHandler for ChatHandler {
 
         let mut final_err: Option<HandlerError> = None;
         for ev in rx.iter() {
+            // Tee to the runlog drainer first. A closed/full channel is a
+            // warning only; the request continues.
+            let _ = log_tx.send(ev.clone());
             let write_result = match &ev {
                 harness::StreamEvent::TextDelta(s) => sink.emit(Some("text_delta"), s),
                 harness::StreamEvent::ToolUseStart { id: tid, name } => {
@@ -768,6 +810,10 @@ impl AgentHandler for ChatHandler {
         drop(rx); // signal cancellation to the still-running session if any
         let _ = sess.join();
         let _ = inst.join();
+        drop(log_tx);
+        if let Some(t) = log_thread {
+            let _ = t.join();
+        }
 
         match final_err {
             Some(e) => Err(e),

@@ -9,4 +9,5 @@ description = "Defensive shell-command scanner. Literal multi-pattern match over
 path = "src/lib.rs"
 
 [dependencies]
+anthropic = { path = "../anthropic" }
 wire = { path = "../wire" }

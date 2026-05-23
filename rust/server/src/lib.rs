@@ -56,7 +56,13 @@ impl Default for ServerConfig {
 }
 
 pub trait AgentHandler: Send + Sync + 'static {
-    fn handle(&self, id: &str, body: &[u8], sink: &mut EventSink) -> Result<(), HandlerError>;
+    fn handle(
+        &self,
+        id: &str,
+        request_id: &str,
+        body: &[u8],
+        sink: &mut EventSink,
+    ) -> Result<(), HandlerError>;
 }
 
 pub struct EventSink<'a> {
@@ -238,22 +244,23 @@ impl Server {
                 Err(ParseError::Idle) => return Ok(()),
                 Err(ParseError::Timeout) => {
                     // Partial request then silence: 408. Don't keep-alive
-                    // because the framing state is unknown.
-                    let _ = write_simple(&mut stream, 408, "Request Timeout");
+                    // because the framing state is unknown. Headers may
+                    // never have arrived, so no request-id to echo.
+                    let _ = write_simple(&mut stream, 408, "Request Timeout", None);
                     return Ok(());
                 }
                 Err(ParseError::TooLarge) => {
-                    write_simple(&mut stream, 413, "Payload Too Large")?;
+                    write_simple(&mut stream, 413, "Payload Too Large", None)?;
                     // Body framing is unknown after a 413 — there may be
                     // unread bytes on the wire. Close.
                     return Ok(());
                 }
                 Err(ParseError::MethodNotAllowed) => {
-                    write_simple(&mut stream, 405, "Method Not Allowed")?;
+                    write_simple(&mut stream, 405, "Method Not Allowed", None)?;
                     return Ok(());
                 }
                 Err(_) => {
-                    write_simple(&mut stream, 400, "Bad Request")?;
+                    write_simple(&mut stream, 400, "Bad Request", None)?;
                     return Ok(());
                 }
             };
@@ -272,35 +279,57 @@ impl Server {
         req: Request,
         stream: &mut TcpStream,
     ) -> (ResponseKind, io::Result<()>) {
+        // Resolve the per-request correlation id: use the client-supplied
+        // `X-Request-ID` if valid, otherwise mint a synthetic one. We do
+        // this even for paths that won't reach a handler so ops endpoints
+        // can echo the id too — cheap and useful for log joins.
+        let request_id = req.request_id.clone().unwrap_or_else(generate_request_id);
+
         // Ops endpoints. GET-only, always cheap, never call handlers. Live
         // here (not registered as `AgentHandler`s) because they're not
         // tenant-specific and shouldn't surface in the handler map.
         if req.method == "GET" {
             return match req.path.split('?').next().unwrap_or(&req.path) {
-                "/healthz" => (ResponseKind::Buffered, write_ops(stream, "ok\n")),
-                "/readyz" => (ResponseKind::Buffered, write_ops(stream, "ok\n")),
+                "/healthz" => (
+                    ResponseKind::Buffered,
+                    write_ops(stream, "ok\n", &request_id),
+                ),
+                "/readyz" => (
+                    ResponseKind::Buffered,
+                    write_ops(stream, "ok\n", &request_id),
+                ),
                 // Any other GET is 405 — `/agents/*` is POST-only.
                 _ => (
                     ResponseKind::Buffered,
-                    write_simple(stream, 405, "Method Not Allowed"),
+                    write_simple(stream, 405, "Method Not Allowed", Some(&request_id)),
                 ),
             };
         }
         let Some((name, id)) = parse_agent_path(&req.path) else {
-            return (ResponseKind::Buffered, write_simple(stream, 404, "Not Found"));
+            return (
+                ResponseKind::Buffered,
+                write_simple(stream, 404, "Not Found", Some(&request_id)),
+            );
         };
         let Some(handler) = self.handlers.get(name) else {
-            return (ResponseKind::Buffered, write_simple(stream, 404, "Not Found"));
+            return (
+                ResponseKind::Buffered,
+                write_simple(stream, 404, "Not Found", Some(&request_id)),
+            );
         };
 
         // Commit SSE headers up front. Once they're on the wire any handler
         // error has to be surfaced inside the stream as an `error` event;
-        // we can't retroactively change the status.
-        let header_res = stream.write_all(
-            b"HTTP/1.1 200 OK\r\n\
-              Content-Type: text/event-stream\r\n\
-              Cache-Control: no-cache\r\n\
-              Connection: close\r\n\r\n",
+        // we can't retroactively change the status. The `X-Request-ID` echo
+        // goes here so the client can correlate the SSE body with its
+        // outbound request before any data frames arrive.
+        let header_res = write!(
+            stream,
+            "HTTP/1.1 200 OK\r\n\
+             Content-Type: text/event-stream\r\n\
+             Cache-Control: no-cache\r\n\
+             Connection: close\r\n\
+             X-Request-ID: {request_id}\r\n\r\n",
         );
         if let Err(e) = header_res {
             return (ResponseKind::Sse, Err(e));
@@ -310,7 +339,7 @@ impl Server {
         }
 
         let mut sink = EventSink::new(stream);
-        if let Err(e) = handler.handle(id, &req.body, &mut sink) {
+        if let Err(e) = handler.handle(id, &request_id, &req.body, &mut sink) {
             let _ = sink.emit(Some("error"), &e.0);
         }
         (ResponseKind::Sse, Ok(()))
@@ -348,6 +377,9 @@ struct Request {
     path: String,
     body: Vec<u8>,
     connection_close: bool,
+    /// Verbatim value of an inbound `X-Request-ID` header, if any. The
+    /// dispatcher falls back to a synthetic id when this is `None`.
+    request_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -383,6 +415,7 @@ fn parse_request<R: BufRead>(reader: &mut R) -> Result<Request, ParseError> {
     // HTTP/1.0 defaults to Connection: close; HTTP/1.1 to keep-alive.
     let mut content_length: Option<usize> = None;
     let mut connection_close = version == "HTTP/1.0";
+    let mut request_id: Option<String> = None;
     let mut header_count = 0usize;
     loop {
         let line = read_line(reader, false)?.ok_or(ParseError::Malformed)?;
@@ -420,6 +453,17 @@ fn parse_request<R: BufRead>(reader: &mut R) -> Result<Request, ParseError> {
                     }
                 }
             }
+            "x-request-id" => {
+                // Reject empty/whitespace-only values and anything containing
+                // ASCII control chars (header injection guard) — fall back to
+                // a synthetic id in that case.
+                if !value.is_empty()
+                    && value.len() <= 256
+                    && !value.bytes().any(|b| b < 0x20 || b == 0x7f)
+                {
+                    request_id = Some(value.to_string());
+                }
+            }
             _ => {}
         }
     }
@@ -433,7 +477,7 @@ fn parse_request<R: BufRead>(reader: &mut R) -> Result<Request, ParseError> {
         }
     };
 
-    Ok(Request { method, path, body, connection_close })
+    Ok(Request { method, path, body, connection_close, request_id })
 }
 
 /// Read one CRLF-terminated line. With `allow_idle = true` (used only for
@@ -504,28 +548,58 @@ fn is_timeout(e: &io::Error) -> bool {
     matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
 }
 
-fn write_simple(w: &mut dyn Write, status: u16, reason: &str) -> io::Result<()> {
+fn write_simple(
+    w: &mut dyn Write,
+    status: u16,
+    reason: &str,
+    request_id: Option<&str>,
+) -> io::Result<()> {
     let body = reason.as_bytes();
     write!(
         w,
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n",
         body.len()
     )?;
+    if let Some(rid) = request_id {
+        write!(w, "X-Request-ID: {rid}\r\n")?;
+    }
+    w.write_all(b"\r\n")?;
     w.write_all(body)?;
     w.flush()
 }
 
 /// 200 OK with a tiny body, no `Connection: close` — health checks
 /// benefit from keep-alive so liveness probes don't TIME_WAIT-flood.
-fn write_ops(w: &mut dyn Write, body_text: &str) -> io::Result<()> {
+fn write_ops(w: &mut dyn Write, body_text: &str, request_id: &str) -> io::Result<()> {
     let body = body_text.as_bytes();
     write!(
         w,
-        "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nX-Request-ID: {request_id}\r\n\r\n",
         body.len()
     )?;
     w.write_all(body)?;
     w.flush()
+}
+
+/// Mint a synthetic request id when the client didn't supply one. Shape:
+/// `req-<unix_ms>-<8 lowercase hex>`. The hex tail mixes pid, subsec
+/// nanos, and a monotonically increasing per-process counter so two
+/// calls in the same millisecond (and on the same coarse-clock tick)
+/// always differ. Not crypto-random — for log/metric joins only.
+fn generate_request_id() -> String {
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let ms = now.as_millis();
+    let nanos = now.subsec_nanos();
+    let pid = std::process::id();
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed) as u32;
+    // Fold all three into a 32-bit tail via Knuth-multiplicative mixing.
+    let mut tail = pid.wrapping_mul(2_654_435_761);
+    tail = tail.wrapping_add(nanos.wrapping_mul(40_503));
+    tail = tail.wrapping_add(seq.wrapping_mul(2_246_822_519));
+    format!("req-{ms}-{tail:08x}")
 }
 
 #[cfg(test)]
@@ -539,7 +613,13 @@ mod tests {
 
     struct EchoAgent;
     impl AgentHandler for EchoAgent {
-        fn handle(&self, id: &str, body: &[u8], sink: &mut EventSink) -> Result<(), HandlerError> {
+        fn handle(
+            &self,
+            id: &str,
+            _request_id: &str,
+            body: &[u8],
+            sink: &mut EventSink,
+        ) -> Result<(), HandlerError> {
             sink.emit(Some("start"), id).map_err(io_to_handler)?;
             sink.emit_data(std::str::from_utf8(body).unwrap_or("<binary>"))
                 .map_err(io_to_handler)?;
@@ -553,6 +633,7 @@ mod tests {
         fn handle(
             &self,
             _id: &str,
+            _request_id: &str,
             _body: &[u8],
             _sink: &mut EventSink,
         ) -> Result<(), HandlerError> {
@@ -565,10 +646,26 @@ mod tests {
         fn handle(
             &self,
             _id: &str,
+            _request_id: &str,
             body: &[u8],
             sink: &mut EventSink,
         ) -> Result<(), HandlerError> {
             sink.emit_data(&body.len().to_string()).map_err(io_to_handler)
+        }
+    }
+
+    /// Re-emits the `request_id` it received so tests can assert the
+    /// dispatcher passed the same value it echoed on the response header.
+    struct EchoReqIdAgent;
+    impl AgentHandler for EchoReqIdAgent {
+        fn handle(
+            &self,
+            _id: &str,
+            request_id: &str,
+            _body: &[u8],
+            sink: &mut EventSink,
+        ) -> Result<(), HandlerError> {
+            sink.emit(Some("req"), request_id).map_err(io_to_handler)
         }
     }
 
@@ -587,6 +684,7 @@ mod tests {
         server.register("echo", Box::new(EchoAgent));
         server.register("err", Box::new(ErrAgent));
         server.register("len", Box::new(LenAgent));
+        server.register("reqid", Box::new(EchoReqIdAgent));
         let handle = thread::spawn(move || {
             let _ = server.serve_listener_with(listener, cfg);
         });
@@ -898,6 +996,7 @@ mod tests {
             fn handle(
                 &self,
                 _id: &str,
+                _request_id: &str,
                 _body: &[u8],
                 sink: &mut EventSink,
             ) -> Result<(), HandlerError> {
@@ -950,6 +1049,7 @@ mod tests {
             fn handle(
                 &self,
                 _id: &str,
+                _request_id: &str,
                 _body: &[u8],
                 sink: &mut EventSink,
             ) -> Result<(), HandlerError> {
@@ -1148,5 +1248,91 @@ mod tests {
                 return;
             }
         }
+    }
+
+    // Request-ID propagation -------------------------------------------------
+
+    /// Client-supplied `X-Request-ID` is echoed verbatim on the SSE
+    /// response header AND surfaced to the handler.
+    #[test]
+    fn inbound_x_request_id_echoed_on_response_and_passed_to_handler() {
+        let (addr, _h) = spawn_server();
+        let req = b"POST /agents/reqid/x HTTP/1.1\r\n\
+                    Host: x\r\n\
+                    X-Request-ID: my-trace-123\r\n\
+                    Content-Length: 0\r\n\r\n";
+        let resp = send(addr, req);
+        let (head, body) = split_headers_body(&resp);
+        assert!(head.starts_with("HTTP/1.1 200 OK"));
+        assert!(
+            head.contains("X-Request-ID: my-trace-123"),
+            "header missing X-Request-ID: {head}"
+        );
+        let body = String::from_utf8(body).unwrap();
+        assert!(
+            body.contains("event: req\ndata: my-trace-123\n\n"),
+            "handler did not receive the inbound id: {body:?}"
+        );
+    }
+
+    /// Missing inbound header → server mints `req-<unix_ms>-<8 hex>` and
+    /// the same value appears on the response header and in the handler.
+    #[test]
+    fn missing_x_request_id_synthesizes_and_echoes() {
+        let (addr, _h) = spawn_server();
+        let req = b"POST /agents/reqid/x HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n";
+        let resp = send(addr, req);
+        let (head, body) = split_headers_body(&resp);
+        assert!(head.starts_with("HTTP/1.1 200 OK"));
+
+        // Pull the synthesised id off the response header.
+        let header_id = head
+            .lines()
+            .find_map(|l| l.strip_prefix("X-Request-ID: "))
+            .expect("X-Request-ID header present");
+        assert!(
+            header_id.starts_with("req-"),
+            "synthetic id has wrong prefix: {header_id:?}"
+        );
+        // Shape: req-<ms>-<8 hex>
+        let rest = &header_id["req-".len()..];
+        let (ms, hex) = rest.split_once('-').expect("ms-hex split");
+        assert!(!ms.is_empty() && ms.bytes().all(|b| b.is_ascii_digit()));
+        assert_eq!(hex.len(), 8);
+        assert!(hex.bytes().all(|b| b.is_ascii_hexdigit()));
+
+        // Same value must reach the handler.
+        let body = String::from_utf8(body).unwrap();
+        assert!(
+            body.contains(&format!("event: req\ndata: {header_id}\n\n")),
+            "handler request_id mismatch; header={header_id:?} body={body:?}"
+        );
+    }
+
+    /// An empty or control-char-laced `X-Request-ID` is rejected (treated
+    /// as missing) so a hostile client can't inject headers via the id.
+    #[test]
+    fn empty_x_request_id_falls_back_to_synthetic() {
+        let (addr, _h) = spawn_server();
+        let req = b"POST /agents/reqid/x HTTP/1.1\r\n\
+                    Host: x\r\n\
+                    X-Request-ID: \r\n\
+                    Content-Length: 0\r\n\r\n";
+        let resp = send(addr, req);
+        let (head, _body) = split_headers_body(&resp);
+        let header_id = head
+            .lines()
+            .find_map(|l| l.strip_prefix("X-Request-ID: "))
+            .expect("X-Request-ID header present");
+        assert!(header_id.starts_with("req-"), "got: {header_id:?}");
+    }
+
+    /// `generate_request_id` returns distinct values on back-to-back calls.
+    /// Cheap sanity check on the suffix mixing.
+    #[test]
+    fn generate_request_id_is_distinct_within_one_ms() {
+        let a = generate_request_id();
+        let b = generate_request_id();
+        assert_ne!(a, b, "generator collided immediately: {a} == {b}");
     }
 }

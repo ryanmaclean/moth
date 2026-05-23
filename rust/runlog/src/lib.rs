@@ -9,6 +9,12 @@
 //! {"ts_ms": <epoch-millis>, "run_id": "<id>", "kind": "<kind>", "data": {...}}
 //! ```
 //!
+//! When the log was opened via `open_with_request_id`, every record also
+//! carries the inbound HTTP correlation id between `run_id` and `kind`:
+//! ```text
+//! {"ts_ms": ..., "run_id": "...", "request_id": "...", "kind": "...", "data": ...}
+//! ```
+//!
 //! `ts_ms` is plain epoch milliseconds — no calendar math, no leap years,
 //! consumers can format if they care.
 //!
@@ -32,6 +38,9 @@ use harness::{PromptResult, SessionError, StreamEvent};
 pub struct RunLog {
     file: Mutex<File>,
     run_id: String,
+    /// Optional HTTP correlation id. When `Some`, every emitted record
+    /// gains a `"request_id":"..."` field after `run_id`.
+    request_id: Option<String>,
     started_at: SystemTime,
 }
 
@@ -70,15 +79,33 @@ impl RunLog {
         dir: impl AsRef<Path>,
         run_id: impl Into<String>,
     ) -> Result<Self, RunLogError> {
-        let dir = dir.as_ref();
+        Self::open_inner(dir.as_ref(), run_id.into(), None)
+    }
+
+    /// Like [`open`] but stamps every record with `request_id`. Used by
+    /// the HTTP server path so log records can be joined against
+    /// request-scoped metrics by the per-request correlation key.
+    pub fn open_with_request_id(
+        dir: impl AsRef<Path>,
+        run_id: impl Into<String>,
+        request_id: impl Into<String>,
+    ) -> Result<Self, RunLogError> {
+        Self::open_inner(dir.as_ref(), run_id.into(), Some(request_id.into()))
+    }
+
+    fn open_inner(
+        dir: &Path,
+        run_id: String,
+        request_id: Option<String>,
+    ) -> Result<Self, RunLogError> {
         std::fs::create_dir_all(dir)?;
-        let run_id = run_id.into();
         let path = dir.join(format!("{run_id}.jsonl"));
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
         let started_at = SystemTime::now();
         let log = Self {
             file: Mutex::new(file),
             run_id,
+            request_id,
             started_at,
         };
         let started_ms = unix_ms(started_at);
@@ -92,6 +119,10 @@ impl RunLog {
 
     pub fn run_id(&self) -> &str {
         &self.run_id
+    }
+
+    pub fn request_id(&self) -> Option<&str> {
+        self.request_id.as_deref()
     }
 
     pub fn started_at(&self) -> SystemTime {
@@ -160,7 +191,13 @@ impl RunLog {
         push_u128(&mut line, ts);
         line.push_str(r#","run_id":""#);
         escape_into(&mut line, &self.run_id);
-        line.push_str(r#"","kind":""#);
+        line.push('"');
+        if let Some(rid) = &self.request_id {
+            line.push_str(r#","request_id":""#);
+            escape_into(&mut line, rid);
+            line.push('"');
+        }
+        line.push_str(r#","kind":""#);
         escape_into(&mut line, kind);
         line.push_str(r#"","data":"#);
         line.push_str(payload);
@@ -645,5 +682,56 @@ mod tests {
         assert!(lines[1].contains("first"));
         assert!(lines[3].contains("second"));
         cleanup(&dir);
+    }
+
+    /// `open_with_request_id` stamps both the opening `start` record and
+    /// every drained event with the same `request_id`, in the documented
+    /// position (after `run_id`, before `kind`).
+    #[test]
+    fn open_with_request_id_stamps_start_and_subsequent_events() {
+        let dir = scratch();
+        let log = RunLog::open_with_request_id(&dir, "r1", "req-abc-12345678").unwrap();
+        assert_eq!(log.run_id(), "r1");
+        assert_eq!(log.request_id(), Some("req-abc-12345678"));
+
+        let (tx, rx) = sync_channel(8);
+        tx.send(StreamEvent::TextDelta("hi".into())).unwrap();
+        tx.send(StreamEvent::Done(PromptResult {
+            text: "bye".into(),
+            structured: None,
+            completed: true,
+            turns: 1,
+        }))
+        .unwrap();
+        drop(tx);
+        let summary = log.drain(rx).unwrap();
+        assert_eq!(summary.final_event, Some("done"));
+
+        let lines = read_lines(&dir, "r1");
+        // start + text_delta + done
+        assert_eq!(lines.len(), 3);
+        for line in &lines {
+            assert!(
+                line.contains(r#""request_id":"req-abc-12345678""#),
+                "missing request_id on line: {line}"
+            );
+            // Field order: ts_ms, run_id, request_id, kind, data
+            let run_pos = line.find(r#""run_id":"#).unwrap();
+            let req_pos = line.find(r#""request_id":"#).unwrap();
+            let kind_pos = line.find(r#""kind":"#).unwrap();
+            assert!(
+                run_pos < req_pos && req_pos < kind_pos,
+                "field order wrong: {line}"
+            );
+        }
+        // Sanity: omitting request_id (plain `open`) still works and the
+        // field is absent.
+        let dir2 = scratch();
+        let log2 = RunLog::open(&dir2, "r2").unwrap();
+        assert!(log2.request_id().is_none());
+        let lines2 = read_lines(&dir2, "r2");
+        assert!(!lines2[0].contains("request_id"), "unexpected: {}", lines2[0]);
+        cleanup(&dir);
+        cleanup(&dir2);
     }
 }

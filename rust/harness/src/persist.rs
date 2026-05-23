@@ -15,13 +15,24 @@ impl std::fmt::Display for StoreError {
 
 impl std::error::Error for StoreError {}
 
-/// Backs a `Session`'s message history. `load` returns `Ok(None)` for an
-/// unseen id; `Ok(Some(_))` for a resumed session. `save` is called after
-/// every successful turn (best-effort — a save error logs and continues
-/// rather than failing the prompt).
+/// Backs a `Session`'s message history.
+///
+/// `load` returns `Ok(None)` for an unseen id; `Ok(Some(_))` for a resumed
+/// session. `append` is called after every successful turn with only the
+/// messages that haven't been persisted yet (best-effort — an append error
+/// logs and continues rather than failing the prompt). `snapshot` is an
+/// optional best-effort compaction hook: stores that maintain an
+/// append-only log can use it to fold the log into a snapshot.
 pub trait SessionStore: Send + Sync + 'static {
     fn load(&self, key: &str) -> Result<Option<Vec<ChatMessage>>, StoreError>;
-    fn save(&self, key: &str, history: &[ChatMessage]) -> Result<(), StoreError>;
+    /// Append `new_messages` to the end of the persisted history.
+    fn append(&self, key: &str, new_messages: &[ChatMessage]) -> Result<(), StoreError>;
+    /// Best-effort log compaction. The caller passes the canonical
+    /// post-compaction history so a store that keeps an append log can
+    /// fold it into a fresh snapshot. Default: no-op.
+    fn snapshot(&self, _key: &str, _history: &[ChatMessage]) -> Result<(), StoreError> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -32,12 +43,15 @@ pub(crate) mod test_store {
 
     pub struct InMemoryStore {
         pub data: Mutex<HashMap<String, Vec<ChatMessage>>>,
-        pub save_calls: Mutex<u32>,
+        pub append_calls: Mutex<u32>,
     }
 
     impl InMemoryStore {
         pub fn new() -> Self {
-            Self { data: Mutex::new(HashMap::new()), save_calls: Mutex::new(0) }
+            Self {
+                data: Mutex::new(HashMap::new()),
+                append_calls: Mutex::new(0),
+            }
         }
     }
 
@@ -45,9 +59,16 @@ pub(crate) mod test_store {
         fn load(&self, key: &str) -> Result<Option<Vec<ChatMessage>>, StoreError> {
             Ok(self.data.lock().unwrap().get(key).cloned())
         }
-        fn save(&self, key: &str, history: &[ChatMessage]) -> Result<(), StoreError> {
-            *self.save_calls.lock().unwrap() += 1;
-            self.data.lock().unwrap().insert(key.to_string(), history.to_vec());
+        fn append(
+            &self,
+            key: &str,
+            new_messages: &[ChatMessage],
+        ) -> Result<(), StoreError> {
+            *self.append_calls.lock().unwrap() += 1;
+            let mut data = self.data.lock().unwrap();
+            data.entry(key.to_string())
+                .or_default()
+                .extend_from_slice(new_messages);
             Ok(())
         }
     }

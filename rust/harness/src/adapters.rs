@@ -202,7 +202,7 @@ impl<S: Sandbox> Sandbox for AuditedShell<S> {
     fn execute(&mut self, cmd: &str) -> Result<ShellResult, SandboxError> {
         let blocked = self.scanner.blocking(cmd.as_bytes());
         if !blocked.is_empty() {
-            let labels: Vec<&str> = blocked.iter().map(|f| f.label).collect();
+            let labels: Vec<&str> = blocked.iter().map(|f| f.label.as_str()).collect();
             return Err(SandboxError(format!("blocked by audit: {labels:?}")));
         }
         self.inner.execute(cmd)
