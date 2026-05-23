@@ -8,14 +8,13 @@ into a build with a small dependency footprint.
 
 ## Status
 
-Production-grade. 23 crates, 542 inline tests across the workspace;
+Production-grade. 20 crates, 592 inline tests across the workspace;
 one direct external dependency (`curl-sys`), all transitive deps fully
 vendored. Streaming + cancellation through the Session iteration loop;
 runlog audit trail; auto-compaction hook between turns; HTTP server
 hardened + streaming SSE; sessions persist; MCP client (stdio + HTTP)
 *and* MCP server (`agent mcp-serve`); fstools symlink + hard-link safe;
-git + jj branch strategies; Gitea + GitHub forge clients; multi-node
-`cluster::RemoteActorRef`; Flue-style `subagent::spawn_task` with an
+git branch strategies; Flue-style `subagent::spawn_task` with an
 LLM-callable `task` tool; Aho-Corasick `audit` scanner; microbench
 suite with measured numbers; cross-crate integration suite (16 default
 + 3 gated real-network).
@@ -36,10 +35,6 @@ suite with measured numbers; cross-crate integration suite (16 default
 | `mcp/` | Model Context Protocol client (stdio + streamable-HTTP transports). Each remote tool implements `harness::Tool`. Session-id propagation, SSE response framing via `wire`, bearer auth. | `harness`, `wire`, `anthropic`, `curl-sys` |
 | `git/` | Branch strategies for code-editing agents: `HeadStrategy` (works in repo_root, refuses dirty tree), `MergeToHeadStrategy` (temp worktree + merge back on success, leave on failure), `Branch{name}` (named persistent branch). Shells out to `git(1)`. | — |
 | `integration/` | Cross-crate scenario tests. 12 whole-stack tests covering tool routing, audit blocking, fstools sandboxing, session persistence, MCP wiring, completion signal, turn cap, structured output extraction. | every crate it tests |
-| `jj/` | Jujutsu (jj) branch strategies implementing `git::BranchStrategy`. Workspace + bookmark mapping. Tests skip cleanly if `jj` isn't installed. | `git` |
-| `gitea/` | Minimal Gitea REST API client (PATs via `Authorization: token`, `/api/v1/...`). Issues, comments, PRs. Works with Forgejo, Codeberg. | `wire`, `anthropic`, `curl-sys` |
-| `cluster/` | Multi-node `RemoteActorRef<M: Codec>` over TCP. Length-prefixed frames, per-node registry, fire-and-forget delivery, cached connections with re-dial on failure. | `actor`, `wire`, `anthropic` |
-| `github/` | GitHub REST API client. `Authorization: Bearer`, `Accept: application/vnd.github+json`, `X-GitHub-Api-Version`, required `User-Agent`. Filters PRs out of `list_issues`. Works with Enterprise via `with_base_url`. | `anthropic`, `curl-sys` |
 | `benches/` | Microbenchmarks for the SIMD/parsing hot paths. `std::time::Instant`-based, no criterion. `cargo test -p benches --release -- --nocapture`. | `wire`, `audit`, `anthropic`, `vshell` |
 | `runlog/` | File-backed JSONL audit trail. Subscribes to `harness::StreamEvent` and writes one record per event. Atomic appends, mutex-guarded; ms-precision UNIX timestamps. | `harness`, `anthropic` |
 | `compact/` | Message-history compaction. Pure layer (`estimate_chars`, `split_for_compaction`) + model-driven `Compactor` that replaces older turns with a single synthetic summary message. Wires into `HarnessState::with_compactor`. | `harness` |
@@ -126,6 +121,6 @@ finds every match regardless of pattern count.
 ## What's left
 
 (Nothing actively deferred. The crate set covers the workflows we set
-out to support — runtime, models, tools, sandbox, audit, forges, VCS
-strategies, cluster, persistence, MCP, HTTP service, CLI. Future work
-is feature growth rather than gap-closing.)
+out to support — runtime, models, tools, sandbox, audit, VCS branch
+strategy, persistence, MCP, HTTP service, CLI. Future work is feature
+growth rather than gap-closing.)
