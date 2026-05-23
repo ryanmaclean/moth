@@ -86,11 +86,22 @@ fn main() -> ExitCode {
     }
 }
 
+/// Returns true if the arg list contains a help flag anywhere. Used by
+/// each subcommand handler to intercept `--help`/`-h` before any other
+/// parsing — otherwise the help flag would be consumed as a prompt
+/// fragment (notably by `agent run`).
+fn wants_help(args: &[String]) -> bool {
+    args.iter().any(|a| a == "--help" || a == "-h")
+}
+
 fn usage_and_exit(code: u8) -> ExitCode {
     let m = "usage:\n  \
-        agent run [opts] <prompt>\n  \
-        agent serve [opts]\n  \
-        agent mcp-serve [opts]            speak MCP over stdio\n\n\
+        agent run [opts] <prompt>          one-shot prompt; streams response to stdout\n    \
+          example: agent run \"summarize README.md\"\n  \
+        agent serve [opts]                 long-running HTTP/1.1 + SSE server\n    \
+          example: agent serve --addr 0.0.0.0:3583\n  \
+        agent mcp-serve [opts]             speak MCP over stdio\n    \
+          example: agent mcp-serve\n\n\
         opts:\n  \
         --openai                     use OpenAI-compatible provider\n  \
         --model NAME                 model id\n  \
@@ -101,9 +112,119 @@ fn usage_and_exit(code: u8) -> ExitCode {
         --runlog DIR                 tee every StreamEvent to <DIR>/<run_id>.jsonl (or RUNLOG_DIR env)\n  \
         --task-tool                  expose a 'task' tool to the LLM (Flue-style session.task)\n  \
         --branch-strategy STRATEGY   [run] head | merge-to-head | branch:NAME\n  \
-        --addr HOST:PORT             [serve] bind address (default 0.0.0.0:3583)";
+        --addr HOST:PORT             [serve] bind address (default 0.0.0.0:3583)\n\n\
+        Run `agent <subcommand> --help` for subcommand-specific help.";
     eprintln!("{m}");
     ExitCode::from(code)
+}
+
+/// Detailed help for `agent run`. Printed on `agent run --help` / `-h`.
+fn print_run_help() {
+    let m = "agent run \u{2014} one-shot prompt; streams the model response to stdout.\n\n\
+        usage:\n  \
+        agent run [opts] <prompt>\n  \
+        agent run [opts] --skill NAME [--arg KEY=VAL ...]\n\n\
+        required:\n  \
+        <prompt>                     free-text prompt, OR use --skill to load one\n\n\
+        flags:\n  \
+        --openai                     use OpenAI-compatible provider (default: Anthropic)\n  \
+        --model NAME                 model id (defaults: claude-haiku-4-5 / gpt-4o-mini)\n  \
+        --skill NAME                 load .agents/skills/NAME.md as the prompt\n  \
+        --arg KEY=VAL                substitute {{KEY}} in the skill (repeatable)\n  \
+        --sessions DIR               persist message history to DIR\n  \
+        --mcp 'CMD ARGS'             spawn MCP server, register its tools (repeatable)\n  \
+        --runlog DIR                 tee every StreamEvent to <DIR>/<run_id>.jsonl\n  \
+        --task-tool                  expose a 'task' tool so the LLM can spawn subagents\n  \
+        --compact-budget N           auto-compact history when over N tokens\n  \
+        --branch-strategy STRATEGY   head | merge-to-head | branch:NAME\n\n\
+        examples:\n  \
+        agent run \"explain this repo in 3 bullets\"\n  \
+        agent run --openai --model gpt-4o-mini \"write a haiku\"\n  \
+        agent run --skill review --arg PR=123\n\n\
+        env:\n  \
+        ANTHROPIC_API_KEY            required for the default Anthropic provider\n  \
+        OPENAI_API_KEY               required with --openai\n  \
+        OPENAI_BASE_URL              override OpenAI base URL (LM Studio, Ollama, OpenRouter)\n  \
+        MODEL                        model id (lower priority than --model)\n  \
+        AGENTS_ROOT                  dir holding .agents/skills/<name>.md (default: cwd)\n  \
+        SESSIONS_DIR                 same as --sessions\n  \
+        RUNLOG_DIR                   same as --runlog";
+    eprintln!("{m}");
+}
+
+/// Detailed help for `agent serve`. Printed on `agent serve --help` / `-h`.
+fn print_serve_help() {
+    let m = "agent serve \u{2014} long-running HTTP/1.1 + SSE server.\n\n\
+        Each POST /agents/chat/<id> opens a Session per id (in-memory) and\n\
+        streams model events back as SSE frames.\n\n\
+        usage:\n  \
+        agent serve [opts]\n\n\
+        flags:\n  \
+        --addr HOST:PORT             bind address (default 0.0.0.0:3583)\n  \
+        --openai                     use OpenAI-compatible provider (default: Anthropic)\n  \
+        --model NAME                 model id\n  \
+        --sessions DIR               persist message history to DIR\n  \
+        --mcp 'CMD ARGS'             spawn MCP server, register its tools (repeatable)\n  \
+        --runlog DIR                 tee every StreamEvent to <DIR>/<request_id>.jsonl\n\n\
+        examples:\n  \
+        agent serve\n  \
+        agent serve --addr 127.0.0.1:8080\n  \
+        agent serve --openai --model gpt-4o-mini --runlog ./logs\n\n\
+        env:\n  \
+        ANTHROPIC_API_KEY            required for the default Anthropic provider\n  \
+        OPENAI_API_KEY               required with --openai\n  \
+        OPENAI_BASE_URL              override OpenAI base URL\n  \
+        MODEL                        model id (lower priority than --model)\n  \
+        SESSIONS_DIR                 same as --sessions\n  \
+        RUNLOG_DIR                   same as --runlog";
+    eprintln!("{m}");
+}
+
+/// Detailed help for `agent mcp-serve`. Printed on `--help` / `-h`.
+fn print_mcp_serve_help() {
+    let m = "agent mcp-serve \u{2014} speak MCP JSON-RPC over stdio.\n\n\
+        Exposes this agent's tool registry (bash + read/write/edit + audit,\n\
+        plus any --mcp child tools) to a parent agent over stdin/stdout.\n\n\
+        usage:\n  \
+        agent mcp-serve [opts]\n\n\
+        flags:\n  \
+        --mcp 'CMD ARGS'             chain another MCP server's tools (repeatable)\n\n\
+        examples:\n  \
+        agent mcp-serve\n  \
+        agent mcp-serve --mcp 'other-mcp-server --flag'\n\n\
+        env:\n  \
+        (none required \u{2014} no model is invoked; this is a tool server only)";
+    eprintln!("{m}");
+}
+
+/// Print a friendly error when the provider's API key env var is missing.
+/// `openai` selects which provider's hint to surface: Anthropic by default,
+/// OpenAI when the user already passed `--openai`.
+fn print_missing_key_error(openai: bool) {
+    if openai {
+        eprintln!(
+            "error: OPENAI_API_KEY is not set.\n\n\
+            Set it from your OpenAI account, then:\n    \
+            export OPENAI_API_KEY=sk-...\n\n\
+            Or point at a local OpenAI-compatible server (LM Studio, Ollama):\n    \
+            export OPENAI_BASE_URL=http://localhost:1234/v1\n    \
+            export OPENAI_API_KEY=dummy   # most local servers ignore the key\n\n\
+            Or use Anthropic instead:\n    \
+            agent run \"<prompt>\"\n    \
+            # with ANTHROPIC_API_KEY set\n\n\
+            See QUICKSTART.md for more."
+        );
+    } else {
+        eprintln!(
+            "error: ANTHROPIC_API_KEY is not set.\n\n\
+            Set it from https://console.anthropic.com/settings/keys, then:\n    \
+            export ANTHROPIC_API_KEY=sk-ant-...\n\n\
+            Or use an OpenAI-compatible provider:\n    \
+            agent run --openai --model gpt-4o-mini \"<prompt>\"\n    \
+            # with OPENAI_API_KEY set, or OPENAI_BASE_URL pointing at LM Studio/Ollama\n\n\
+            See QUICKSTART.md for more."
+        );
+    }
 }
 
 #[derive(Default)]
@@ -198,10 +319,15 @@ fn open_store(dir: Option<&PathBuf>) -> Result<Option<Arc<dyn SessionStore>>, St
     Ok(Some(Arc::new(store)))
 }
 
-fn build_model(opts: &CommonOpts) -> Result<Arc<dyn Model>, String> {
+/// Error returned by `build_model` when the provider's API key env var is
+/// absent. Callers print the dedicated hint via `print_missing_key_error`
+/// instead of treating it as a plain string error so the user gets a
+/// formatted, actionable message rather than a single-line gripe.
+struct MissingApiKey;
+
+fn build_model(opts: &CommonOpts) -> Result<Arc<dyn Model>, MissingApiKey> {
     if opts.openai {
-        let key = std::env::var("OPENAI_API_KEY")
-            .map_err(|_| "OPENAI_API_KEY required".to_string())?;
+        let key = std::env::var("OPENAI_API_KEY").map_err(|_| MissingApiKey)?;
         let name = opts
             .model
             .clone()
@@ -213,8 +339,7 @@ fn build_model(opts: &CommonOpts) -> Result<Arc<dyn Model>, String> {
         }
         Ok(Arc::new(m))
     } else {
-        let key = std::env::var("ANTHROPIC_API_KEY")
-            .map_err(|_| "ANTHROPIC_API_KEY required".to_string())?;
+        let key = std::env::var("ANTHROPIC_API_KEY").map_err(|_| MissingApiKey)?;
         let name = opts
             .model
             .clone()
@@ -304,6 +429,10 @@ fn open_runlog(dir: Option<&PathBuf>, run_id: &str) -> Option<Arc<runlog::RunLog
 }
 
 fn run_cmd(mut args: Vec<String>) -> ExitCode {
+    if wants_help(&args) {
+        print_run_help();
+        return ExitCode::SUCCESS;
+    }
     let common = parse_common(&mut args);
 
     let mut skill_name: Option<String> = None;
@@ -350,8 +479,8 @@ fn run_cmd(mut args: Vec<String>) -> ExitCode {
 
     let model = match build_model(&common) {
         Ok(m) => m,
-        Err(e) => {
-            eprintln!("{e}");
+        Err(MissingApiKey) => {
+            print_missing_key_error(common.openai);
             return ExitCode::from(2);
         }
     };
@@ -600,6 +729,10 @@ fn render_skill(name: &str, args: &HashMap<String, String>) -> Result<String, St
 }
 
 fn serve_cmd(mut args: Vec<String>) -> ExitCode {
+    if wants_help(&args) {
+        print_serve_help();
+        return ExitCode::SUCCESS;
+    }
     let common = parse_common(&mut args);
     let mut addr: String = "0.0.0.0:3583".into();
     let mut i = 0;
@@ -621,8 +754,8 @@ fn serve_cmd(mut args: Vec<String>) -> ExitCode {
 
     let model = match build_model(&common) {
         Ok(m) => m,
-        Err(e) => {
-            eprintln!("{e}");
+        Err(MissingApiKey) => {
+            print_missing_key_error(common.openai);
             return ExitCode::from(2);
         }
     };
@@ -851,6 +984,10 @@ fn unix_ms_now() -> u128 {
 /// call our tool registry (bash + read/write/edit + audit). Useful for
 /// chaining agents: parent agent A connects to child agent B's mcp server.
 fn mcp_serve_cmd(mut args: Vec<String>) -> ExitCode {
+    if wants_help(&args) {
+        print_mcp_serve_help();
+        return ExitCode::SUCCESS;
+    }
     let common = parse_common(&mut args);
     if !args.is_empty() {
         eprintln!("unexpected args: {args:?}");
