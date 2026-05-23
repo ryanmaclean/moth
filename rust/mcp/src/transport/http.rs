@@ -278,6 +278,11 @@ fn post(
         )?;
         setopt_long(easy, c::CURLOPT_NOPROGRESS, 1, "NOPROGRESS")?;
         setopt_long(easy, c::CURLOPT_FOLLOWLOCATION, 1, "FOLLOWLOCATION")?;
+        // Hard timeouts: MCP HTTP is request/response (not streaming), so a
+        // half-open / silent-after-handshake socket would otherwise pin the
+        // calling thread forever. 10s connect, 30s total.
+        setopt_long(easy, c::CURLOPT_CONNECTTIMEOUT, 10, "CONNECTTIMEOUT")?;
+        setopt_long(easy, c::CURLOPT_TIMEOUT, 30, "TIMEOUT")?;
 
         let rc = c::curl_easy_perform(easy);
         let mut status: i64 = 0;
@@ -867,6 +872,58 @@ mod tests {
     }
 
     // ---- direct transport unit tests (no McpClient) ----
+
+    /// A silent peer: TcpListener that `accept`s once and never sends a
+    /// reply. Models a half-open / LB-dropped socket. Without
+    /// CURLOPT_TIMEOUT the `post` call would block until the OS finally
+    /// gives up (often hours). With the 30s hard cap, `send_line` returns
+    /// Err well inside that bound.
+    #[test]
+    fn silent_peer_trips_hard_timeout() {
+        use std::sync::atomic::AtomicBool;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_c = Arc::clone(&stop);
+        let parked = thread::spawn(move || {
+            listener.set_nonblocking(true).ok();
+            let mut held: Option<TcpStream> = None;
+            while !stop_c.load(std::sync::atomic::Ordering::Relaxed) {
+                if held.is_none()
+                    && let Ok((s, _)) = listener.accept()
+                {
+                    held = Some(s);
+                }
+                thread::sleep(std::time::Duration::from_millis(50));
+            }
+            drop(held);
+        });
+
+        let url = format!("http://{addr}/mcp");
+        let transport = HttpTransport::new(&url);
+
+        let started = std::time::Instant::now();
+        let err = transport.send_line(b"{}").unwrap_err();
+        let elapsed = started.elapsed();
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = parked.join();
+
+        // CURLOPT_TIMEOUT=30s; allow 35s upper bound for scheduler jitter.
+        // Load-bearing: the call returns at all, instead of blocking until
+        // the OS gives up.
+        assert!(
+            elapsed < std::time::Duration::from_secs(35),
+            "send_line must abort within ~30s; took {elapsed:?}"
+        );
+        // curl_easy_perform yields CURLE_OPERATION_TIMEDOUT (28); the post()
+        // helper packages it as "curl perform: ... (code 28)".
+        assert!(
+            err.contains("code 28"),
+            "expected CURLE_OPERATION_TIMEDOUT, got {err}"
+        );
+    }
 
     #[test]
     fn parse_sse_data_frames_handles_crlf() {

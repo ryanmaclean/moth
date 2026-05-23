@@ -312,6 +312,14 @@ unsafe fn run_easy(
             "XFERINFODATA",
         )?;
         setopt_long(easy, c::CURLOPT_FOLLOWLOCATION, 1, "FOLLOWLOCATION")?;
+        // Connection-level timeouts so a half-open or LB-dropped TCP socket
+        // can't wedge the worker thread indefinitely. No hard CURLOPT_TIMEOUT
+        // — streams can legitimately run for many minutes — but require at
+        // least 1 byte/s averaged over a 60s window once data should be
+        // flowing, and cap the initial connect at 10s.
+        setopt_long(easy, c::CURLOPT_CONNECTTIMEOUT, 10, "CONNECTTIMEOUT")?;
+        setopt_long(easy, c::CURLOPT_LOW_SPEED_LIMIT, 1, "LOW_SPEED_LIMIT")?;
+        setopt_long(easy, c::CURLOPT_LOW_SPEED_TIME, 60, "LOW_SPEED_TIME")?;
 
         let perform_rc = c::curl_easy_perform(easy);
         let mut status: i64 = 0;
@@ -555,6 +563,81 @@ mod tests {
             classify(ok(c::CURLE_WRITE_ERROR, 200), true)
         });
         assert_eq!(attempts, 1, "Ok outcome must short-circuit");
+    }
+
+    /// A silent peer: a TcpListener that `accept`s a single connection and
+    /// then holds it open without reading or writing. Models the LB-dropped
+    /// / NAT-timeout / half-open case where TCP handshakes succeed but no
+    /// bytes ever flow. Without CURLOPT_LOW_SPEED_LIMIT/TIME the worker
+    /// thread would block here for hours; with them, curl aborts after
+    /// LOW_SPEED_TIME=60s with CURLE_OPERATION_TIMEDOUT.
+    #[test]
+    fn silent_peer_trips_low_speed_timeout() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let stop_c = std::sync::Arc::clone(&stop);
+        let parked = std::thread::spawn(move || {
+            // Bound the accept wait so the thread can exit promptly.
+            listener.set_nonblocking(true).ok();
+            let mut held: Option<std::net::TcpStream> = None;
+            while !stop_c.load(Ordering::Relaxed) {
+                if held.is_none()
+                    && let Ok((s, _)) = listener.accept()
+                {
+                    held = Some(s);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            drop(held);
+        });
+
+        let url = CString::new(format!("http://{addr}/v1/messages")).unwrap();
+        let key_header = CString::new("x-api-key: test").unwrap();
+        let version_header = CString::new("anthropic-version: 2023-06-01").unwrap();
+        let content_type = CString::new("content-type: application/json").unwrap();
+        let accept = CString::new("accept: text/event-stream").unwrap();
+        let body = b"{}".to_vec();
+
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<Chunk>(1);
+        let ctx = Ctx {
+            tx,
+            aborted: AtomicBool::new(false),
+            delivered: AtomicBool::new(false),
+        };
+
+        let started = std::time::Instant::now();
+        let result = unsafe {
+            run_easy(
+                &url,
+                &key_header,
+                &version_header,
+                &content_type,
+                &accept,
+                &body,
+                &ctx,
+            )
+        };
+        let elapsed = started.elapsed();
+
+        stop.store(true, Ordering::Relaxed);
+        let _ = parked.join();
+
+        // With LOW_SPEED_TIME=60s the abort fires around the 60s mark; give
+        // a generous 75s upper bound so this isn't flaky under load. The
+        // load-bearing assertion is that perform completes in *finite*
+        // time at all — without these setopt calls it never would.
+        assert!(
+            elapsed < std::time::Duration::from_secs(75),
+            "perform must abort within ~60s; took {elapsed:?}"
+        );
+        let outcome = result.expect("run_easy itself shouldn't error");
+        assert_eq!(
+            outcome.rc,
+            c::CURLE_OPERATION_TIMEDOUT,
+            "expected CURLE_OPERATION_TIMEDOUT (28), got code {}",
+            outcome.rc
+        );
     }
 
     #[test]

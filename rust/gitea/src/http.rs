@@ -95,6 +95,11 @@ pub(crate) fn request(
         )?;
         setopt_long(easy, c::CURLOPT_NOPROGRESS, 1, "NOPROGRESS")?;
         setopt_long(easy, c::CURLOPT_FOLLOWLOCATION, 1, "FOLLOWLOCATION")?;
+        // Hard timeouts: forge ops are short request/response calls, so a
+        // half-open / silent-after-handshake socket would otherwise pin the
+        // calling thread forever. 10s connect, 30s total.
+        setopt_long(easy, c::CURLOPT_CONNECTTIMEOUT, 10, "CONNECTTIMEOUT")?;
+        setopt_long(easy, c::CURLOPT_TIMEOUT, 30, "TIMEOUT")?;
 
         let rc = c::curl_easy_perform(easy);
         let mut code: i64 = 0;
@@ -194,4 +199,58 @@ unsafe fn curl_global_init_once() {
         // yet in this process (by contract — every request goes through here).
         unsafe { c::curl_global_init(c::CURL_GLOBAL_DEFAULT); }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
+
+    /// A silent peer: TcpListener that `accept`s once and never sends a
+    /// reply. Models a half-open / LB-dropped socket. Without CURLOPT_TIMEOUT
+    /// the call would block until the OS finally gives up; with the 30s hard
+    /// cap, `request` returns an Err well inside that bound.
+    #[test]
+    fn silent_peer_trips_hard_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_c = Arc::clone(&stop);
+        let parked = thread::spawn(move || {
+            listener.set_nonblocking(true).ok();
+            let mut held: Option<TcpStream> = None;
+            while !stop_c.load(Ordering::Relaxed) {
+                if held.is_none()
+                    && let Ok((s, _)) = listener.accept()
+                {
+                    held = Some(s);
+                }
+                thread::sleep(std::time::Duration::from_millis(50));
+            }
+            drop(held);
+        });
+
+        let url = format!("http://{addr}/api/v1/repos/x/y");
+        let started = std::time::Instant::now();
+        let err = request(&url, "GET", &["authorization: token t".into()], &[])
+            .err()
+            .expect("silent peer must produce an error");
+        let elapsed = started.elapsed();
+
+        stop.store(true, Ordering::Relaxed);
+        let _ = parked.join();
+
+        // CURLOPT_TIMEOUT=30s; allow 35s upper bound for scheduler jitter.
+        assert!(
+            elapsed < std::time::Duration::from_secs(35),
+            "request must abort within ~30s; took {elapsed:?}"
+        );
+        // curl_easy_perform yields CURLE_OPERATION_TIMEDOUT (28); curl_err
+        // formats it as "curl perform: ... (code 28)".
+        let msg = err.to_string();
+        assert!(msg.contains("code 28"), "expected timeout (code 28), got {msg}");
+    }
 }
