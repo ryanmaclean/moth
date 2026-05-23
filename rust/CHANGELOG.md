@@ -8,6 +8,13 @@ semver pre-1.0 (every release is `0.x.y`; minor bumps may break API).
 ### Added
 - `agent --version` / `-V` prints `agent <cargo-pkg-version>`.
 - `rust/docs/adr/` directory with the first architecture decision records.
+- ADR-0002 captures the subtraction-first scope policy.
+
+### Removed (round 7 — staff-eng cut pass)
+- `cluster` crate: distributed actor refs with no callers.
+- `gitea`, `github`: forge clients with no callers; forge ops belong behind MCP.
+- `jj`: second branch-strategy backend alongside `git/`.
+- `mcp_server`: merged into `mcp::server`; the two halves share framing.
 
 ### Production hardening (round 2)
 - `actor::spawn_bounded(actor, capacity)` + `SyncActorRef::try_send`.
