@@ -199,7 +199,14 @@ impl Iterator for EventStream {
                 continue;
             }
             match self.stream.rx.recv() {
-                Ok(Chunk::Data(b)) => self.framer.push(&b),
+                Ok(Chunk::Data(b)) => {
+                    if let Err(e) = self.framer.push(&b) {
+                        self.done = true;
+                        self.terminal = Some(Error::InvalidResponse(format!(
+                            "frame exceeds 4 MiB cap: {e}"
+                        )));
+                    }
+                }
                 Ok(Chunk::End(Ok(_))) => {
                     self.done = true;
                 }
@@ -241,7 +248,14 @@ impl EventStream {
                 continue;
             }
             match self.stream.rx.try_recv() {
-                Ok(Chunk::Data(b)) => self.framer.push(&b),
+                Ok(Chunk::Data(b)) => {
+                    if let Err(e) = self.framer.push(&b) {
+                        self.done = true;
+                        self.terminal = Some(Error::InvalidResponse(format!(
+                            "frame exceeds 4 MiB cap: {e}"
+                        )));
+                    }
+                }
                 Ok(Chunk::End(Ok(_))) => {
                     self.done = true;
                 }

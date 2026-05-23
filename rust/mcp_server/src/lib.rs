@@ -20,17 +20,23 @@ use wire::NdjsonSplitter;
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
-/// Server-side errors. Only IO failures surface here; protocol failures
-/// are encoded as JSON-RPC error responses to the peer.
+/// Server-side errors. IO failures and oversized inbound frames surface
+/// here; protocol failures are encoded as JSON-RPC error responses to the
+/// peer.
 #[derive(Debug)]
 pub enum ServerError {
     Io(std::io::Error),
+    /// Inbound stream tried to buffer more than `wire::DEFAULT_MAX` bytes
+    /// without emitting a newline. We refuse to grow the splitter past
+    /// the cap and tear down the loop instead.
+    OversizedFrame(wire::FramerError),
 }
 
 impl std::fmt::Display for ServerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ServerError::Io(e) => write!(f, "io: {e}"),
+            ServerError::OversizedFrame(e) => write!(f, "oversized frame: {e}"),
         }
     }
 }
@@ -40,6 +46,12 @@ impl std::error::Error for ServerError {}
 impl From<std::io::Error> for ServerError {
     fn from(e: std::io::Error) -> Self {
         ServerError::Io(e)
+    }
+}
+
+impl From<wire::FramerError> for ServerError {
+    fn from(e: wire::FramerError) -> Self {
+        ServerError::OversizedFrame(e)
     }
 }
 
@@ -112,7 +124,7 @@ impl Server {
                 Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(ServerError::Io(e)),
             };
-            splitter.push(&chunk[..n]);
+            splitter.push(&chunk[..n])?;
         }
     }
 

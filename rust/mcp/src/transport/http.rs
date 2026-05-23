@@ -102,6 +102,7 @@ impl Transport for HttpTransport {
 
         let frames = if resp.content_type_sse {
             parse_sse_data_frames(&resp.body)
+                .map_err(|e| format!("SSE response exceeds 4 MiB frame cap: {e}"))?
         } else {
             // Single JSON frame.
             vec![resp.body]
@@ -141,17 +142,17 @@ fn http_class(status: u16) -> &'static str {
 /// joined with `\n`; that's what the MCP server emits when a single
 /// response straddles lines. Non-`data:` lines (`event:`, `id:`, `:`
 /// comments) are ignored — v1 doesn't need them.
-fn parse_sse_data_frames(body: &[u8]) -> Vec<Vec<u8>> {
+fn parse_sse_data_frames(body: &[u8]) -> Result<Vec<Vec<u8>>, wire::FramerError> {
     // SseFramer scans for the literal pair `\n\n`. Some servers (and our
     // test fixtures) emit CRLF line endings, in which case the separator
     // is `\r\n\r\n`. Normalise by dropping CRs before framing — the SSE
     // spec treats them as line-ending noise anyway.
     let normalised: Vec<u8> = body.iter().copied().filter(|b| *b != b'\r').collect();
     let mut framer = SseFramer::new();
-    framer.push(&normalised);
+    framer.push(&normalised)?;
     // Some servers don't terminate the final event with a second \n.
     // Pad so `pop_frame` can drain the tail.
-    framer.push(b"\n\n");
+    framer.push(b"\n\n")?;
 
     let mut out = Vec::new();
     while let Some(frame) = framer.pop_frame() {
@@ -172,7 +173,7 @@ fn parse_sse_data_frames(body: &[u8]) -> Vec<Vec<u8>> {
             out.push(joined);
         }
     }
-    out
+    Ok(out)
 }
 
 // ---- curl plumbing ---------------------------------------------------------
@@ -870,14 +871,21 @@ mod tests {
     #[test]
     fn parse_sse_data_frames_handles_crlf() {
         let body = b"data: hello\r\n\r\ndata: world\r\n\r\n";
-        let frames = parse_sse_data_frames(body);
+        let frames = parse_sse_data_frames(body).unwrap();
         assert_eq!(frames, vec![b"hello".to_vec(), b"world".to_vec()]);
     }
 
     #[test]
     fn parse_sse_data_frames_ignores_comments_and_event_lines() {
         let body = b": keep-alive\nevent: progress\ndata: {\"x\":1}\n\n";
-        let frames = parse_sse_data_frames(body);
+        let frames = parse_sse_data_frames(body).unwrap();
         assert_eq!(frames, vec![br#"{"x":1}"#.to_vec()]);
+    }
+
+    #[test]
+    fn parse_sse_data_frames_rejects_oversize_body() {
+        // 5 MiB body with no boundaries — exceeds the 4 MiB default cap.
+        let body = vec![b'x'; 5 * 1024 * 1024];
+        assert!(parse_sse_data_frames(&body).is_err());
     }
 }

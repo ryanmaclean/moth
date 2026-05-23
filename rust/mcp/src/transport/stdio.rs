@@ -95,7 +95,10 @@ impl Transport for StdioTransport {
                 state.reader.consume(n);
                 owned
             };
-            state.splitter.push(&chunk);
+            state
+                .splitter
+                .push(&chunk)
+                .map_err(|e| format!("stdout line exceeds 4 MiB cap: {e}"))?;
         }
     }
 }

@@ -7,16 +7,30 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::ShellError;
 use crate::lex::{Word, WordPart};
 use crate::parse::{Item, Pipeline, Redirect, SeqOp, Sequence, SimpleCommand};
+
+/// Per-stream captured-output cap. Matches Anthropic API tool-result limits.
+pub const OUTPUT_CAP_BYTES: usize = 8 * 1024 * 1024;
+/// Default wall-clock timeout for an external child.
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
+/// Time between SIGTERM and SIGKILL when killing a child.
+const KILL_GRACE: Duration = Duration::from_secs(5);
+/// Polling interval for waitpid + deadline + cancel checks.
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 pub struct VShell {
     cwd: PathBuf,
     env: HashMap<String, String>,
     exported: std::collections::HashSet<String>,
     last_exit: i32,
+    timeout: Duration,
+    cancel: Option<Arc<AtomicBool>>,
 }
 
 pub struct ExecResult {
@@ -38,7 +52,23 @@ impl VShell {
             env: HashMap::new(),
             exported: Default::default(),
             last_exit: 0,
+            timeout: DEFAULT_TIMEOUT,
+            cancel: None,
         }
+    }
+
+    /// Set the wall-clock timeout for external children. Builtins are not
+    /// subject to this (they run in-process and complete promptly).
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// Install a cancel token. Setting the flag terminates any in-flight
+    /// external child (SIGTERM, then SIGKILL after a grace period).
+    pub fn with_cancel(mut self, cancel: Arc<AtomicBool>) -> Self {
+        self.cancel = Some(cancel);
+        self
     }
 
     pub fn cwd(&self) -> &Path {
@@ -257,35 +287,88 @@ impl VShell {
             }
         };
 
-        // Push stdin if needed.
-        if let Some(ref bytes) = io.stdin
+        // Push stdin from a background thread so a builtin's upstream output
+        // larger than the pipe buffer can't deadlock the wait loop.
+        let stdin_join = if let Some(bytes) = io.stdin.clone()
             && !bytes.is_empty()
             && let Some(mut sin) = child.stdin.take()
         {
-            let _ = sin.write_all(bytes);
-            drop(sin);
-        }
+            Some(std::thread::spawn(move || {
+                let _ = sin.write_all(&bytes);
+                drop(sin);
+            }))
+        } else {
+            None
+        };
 
-        // Pump streams. If stdout is piped, read it into io.stdout. If stderr
-        // is piped and merging is requested, also read into io.stdout, else
-        // into io.stderr.
+        // Spawn reader threads with per-stream caps. On overflow they tag the
+        // shared `overflow` cell (CAS, first stream wins); the wait loop will
+        // kill the child promptly.
         let merging = want_stderr_to_stdout && !stdout_to_file;
+        let overflow = Arc::new(AtomicUsize::new(OVERFLOW_NONE));
         let stdout_pipe = child.stdout.take();
         let stderr_pipe = child.stderr.take();
-        let (out_buf, err_buf) = read_streams(stdout_pipe, stderr_pipe);
-        if !out_buf.is_empty() {
-            io.stdout.extend_from_slice(&out_buf);
+        let out_join =
+            spawn_reader(stdout_pipe, OUTPUT_CAP_BYTES, overflow.clone(), OVERFLOW_STDOUT);
+        let err_join =
+            spawn_reader(stderr_pipe, OUTPUT_CAP_BYTES, overflow.clone(), OVERFLOW_STDERR);
+
+        let deadline = Instant::now().checked_add(self.timeout);
+        let outcome =
+            wait_with_supervision(&mut child, deadline, self.cancel.as_ref(), &overflow);
+
+        if let Some(j) = stdin_join {
+            let _ = j.join();
         }
-        if !err_buf.is_empty() {
-            if merging {
-                io.stdout.extend_from_slice(&err_buf);
-            } else {
-                io.stderr.extend_from_slice(&err_buf);
+        let out_buf = out_join.map(|t| t.join().unwrap_or_default()).unwrap_or_default();
+        let err_buf = err_join.map(|t| t.join().unwrap_or_default()).unwrap_or_default();
+
+        match outcome {
+            ChildOutcome::Exited(code) => {
+                if !out_buf.is_empty() {
+                    io.stdout.extend_from_slice(&out_buf);
+                }
+                if !err_buf.is_empty() {
+                    if merging {
+                        io.stdout.extend_from_slice(&err_buf);
+                    } else {
+                        io.stderr.extend_from_slice(&err_buf);
+                    }
+                }
+                Ok(Flow::Done(code))
+            }
+            ChildOutcome::TimedOut => {
+                let _ = writeln!(
+                    io.stderr,
+                    "vshell: {}: killed after {}s timeout",
+                    name,
+                    self.timeout.as_secs()
+                );
+                Ok(Flow::Done(124))
+            }
+            ChildOutcome::Cancelled => {
+                let _ = writeln!(io.stderr, "vshell: {}: cancelled", name);
+                Ok(Flow::Done(130))
+            }
+            ChildOutcome::StdoutOverflow => {
+                let _ = writeln!(
+                    io.stderr,
+                    "vshell: {}: stdout exceeded {} MiB cap",
+                    name,
+                    OUTPUT_CAP_BYTES / (1024 * 1024)
+                );
+                Ok(Flow::Done(1))
+            }
+            ChildOutcome::StderrOverflow => {
+                let _ = writeln!(
+                    io.stderr,
+                    "vshell: {}: stderr exceeded {} MiB cap",
+                    name,
+                    OUTPUT_CAP_BYTES / (1024 * 1024)
+                );
+                Ok(Flow::Done(1))
             }
         }
-
-        let status = child.wait().map_err(ShellError::Io)?;
-        Ok(Flow::Done(status.code().unwrap_or(128)))
     }
 
     fn run_builtin(
@@ -695,26 +778,151 @@ fn builtin_unset(sh: &mut VShell, argv: &[String]) -> Result<i32, String> {
     Ok(0)
 }
 
-fn read_streams(
-    mut out: Option<std::process::ChildStdout>,
-    mut err: Option<std::process::ChildStderr>,
-) -> (Vec<u8>, Vec<u8>) {
-    // Read both streams concurrently to avoid deadlocking on large outputs.
-    let out_thread = out.take().map(|mut s| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = s.read_to_end(&mut buf);
-            buf
-        })
-    });
-    let err_thread = err.take().map(|mut s| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = s.read_to_end(&mut buf);
-            buf
-        })
-    });
-    let o = out_thread.map(|t| t.join().unwrap_or_default()).unwrap_or_default();
-    let e = err_thread.map(|t| t.join().unwrap_or_default()).unwrap_or_default();
-    (o, e)
+// Overflow sentinel values stored in the shared AtomicUsize. The reader
+// threads compare-and-swap from `OVERFLOW_NONE`, so the first stream to
+// overflow wins and `wait_with_supervision` reports that one.
+const OVERFLOW_NONE: usize = 0;
+const OVERFLOW_STDOUT: usize = 1;
+const OVERFLOW_STDERR: usize = 2;
+
+enum ChildOutcome {
+    Exited(i32),
+    TimedOut,
+    Cancelled,
+    StdoutOverflow,
+    StderrOverflow,
+}
+
+/// Spawn a reader thread that captures up to `cap` bytes. If the child writes
+/// more than `cap`, the thread records its tag in `overflow` (CAS, so the
+/// first overflow wins) and keeps draining the pipe so the kernel never
+/// blocks the child on a full pipe — the supervisor's SIGTERM is what
+/// actually stops it. Returns `None` if `stream` was `None`.
+fn spawn_reader<R>(
+    stream: Option<R>,
+    cap: usize,
+    overflow: Arc<AtomicUsize>,
+    tag: usize,
+) -> Option<std::thread::JoinHandle<Vec<u8>>>
+where
+    R: Read + Send + 'static,
+{
+    let mut s = stream?;
+    Some(std::thread::spawn(move || {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 8192];
+        let mut overflowed = false;
+        loop {
+            match s.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if overflowed {
+                        // Discard; keep draining so the child doesn't block.
+                        continue;
+                    }
+                    let remaining = cap.saturating_sub(buf.len());
+                    if n <= remaining {
+                        buf.extend_from_slice(&chunk[..n]);
+                    } else {
+                        buf.extend_from_slice(&chunk[..remaining]);
+                        overflowed = true;
+                        let _ = overflow.compare_exchange(
+                            OVERFLOW_NONE,
+                            tag,
+                            Ordering::SeqCst,
+                            Ordering::SeqCst,
+                        );
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        buf
+    }))
+}
+
+/// Poll for child exit while watching the deadline, cancel token, and output
+/// overflow flag. On any trigger, send SIGTERM, then SIGKILL after
+/// `KILL_GRACE` if the child hasn't exited.
+///
+/// Uses `Child::try_wait` (a thin wrapper around `waitpid(WNOHANG)`) rather
+/// than calling `libc::waitpid` directly so std's internal `Child` bookkeeping
+/// stays consistent — otherwise `Child::drop` could try to reap a pid that
+/// we already reaped.
+fn wait_with_supervision(
+    child: &mut Child,
+    deadline: Option<Instant>,
+    cancel: Option<&Arc<AtomicBool>>,
+    overflow: &Arc<AtomicUsize>,
+) -> ChildOutcome {
+    let pid = child.id() as libc::pid_t;
+    let mut killed_for: Option<KillReason> = None;
+    let mut sigkill_after: Option<Instant> = None;
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let code = status.code().unwrap_or_else(|| {
+                    use std::os::unix::process::ExitStatusExt;
+                    status.signal().map(|s| 128 + s).unwrap_or(128)
+                });
+                return outcome_for(killed_for, code);
+            }
+            Ok(None) => { /* still running */ }
+            Err(_) => return outcome_for(killed_for, 128),
+        }
+
+        if killed_for.is_none() {
+            let reason = if deadline.is_some_and(|d| Instant::now() >= d) {
+                Some(KillReason::Timeout)
+            } else if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
+                Some(KillReason::Cancel)
+            } else {
+                match overflow.load(Ordering::SeqCst) {
+                    OVERFLOW_STDOUT => Some(KillReason::StdoutOverflow),
+                    OVERFLOW_STDERR => Some(KillReason::StderrOverflow),
+                    _ => None,
+                }
+            };
+            if let Some(r) = reason {
+                send_signal(pid, libc::SIGTERM);
+                sigkill_after = Instant::now().checked_add(KILL_GRACE);
+                killed_for = Some(r);
+            }
+        } else if let Some(t) = sigkill_after
+            && Instant::now() >= t
+        {
+            send_signal(pid, libc::SIGKILL);
+            sigkill_after = None;
+        }
+
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum KillReason {
+    Timeout,
+    Cancel,
+    StdoutOverflow,
+    StderrOverflow,
+}
+
+fn outcome_for(killed_for: Option<KillReason>, code: i32) -> ChildOutcome {
+    match killed_for {
+        Some(KillReason::Timeout) => ChildOutcome::TimedOut,
+        Some(KillReason::Cancel) => ChildOutcome::Cancelled,
+        Some(KillReason::StdoutOverflow) => ChildOutcome::StdoutOverflow,
+        Some(KillReason::StderrOverflow) => ChildOutcome::StderrOverflow,
+        None => ChildOutcome::Exited(code),
+    }
+}
+
+fn send_signal(pid: libc::pid_t, sig: libc::c_int) {
+    // SAFETY: standard libc call; failure modes (ESRCH if the child already
+    // exited and was reaped) are benign here.
+    unsafe {
+        libc::kill(pid, sig);
+    }
 }

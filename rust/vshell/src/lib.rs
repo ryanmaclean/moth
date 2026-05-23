@@ -499,4 +499,85 @@ mod tests {
         let r = sh.execute("echo \"a\\\"b\"");
         assert_eq!(s(&r.stdout), "a\"b\n");
     }
+
+    // --- supervision (timeout / cancel / output cap) ---
+
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn command_killed_after_timeout() {
+        let mut sh = VShell::new().with_timeout(Duration::from_secs(1));
+        let start = Instant::now();
+        let r = sh.execute("sleep 60");
+        let elapsed = start.elapsed();
+        // Should kill via SIGTERM within ~1s; SIGKILL grace is 5s but `sleep`
+        // exits on SIGTERM immediately.
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "expected fast timeout, took {elapsed:?}"
+        );
+        assert_eq!(r.exit_code, 124, "stderr: {}", s(&r.stderr));
+        assert!(
+            s(&r.stderr).contains("timeout"),
+            "stderr did not mention timeout: {}",
+            s(&r.stderr)
+        );
+    }
+
+    #[test]
+    fn stdout_overflow_kills_child_and_errors() {
+        // `yes` writes "y\n" forever; 8 MiB cap is hit very quickly.
+        let mut sh = VShell::new().with_timeout(Duration::from_secs(30));
+        let start = Instant::now();
+        let r = sh.execute("yes");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "overflow kill should be prompt, took {elapsed:?}"
+        );
+        assert_ne!(r.exit_code, 0);
+        let err = s(&r.stderr);
+        assert!(
+            err.contains("cap") || err.contains("exceeded"),
+            "stderr did not mention cap: {err}"
+        );
+        // Captured stdout should be bounded at the cap (allow small slack for
+        // the final chunk that triggered overflow).
+        assert!(
+            r.stdout.len() <= 8 * 1024 * 1024 + 8192,
+            "stdout exceeded cap+chunk: {}",
+            r.stdout.len()
+        );
+    }
+
+    #[test]
+    fn cancel_token_set_terminates_in_flight_child() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut sh = VShell::new()
+            .with_timeout(Duration::from_secs(60))
+            .with_cancel(cancel.clone());
+
+        // Flip the flag after 100ms from another thread.
+        let flipper = {
+            let cancel = cancel.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+        };
+
+        let start = Instant::now();
+        let r = sh.execute("sleep 60");
+        let elapsed = start.elapsed();
+        let _ = flipper.join();
+
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "cancel should kill promptly, took {elapsed:?}"
+        );
+        assert_eq!(r.exit_code, 130, "stderr: {}", s(&r.stderr));
+        assert!(s(&r.stderr).contains("cancelled"));
+    }
 }

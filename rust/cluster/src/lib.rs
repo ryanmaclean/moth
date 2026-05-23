@@ -18,20 +18,50 @@
 //! forward the typed message to the local `ActorRef<M>`. Unknown actor ids
 //! and codec errors log to stderr and skip the frame; they do not tear down
 //! the connection.
+//!
+//! # Authentication
+//!
+//! `NodeConfig::auth_token` holds an optional 32-byte shared secret. When
+//! set, every accepted connection must open with a fixed-length handshake
+//! (`b"AUTH"` magic + 32-byte token) before any frame is read; mismatches
+//! are silently dropped (we close without responding so a probing attacker
+//! cannot distinguish "wrong token" from "wrong protocol"). The compare is
+//! constant-time.
+//!
+//! **WARNING**: a `Node` without an `auth_token` accepts traffic from any
+//! TCP peer that can reach the listener. Binding to anything other than
+//! `127.0.0.1` (or another trusted loopback) without configuring
+//! `auth_token` is a remote-code-execution-shaped foot-gun: an attacker
+//! who reaches the socket can deliver arbitrary `Codec::decode` payloads
+//! into any registered actor. Always pair public bind addresses with
+//! `auth_token`.
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::marker::PhantomData;
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use actor::ActorRef;
 
 /// Maximum frame payload size. Anything larger is rejected on both sender
 /// and receiver to bound memory and protect against runaway peers.
 pub const MAX_PAYLOAD: usize = 4 * 1024 * 1024;
+
+/// Handshake magic bytes. Sent before the 32-byte token by clients that
+/// have a configured `auth_token`.
+const AUTH_MAGIC: [u8; 4] = *b"AUTH";
+
+/// Length of the auth token in bytes.
+pub const AUTH_TOKEN_LEN: usize = 32;
+
+/// Default per-connection idle timeout. Peers that send nothing within this
+/// window have their reader dropped to prevent slowloris-style resource
+/// exhaustion.
+pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub trait Codec: Sized + Send + 'static {
     fn encode(&self) -> Vec<u8>;
@@ -57,6 +87,8 @@ pub enum ClusterError {
     NotConnected,
     /// Frame payload exceeded `MAX_PAYLOAD`.
     Oversize(usize),
+    /// Peer rejected the handshake or closed the connection mid-handshake.
+    AuthFailed,
 }
 
 impl std::fmt::Display for ClusterError {
@@ -67,6 +99,7 @@ impl std::fmt::Display for ClusterError {
             ClusterError::UnknownActor(id) => write!(f, "unknown actor id: {id}"),
             ClusterError::NotConnected => write!(f, "not connected"),
             ClusterError::Oversize(n) => write!(f, "oversize payload: {n} bytes"),
+            ClusterError::AuthFailed => write!(f, "auth handshake failed"),
         }
     }
 }
@@ -85,6 +118,46 @@ impl From<CodecError> for ClusterError {
     }
 }
 
+/// Constant-time byte-slice equality. We avoid `==` on `[u8; N]` because
+/// the standard comparator short-circuits on the first mismatching byte,
+/// which leaks token bytes through a timing side channel.
+#[inline]
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+// ---------------------------------------------------------------------------
+// NodeConfig
+// ---------------------------------------------------------------------------
+
+/// Tunables for a `Node`.
+#[derive(Clone)]
+pub struct NodeConfig {
+    /// Shared secret expected from inbound peers. `None` disables the
+    /// handshake — fine for `127.0.0.1`-only listeners, dangerous on any
+    /// reachable address (see module docs).
+    pub auth_token: Option<[u8; AUTH_TOKEN_LEN]>,
+    /// Per-connection idle timeout. A peer that sends nothing within this
+    /// window has its reader thread closed; the listener stays up.
+    pub idle_timeout: Duration,
+}
+
+impl Default for NodeConfig {
+    fn default() -> Self {
+        Self {
+            auth_token: None,
+            idle_timeout: DEFAULT_IDLE_TIMEOUT,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Node
 // ---------------------------------------------------------------------------
@@ -97,7 +170,13 @@ type Registry = Arc<Mutex<HashMap<String, Dispatcher>>>;
 struct Inner {
     running: AtomicBool,
     addr: SocketAddr,
-    readers: Mutex<Vec<JoinHandle<()>>>,
+    /// Number of live reader threads. Each thread bumps on entry and
+    /// decrements on exit, so `shutdown` can spin-wait for the count to
+    /// drain instead of holding `JoinHandle`s that never get joined on the
+    /// long-lived-node path.
+    reader_count: AtomicUsize,
+    auth_token: Option<[u8; AUTH_TOKEN_LEN]>,
+    idle_timeout: Duration,
 }
 
 pub struct Node {
@@ -107,19 +186,22 @@ pub struct Node {
 }
 
 impl Node {
-    /// Start listening on `addr`. Pass `"127.0.0.1:0"` for an ephemeral port.
-    /// Spawns the accept loop on a background thread and returns once the
-    /// socket is bound.
+    /// Start listening on `addr` with default config (no auth, 60s idle
+    /// timeout). Pass `"127.0.0.1:0"` for an ephemeral port.
     pub fn start(addr: &str) -> Result<Self, ClusterError> {
+        Self::start_with_config(addr, NodeConfig::default())
+    }
+
+    /// Start listening on `addr` with explicit config.
+    pub fn start_with_config(addr: &str, config: NodeConfig) -> Result<Self, ClusterError> {
         let listener = TcpListener::bind(addr)?;
-        // Non-blocking accept with a short timeout via set_nonblocking would
-        // force a poll loop; instead we use a blocking accept and unblock it
-        // on shutdown by dialing ourselves once the running flag is cleared.
         let local_addr = listener.local_addr()?;
         let inner = Arc::new(Inner {
             running: AtomicBool::new(true),
             addr: local_addr,
-            readers: Mutex::new(Vec::new()),
+            reader_count: AtomicUsize::new(0),
+            auth_token: config.auth_token,
+            idle_timeout: config.idle_timeout,
         });
         let registry: Registry = Arc::new(Mutex::new(HashMap::new()));
 
@@ -136,16 +218,11 @@ impl Node {
         })
     }
 
-    /// Register a local actor under `id`. Subsequent inbound frames addressed
-    /// to this id are decoded as `M` and forwarded to the actor's mailbox.
-    /// Re-registering the same id replaces the previous dispatcher.
+    /// Register a local actor under `id`.
     pub fn register<M: Codec>(&self, id: &str, addr: ActorRef<M>) {
         let dispatcher: Dispatcher = Box::new(move |bytes: &[u8]| {
             match M::decode(bytes) {
                 Ok(msg) => {
-                    // Mailbox closed (actor dropped) — skip. Don't crash
-                    // the reader thread; other actors on this node may
-                    // still be live.
                     let _ = addr.send(msg);
                 }
                 Err(e) => {
@@ -163,24 +240,30 @@ impl Node {
         self.inner.addr
     }
 
-    /// Stop the listener and join its thread (and any reader threads
-    /// spawned for inbound connections).
+    /// Number of currently live reader threads. Exposed for tests and ops
+    /// dashboards — useful for confirming idle peers are reaped.
+    pub fn reader_count(&self) -> usize {
+        self.inner.reader_count.load(Ordering::SeqCst)
+    }
+
+    /// Stop the listener and wait for all reader threads to drain.
     pub fn shutdown(mut self) {
         self.inner.running.store(false, Ordering::SeqCst);
         // Wake the blocking accept by dialing ourselves once.
-        let _ = TcpStream::connect_timeout(
-            &self.inner.addr,
-            std::time::Duration::from_millis(200),
-        );
+        let _ = TcpStream::connect_timeout(&self.inner.addr, Duration::from_millis(200));
         if let Some(h) = self.listener_thread.take() {
             let _ = h.join();
         }
-        // Reader threads will exit when their peer disconnects. Join any we
-        // know about, with the listener already stopped no new ones will
-        // appear.
-        let readers = std::mem::take(&mut *self.inner.readers.lock().expect("readers poisoned"));
-        for h in readers {
-            let _ = h.join();
+        // Wait for reader threads to drain. They observe EOF/timeout and
+        // exit on their own; cap the wait at one idle window plus a small
+        // slack so a wedged reader doesn't block shutdown forever.
+        let deadline = Instant::now()
+            + self
+                .inner
+                .idle_timeout
+                .saturating_add(Duration::from_secs(2));
+        while self.inner.reader_count.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
         }
     }
 }
@@ -188,7 +271,6 @@ impl Node {
 fn accept_loop(listener: TcpListener, inner: Arc<Inner>, registry: Registry) {
     for incoming in listener.incoming() {
         if !inner.running.load(Ordering::SeqCst) {
-            // Drop any stream we just accepted as part of the wake-up dial.
             if let Ok(s) = incoming {
                 let _ = s.shutdown(Shutdown::Both);
             }
@@ -198,20 +280,47 @@ fn accept_loop(listener: TcpListener, inner: Arc<Inner>, registry: Registry) {
             Ok(stream) => {
                 let registry = Arc::clone(&registry);
                 let inner_r = Arc::clone(&inner);
-                let h = thread::spawn(move || {
-                    if let Err(e) = read_loop(stream, &registry) {
-                        // EOF / connection drop is expected — only log real
-                        // protocol failures, and never tear down the node.
-                        if !is_expected_disconnect(&e) {
+                inner.reader_count.fetch_add(1, Ordering::SeqCst);
+                let spawned = thread::Builder::new()
+                    .name("cluster-reader".into())
+                    .spawn(move || {
+                        // Decrement on any exit path.
+                        struct Guard<'a>(&'a AtomicUsize);
+                        impl Drop for Guard<'_> {
+                            fn drop(&mut self) {
+                                self.0.fetch_sub(1, Ordering::SeqCst);
+                            }
+                        }
+                        let _g = Guard(&inner_r.reader_count);
+
+                        // Bound how long we'll wait for the handshake. Use
+                        // the same per-connection idle timeout: a peer that
+                        // dials and then sits silent for that long gets
+                        // dropped here rather than parking a reader thread.
+                        let _ = stream.set_read_timeout(Some(inner_r.idle_timeout));
+
+                        if let Some(expected) = inner_r.auth_token.as_ref()
+                            && !server_handshake(&stream, expected)
+                        {
+                            // Don't respond — silently close. We log so
+                            // ops can see brute-force attempts.
+                            eprintln!(
+                                "cluster: rejecting connection from {:?} (bad auth)",
+                                stream.peer_addr().ok()
+                            );
+                            let _ = stream.shutdown(Shutdown::Both);
+                            return;
+                        }
+
+                        if let Err(e) = read_loop(stream, &registry, inner_r.idle_timeout)
+                            && !is_expected_disconnect(&e)
+                        {
                             eprintln!("cluster: reader error: {e}");
                         }
-                    }
-                    // Best-effort: trim our entry from the readers list so
-                    // it doesn't grow unbounded over many connections.
-                    let _ = inner_r;
-                });
-                if let Ok(mut rs) = inner.readers.lock() {
-                    rs.push(h);
+                    });
+                if spawned.is_err() {
+                    // Thread spawn failed — undo the count we eagerly added.
+                    inner.reader_count.fetch_sub(1, Ordering::SeqCst);
                 }
             }
             Err(e) => {
@@ -224,6 +333,22 @@ fn accept_loop(listener: TcpListener, inner: Arc<Inner>, registry: Registry) {
     }
 }
 
+/// Read the fixed-length handshake from a freshly accepted connection.
+/// Returns `true` iff the magic and token match. Reads exactly
+/// `4 + AUTH_TOKEN_LEN` bytes (or fails) so a partial/malformed handshake
+/// can't shift the framer.
+fn server_handshake(mut stream: &TcpStream, expected: &[u8; AUTH_TOKEN_LEN]) -> bool {
+    let mut buf = [0u8; 4 + AUTH_TOKEN_LEN];
+    if stream.read_exact(&mut buf).is_err() {
+        return false;
+    }
+    let magic_ok = ct_eq(&buf[..4], &AUTH_MAGIC);
+    let token_ok = ct_eq(&buf[4..], expected);
+    // Compute both halves to keep timing uniform regardless of which side
+    // mismatched.
+    magic_ok && token_ok
+}
+
 fn is_expected_disconnect(e: &io::Error) -> bool {
     matches!(
         e.kind(),
@@ -231,18 +356,28 @@ fn is_expected_disconnect(e: &io::Error) -> bool {
             | io::ErrorKind::ConnectionReset
             | io::ErrorKind::ConnectionAborted
             | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::WouldBlock
+            | io::ErrorKind::TimedOut
     )
 }
 
-/// Pull frames off the connection until EOF or an unrecoverable error.
-fn read_loop(mut stream: TcpStream, registry: &Registry) -> io::Result<()> {
+/// Pull frames off the connection until EOF, idle timeout, or
+/// unrecoverable error. `idle_timeout` sets a per-read deadline; a peer
+/// that goes silent for that long is dropped.
+fn read_loop(mut stream: TcpStream, registry: &Registry, idle_timeout: Duration) -> io::Result<()> {
+    stream.set_read_timeout(Some(idle_timeout))?;
     loop {
         let mut len_buf = [0u8; 4];
         if let Err(e) = stream.read_exact(&mut len_buf) {
-            if e.kind() == io::ErrorKind::UnexpectedEof {
-                return Ok(());
+            match e.kind() {
+                io::ErrorKind::UnexpectedEof => return Ok(()),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => {
+                    // Idle peer — drop. Treating timeout-as-EOF here keeps
+                    // the slowloris bound at `idle_timeout` per connection.
+                    return Ok(());
+                }
+                _ => return Err(e),
             }
-            return Err(e);
         }
         let len = u32::from_be_bytes(len_buf) as usize;
         if len > MAX_PAYLOAD {
@@ -250,7 +385,12 @@ fn read_loop(mut stream: TcpStream, registry: &Registry) -> io::Result<()> {
             return Ok(());
         }
         let mut payload = vec![0u8; len];
-        stream.read_exact(&mut payload)?;
+        if let Err(e) = stream.read_exact(&mut payload) {
+            match e.kind() {
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => return Ok(()),
+                _ => return Err(e),
+            }
+        }
         dispatch_frame(&payload, registry);
     }
 }
@@ -286,23 +426,40 @@ pub struct RemoteActorRef<M: Codec> {
     node_addr: String,
     actor_id: String,
     conn: Mutex<Option<TcpStream>>,
+    auth_token: Option<[u8; AUTH_TOKEN_LEN]>,
     _phantom: PhantomData<fn(M)>,
 }
 
 impl<M: Codec> RemoteActorRef<M> {
+    /// Create a remote ref with no auth token. Use against a `Node` whose
+    /// `auth_token` is `None`.
     pub fn new(node_addr: &str, actor_id: impl Into<String>) -> Self {
         Self {
             node_addr: node_addr.to_string(),
             actor_id: actor_id.into(),
             conn: Mutex::new(None),
+            auth_token: None,
             _phantom: PhantomData,
         }
     }
 
-    /// Connect (or reuse the cached connection), serialise `msg`, send. On a
-    /// write failure the cached connection is dropped; the next call dials a
-    /// fresh one. Returns once the bytes are flushed to the kernel — there is
-    /// no ack.
+    /// Create a remote ref that presents `token` to the server during the
+    /// handshake. Required when the target `Node` has `auth_token: Some(_)`.
+    pub fn with_auth(
+        node_addr: &str,
+        actor_id: impl Into<String>,
+        token: [u8; AUTH_TOKEN_LEN],
+    ) -> Self {
+        Self {
+            node_addr: node_addr.to_string(),
+            actor_id: actor_id.into(),
+            conn: Mutex::new(None),
+            auth_token: Some(token),
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Connect (or reuse the cached connection), serialise `msg`, send.
     pub fn send(&self, msg: M) -> Result<(), ClusterError> {
         let encoded = msg.encode();
         let payload_len = self.actor_id.len() + 1 + encoded.len();
@@ -318,17 +475,31 @@ impl<M: Codec> RemoteActorRef<M> {
 
         let mut guard = self.conn.lock().expect("conn poisoned");
         if guard.is_none() {
-            *guard = Some(dial(&self.node_addr)?);
+            let stream = dial(&self.node_addr)?;
+            // Send the handshake before any frame, so the server can drop
+            // unauthenticated peers without ever seeing a payload.
+            if let Some(token) = self.auth_token.as_ref()
+                && let Err(e) = client_handshake(&stream, token)
+            {
+                return Err(ClusterError::Io(e));
+            }
+            *guard = Some(stream);
         }
-        // SAFETY: we just populated it.
         let stream = guard.as_mut().expect("conn populated");
         if let Err(e) = stream.write_all(&frame).and_then(|()| stream.flush()) {
-            // Drop the dead connection; let the next send re-dial.
             *guard = None;
             return Err(ClusterError::Io(e));
         }
         Ok(())
     }
+}
+
+fn client_handshake(mut stream: &TcpStream, token: &[u8; AUTH_TOKEN_LEN]) -> io::Result<()> {
+    let mut buf = [0u8; 4 + AUTH_TOKEN_LEN];
+    buf[..4].copy_from_slice(&AUTH_MAGIC);
+    buf[4..].copy_from_slice(token);
+    stream.write_all(&buf)?;
+    stream.flush()
 }
 
 fn dial(addr: &str) -> io::Result<TcpStream> {
@@ -338,10 +509,8 @@ fn dial(addr: &str) -> io::Result<TcpStream> {
         Err(e) => return Err(e),
     };
     for sa in resolved {
-        match TcpStream::connect_timeout(&sa, std::time::Duration::from_secs(5)) {
+        match TcpStream::connect_timeout(&sa, Duration::from_secs(5)) {
             Ok(s) => {
-                // Disable Nagle so small fire-and-forget messages don't sit
-                // in a 40ms coalesce window.
                 let _ = s.set_nodelay(true);
                 return Ok(s);
             }
@@ -366,9 +535,6 @@ mod tests {
 
     // ---- TestMsg ----------------------------------------------------------
 
-    /// A minimal JSON-shaped message. We hand-roll the encoder because the
-    /// shape is fixed; we reuse `anthropic::json` for decoding so we don't
-    /// re-implement a parser.
     #[derive(Debug, Clone, PartialEq)]
     struct TestMsg {
         kind: String,
@@ -403,10 +569,6 @@ mod tests {
         }
     }
 
-    // ---- Collector actor --------------------------------------------------
-
-    /// The actor's `Msg` is `TestMsg` (which is `Codec`); a shared `Vec`
-    /// collects what arrives so the test can inspect.
     struct Collector {
         observed: Arc<Mutex<Vec<TestMsg>>>,
     }
@@ -494,9 +656,6 @@ mod tests {
 
     // ---- 3: connection reuse ---------------------------------------------
 
-    /// On the server side, each accepted TCP connection spawns one reader
-    /// thread. We can verify a single TCP connection is reused across many
-    /// sends by counting how many readers the node ever spawned.
     #[test]
     fn connection_is_reused() {
         let node = Node::start("127.0.0.1:0").unwrap();
@@ -514,10 +673,8 @@ mod tests {
             observed.lock().unwrap().len() == 25
         }));
 
-        // Exactly one TCP connection (one reader thread) should have been
-        // opened over those 25 sends.
-        let reader_count = node.inner.readers.lock().unwrap().len();
-        assert_eq!(reader_count, 1, "expected single reused connection");
+        // Exactly one TCP connection (one reader thread) should be alive.
+        assert_eq!(node.reader_count(), 1, "expected single reused connection");
 
         drop(remote);
         drop(s);
@@ -538,10 +695,7 @@ mod tests {
         let known: RemoteActorRef<TestMsg> =
             RemoteActorRef::new(&node.local_addr().to_string(), "known");
 
-        // Sending to an unknown id succeeds (server logs and drops the frame).
         nope.send(TestMsg { kind: "ignored".into(), n: 0 }).unwrap();
-        // The connection should still be alive — subsequent traffic on the
-        // (separate) `known` ref must deliver.
         known.send(TestMsg { kind: "ok".into(), n: 9 }).unwrap();
 
         assert!(wait_until(Duration::from_secs(2), || {
@@ -594,9 +748,6 @@ mod tests {
 
     // ---- 6: codec decode error doesn't crash the connection --------------
 
-    /// A message type whose decoder always fails. We feed it a frame, then
-    /// follow with a `TestMsg` frame on the same connection — the second
-    /// frame must still be delivered.
     #[test]
     fn codec_error_logs_and_continues() {
         struct AlwaysFails;
@@ -614,7 +765,6 @@ mod tests {
         let s = spawn(Collector { observed: observed.clone() });
         node.register::<TestMsg>("good", s.addr.clone());
 
-        // Register the broken codec under another id.
         struct Sink;
         impl Actor for Sink {
             type Msg = AlwaysFails;
@@ -625,8 +775,6 @@ mod tests {
         let s_bad = spawn(Sink);
         node.register::<AlwaysFails>("bad", s_bad.addr.clone());
 
-        // Sending to "bad" must succeed at the wire level; server logs the
-        // codec error and moves on.
         let to_bad: RemoteActorRef<AlwaysFails> =
             RemoteActorRef::new(&node.local_addr().to_string(), "bad");
         to_bad.send(AlwaysFails).unwrap();
@@ -700,7 +848,14 @@ mod tests {
 
     #[test]
     fn shutdown_with_open_connection() {
-        let node = Node::start("127.0.0.1:0").unwrap();
+        let node = Node::start_with_config(
+            "127.0.0.1:0",
+            NodeConfig {
+                auth_token: None,
+                idle_timeout: Duration::from_secs(2),
+            },
+        )
+        .unwrap();
         let observed = Arc::new(Mutex::new(Vec::new()));
         let s = spawn(Collector { observed: observed.clone() });
         node.register::<TestMsg>("x", s.addr.clone());
@@ -712,12 +867,11 @@ mod tests {
             !observed.lock().unwrap().is_empty()
         }));
 
-        // Drop the remote so the reader sees EOF, then shut down.
         drop(remote);
         drop(s);
         let t = Instant::now();
         node.shutdown();
-        assert!(t.elapsed() < Duration::from_secs(2));
+        assert!(t.elapsed() < Duration::from_secs(4));
     }
 
     // ---- 10: write failure drops cached connection, next send recovers ----
@@ -736,18 +890,13 @@ mod tests {
             !observed.lock().unwrap().is_empty()
         }));
 
-        // Forcibly tear down the cached connection from inside.
         {
             let mut g = remote.conn.lock().unwrap();
             if let Some(stream) = g.as_mut() {
                 let _ = stream.shutdown(Shutdown::Both);
             }
         }
-        // The next send may fail (write to a half-closed socket) or succeed
-        // (kernel-buffered write); either way a subsequent send must succeed
-        // by re-dialing.
         let _ = remote.send(TestMsg { kind: "shed".into(), n: 2 });
-        // Loop a couple of times in case the first attempt won the race.
         let mut ok = false;
         for _ in 0..3 {
             if remote.send(TestMsg { kind: "retry".into(), n: 3 }).is_ok() {
@@ -808,16 +957,12 @@ mod tests {
         let s = spawn(Collector { observed: observed.clone() });
         node.register::<TestMsg>("z", s.addr.clone());
 
-        // Dial manually and write a bogus frame: 4-byte length + payload
-        // with no NUL terminator. Then write a real frame on the same
-        // connection and confirm it delivers.
         let mut sock = TcpStream::connect(node.local_addr()).unwrap();
         let bogus = b"not-null-terminated-anywhere";
         let len = (bogus.len() as u32).to_be_bytes();
         sock.write_all(&len).unwrap();
         sock.write_all(bogus).unwrap();
 
-        // Then a well-formed frame.
         let real = TestMsg { kind: "ok".into(), n: 42 };
         let encoded = real.encode();
         let id = "z";
@@ -837,4 +982,151 @@ mod tests {
         node.shutdown();
     }
 
+    // ---- 13: connection without token rejected when auth required --------
+
+    #[test]
+    fn connection_without_token_rejected_when_auth_required() {
+        let token = [0x42u8; AUTH_TOKEN_LEN];
+        let node = Node::start_with_config(
+            "127.0.0.1:0",
+            NodeConfig {
+                auth_token: Some(token),
+                idle_timeout: Duration::from_secs(5),
+            },
+        )
+        .unwrap();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let s = spawn(Collector { observed: observed.clone() });
+        node.register::<TestMsg>("vault", s.addr.clone());
+
+        // No token at all — server reads the first 36 bytes of the data
+        // frame as a (wrong) handshake and closes. The kernel may accept
+        // a few bytes before the FIN propagates, so loop until a send fails.
+        let anon: RemoteActorRef<TestMsg> =
+            RemoteActorRef::new(&node.local_addr().to_string(), "vault");
+        let mut saw_err = false;
+        for _ in 0..40 {
+            if anon
+                .send(TestMsg { kind: "knock".into(), n: 1 })
+                .is_err()
+            {
+                saw_err = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(saw_err, "unauthenticated send must eventually fail");
+
+        // Wrong token — same outcome.
+        let wrong: RemoteActorRef<TestMsg> = RemoteActorRef::with_auth(
+            &node.local_addr().to_string(),
+            "vault",
+            [0xAAu8; AUTH_TOKEN_LEN],
+        );
+        let mut saw_err2 = false;
+        for _ in 0..40 {
+            if wrong
+                .send(TestMsg { kind: "knock".into(), n: 2 })
+                .is_err()
+            {
+                saw_err2 = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(saw_err2, "wrong-token send must eventually fail");
+
+        // No frames delivered.
+        thread::sleep(Duration::from_millis(200));
+        assert!(observed.lock().unwrap().is_empty());
+
+        drop(anon);
+        drop(wrong);
+        drop(s);
+        node.shutdown();
+    }
+
+    // ---- 14: connection with correct token succeeds ----------------------
+
+    #[test]
+    fn connection_with_correct_token_succeeds() {
+        let token = [0x77u8; AUTH_TOKEN_LEN];
+        let node = Node::start_with_config(
+            "127.0.0.1:0",
+            NodeConfig {
+                auth_token: Some(token),
+                idle_timeout: Duration::from_secs(5),
+            },
+        )
+        .unwrap();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let s = spawn(Collector { observed: observed.clone() });
+        node.register::<TestMsg>("door", s.addr.clone());
+
+        let remote: RemoteActorRef<TestMsg> = RemoteActorRef::with_auth(
+            &node.local_addr().to_string(),
+            "door",
+            token,
+        );
+        remote
+            .send(TestMsg { kind: "open".into(), n: 12 })
+            .unwrap();
+
+        assert!(wait_until(Duration::from_secs(2), || {
+            !observed.lock().unwrap().is_empty()
+        }));
+        assert_eq!(observed.lock().unwrap()[0].n, 12);
+
+        drop(remote);
+        drop(s);
+        node.shutdown();
+    }
+
+    // ---- 15: idle peer disconnected within timeout -----------------------
+
+    #[test]
+    fn idle_peer_disconnected_within_timeout() {
+        let node = Node::start_with_config(
+            "127.0.0.1:0",
+            NodeConfig {
+                auth_token: None,
+                idle_timeout: Duration::from_secs(2),
+            },
+        )
+        .unwrap();
+
+        let sock = TcpStream::connect(node.local_addr()).unwrap();
+        // Reader thread should be live almost immediately.
+        assert!(wait_until(Duration::from_secs(1), || {
+            node.reader_count() == 1
+        }));
+
+        // Within `idle_timeout + slack` the reader should drop the silent peer.
+        let dropped = wait_until(Duration::from_secs(5), || node.reader_count() == 0);
+        assert!(dropped, "idle reader should be reaped");
+
+        drop(sock);
+        node.shutdown();
+    }
+
+    // ---- 16: reader count returns to zero after peer disconnects ---------
+
+    #[test]
+    fn reader_count_returns_to_zero_after_peer_disconnects() {
+        let node = Node::start("127.0.0.1:0").unwrap();
+
+        for _ in 0..10 {
+            let sock = TcpStream::connect(node.local_addr()).unwrap();
+            assert!(wait_until(Duration::from_secs(1), || {
+                node.reader_count() >= 1
+            }));
+            drop(sock);
+            assert!(wait_until(Duration::from_secs(1), || {
+                node.reader_count() == 0
+            }));
+        }
+
+        assert_eq!(node.reader_count(), 0);
+        node.shutdown();
+    }
 }
