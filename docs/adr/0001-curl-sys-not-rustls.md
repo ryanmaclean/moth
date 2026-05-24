@@ -13,7 +13,7 @@ The Rust agent harness needs HTTPS streaming clients for Anthropic + OpenAI
 
 The project's stated threat model is **supply-chain isolation** (motivated
 by the shai-hulud worm hitting npm). We `cargo vendor` the entire
-dependency tree and commit `rust/vendor/` so builds are reproducible
+dependency tree and commit `vendor/` so builds are reproducible
 offline.
 
 ## Decision

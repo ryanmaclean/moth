@@ -20,7 +20,7 @@ build toolchain in a multi-stage image and exposes a 48 MB runtime.
 ```bash
 git clone <this-repo>
 cd <this-repo>
-cargo install --locked --offline --frozen --path rust/cli --root ~/.local
+cargo install --locked --offline --frozen --path cli --root ~/.local
 # binary lands in ~/.local/bin/agent
 ```
 
@@ -128,7 +128,7 @@ Wire it into Claude Desktop by editing
 ```json
 {
   "mcpServers": {
-    "sandcastle": {
+    "agent": {
       "command": "agent",
       "args": ["mcp-serve"]
     }

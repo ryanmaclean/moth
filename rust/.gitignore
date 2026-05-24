@@ -1,4 +1,0 @@
-target/
-!vendor/**/target/
-!vendor/**/target/**
-!vendor/**/target.rs

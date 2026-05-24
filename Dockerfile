@@ -20,7 +20,7 @@ RUN cargo build --release --locked --offline --frozen -p cli \
 
 FROM gcr.io/distroless/cc-debian12 AS runtime
 
-LABEL org.opencontainers.image.source="https://github.com/mattpocock/sandcastle"
+LABEL org.opencontainers.image.source="https://github.com/ryanmaclean/agent-harness"
 LABEL org.opencontainers.image.description="Minimal Rust agent harness; vendored deps, libcurl + OpenSSL via curl-sys."
 LABEL org.opencontainers.image.licenses="MIT"
 

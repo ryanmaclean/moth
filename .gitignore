@@ -1,6 +1,6 @@
-node_modules
-dist
-.env.*
-.vercel
+target/
+!vendor/**/target/
+!vendor/**/target/**
+!vendor/**/target.rs
 .claude/settings.local.json
 .claude/worktrees/
