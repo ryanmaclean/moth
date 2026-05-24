@@ -22,58 +22,79 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04
+            kind: linux
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-22.04
+            kind: linux
           - target: x86_64-apple-darwin
             os: macos-14
+            kind: darwin
           - target: aarch64-apple-darwin
             os: macos-14
+            kind: darwin
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Linux build deps
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential pkg-config perl make
-
-      - name: Install aarch64 cross linker + sysroot
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        # See .github/workflows/rust.yml cross-check-aarch64 — the
-        # -cross sysroot packages provide glibc + kernel headers the
-        # vendored C builds (zlib, openssl, libcurl) need.
-        run: |
-          sudo apt-get install -y --no-install-recommends \
-            gcc-aarch64-linux-gnu \
-            libc6-dev-arm64-cross \
-            linux-libc-dev-arm64-cross
-
-      - uses: dtolnay/rust-toolchain@stable
+      # --------------- Linux legs: docker builder image ----------------
+      # The builder stage bakes in build-essential, pkg-config, perl,
+      # make, gcc-aarch64-linux-gnu, libc6-dev-arm64-cross,
+      # linux-libc-dev-arm64-cross, the aarch64 rust target, and
+      # CARGO_TARGET_AARCH64_*/CC_*/AR_* env. No per-step apt-get.
+      - name: Set up buildx (linux)
+        if: matrix.kind == 'linux'
+        uses: docker/setup-buildx-action@v3
+      - name: Build builder image (linux)
+        if: matrix.kind == 'linux'
+        uses: docker/build-push-action@v6
         with:
-          targets: ${{ matrix.target }}
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
-
-      - name: Build
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          context: .
+          target: builder
+          tags: agent-builder
+          load: true
+          cache-from: type=gha,scope=builder
+          cache-to: type=gha,mode=max,scope=builder
+      - name: Build (linux)
+        if: matrix.kind == 'linux'
         run: |
-          cargo build --release --locked --frozen --offline \
+          .github/scripts/cargo-annotate.sh build-${{ matrix.target }} \
+            build --release --locked --frozen --offline \
             -p cli --target ${{ matrix.target }}
-
-      - name: Strip binary
+      - name: Strip binary (linux)
+        if: matrix.kind == 'linux'
         run: |
           BIN=target/${{ matrix.target }}/release/agent
           if [[ "${{ matrix.target }}" == aarch64-unknown-linux-gnu ]]; then
-            aarch64-linux-gnu-strip "$BIN"
+            docker run --rm -v "$PWD:/work" -w /work agent-builder \
+              aarch64-linux-gnu-strip "$BIN"
           else
-            strip "$BIN"
+            docker run --rm -v "$PWD:/work" -w /work agent-builder \
+              strip "$BIN"
           fi
 
+      # --------------- Darwin legs: native macos-14 runner -------------
+      # No docker on GitHub-hosted macOS runners. The toolchain pin in
+      # rust-toolchain.toml is picked up automatically by cargo.
+      - name: Install rust toolchain (darwin)
+        if: matrix.kind == 'darwin'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        if: matrix.kind == 'darwin'
+        with:
+          key: ${{ matrix.target }}
+      - name: Build (darwin)
+        if: matrix.kind == 'darwin'
+        run: |
+          cargo build --release --locked --frozen --offline \
+            -p cli --target ${{ matrix.target }}
+      - name: Strip binary (darwin)
+        if: matrix.kind == 'darwin'
+        run: |
+          strip target/${{ matrix.target }}/release/agent
+
+      # --------------- Common: stage + checksum + upload ---------------
       - name: Stage tarball
         run: |
           STAGE="agent-${{ github.ref_name }}-${{ matrix.target }}"
@@ -148,5 +169,8 @@ jobs:
           tags: |
             ${{ steps.img.outputs.name }}:${{ github.ref_name }}
             ${{ steps.img.outputs.name }}:latest
+          build-args: |
+            REPO_SOURCE=https://github.com/${{ github.repository }}
           provenance: true
           sbom: true
+          cache-from: type=gha,scope=builder

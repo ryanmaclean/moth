@@ -1,0 +1,62 @@
+name: cross-check
+
+# Once-per-release validation that the workspace still cross-compiles
+# to aarch64-unknown-linux-gnu against the vendored C deps. Moved out
+# of rust.yml because it doesn't need to run on every PR — the
+# `release` workflow exercises the same path on tag push and the
+# weekly run catches drift from upstream rust-lang / curl-sys / etc.
+#
+# Triggers: weekly Monday 06:00 UTC and on-demand via the Actions UI.
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cross-check-aarch64:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build builder image
+        # The builder stage already has gcc-aarch64-linux-gnu +
+        # libc6-dev-arm64-cross + linux-libc-dev-arm64-cross +
+        # `rustup target add aarch64-unknown-linux-gnu` baked in, plus
+        # CARGO_TARGET_AARCH64_*/CC_*/AR_* env. No apt-get here.
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: builder
+          tags: agent-builder
+          load: true
+          cache-from: type=gha,scope=builder
+          cache-to: type=gha,mode=max,scope=builder
+      - name: Diagnostics (fail-tolerant)
+        run: |
+          set +e
+          echo "::group::builder image rust toolchain"
+          docker run --rm agent-builder rustc -V
+          docker run --rm agent-builder cargo -V
+          docker run --rm agent-builder rustup show
+          echo "::endgroup::"
+          echo "::group::cross toolchain"
+          docker run --rm agent-builder bash -c \
+            'which aarch64-linux-gnu-gcc && aarch64-linux-gnu-gcc --version | head -1 && which aarch64-linux-gnu-ar'
+          echo "::endgroup::"
+      - name: cargo check (aarch64)
+        run: |
+          .github/scripts/cargo-annotate.sh aarch64 \
+            check -v --workspace --target aarch64-unknown-linux-gnu \
+            --locked --frozen --offline
+      - name: Upload cargo check log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aarch64-cargo-check-log
+          path: /tmp/cargo-aarch64.log
+          if-no-files-found: warn
+          retention-days: 30

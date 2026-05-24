@@ -1,5 +1,12 @@
 name: rust
 
+# Every cargo job runs inside the `builder` stage of the project
+# Dockerfile, so CI uses the *same* environment as a developer
+# `docker build .`. There is no apt-get and no dtolnay/rust-toolchain
+# here — the toolchain pin lives in rust-toolchain.toml, and the
+# native + cross C deps live in the Dockerfile. Local and CI builds
+# cannot diverge on apt-deps or rust channel.
+
 on:
   push:
     branches: [main]
@@ -9,123 +16,78 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  fmt:
+  builder-image:
+    # Build the builder image once and export it as a tar artifact so
+    # downstream jobs can `docker load` it instead of each rebuilding
+    # the same apt+rustup layers. Cuts ~2 minutes per dependent job.
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: docker/setup-buildx-action@v3
+      - name: Build builder image
+        uses: docker/build-push-action@v6
         with:
-          toolchain: "1.94.1"
-          components: rustfmt
-      - run: cargo fmt --all -- --check
+          context: .
+          target: builder
+          tags: agent-builder:ci
+          outputs: type=docker,dest=/tmp/agent-builder.tar
+          cache-from: type=gha,scope=builder
+          cache-to: type=gha,mode=max,scope=builder
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agent-builder-image
+          path: /tmp/agent-builder.tar
+          retention-days: 1
+
+  fmt:
+    needs: builder-image
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: agent-builder-image
+          path: /tmp
+      - name: Load builder image
+        run: docker load -i /tmp/agent-builder.tar && docker tag agent-builder:ci agent-builder
+      - name: cargo fmt --check
+        run: .github/scripts/cargo-annotate.sh fmt fmt --all -- --check
 
   clippy:
+    needs: builder-image
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
-      - run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential pkg-config perl make
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/download-artifact@v4
         with:
-          toolchain: "1.94.1"
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --workspace --all-targets --locked --frozen --offline -- -D warnings
+          name: agent-builder-image
+          path: /tmp
+      - name: Load builder image
+        run: docker load -i /tmp/agent-builder.tar && docker tag agent-builder:ci agent-builder
+      - name: cargo clippy
+        run: |
+          .github/scripts/cargo-annotate.sh clippy \
+            clippy --workspace --all-targets --locked --frozen --offline -- -D warnings
 
   test:
+    needs: builder-image
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
-      - run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential pkg-config perl make
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/download-artifact@v4
         with:
-          toolchain: "1.94.1"
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --locked --frozen --offline
-
-  cross-check-aarch64:
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install apt deps
-        # gcc-aarch64-linux-gnu ships the cross *compiler* but NOT the
-        # aarch64 sysroot. Without libc6-dev-arm64-cross (glibc headers)
-        # and linux-libc-dev-arm64-cross (kernel headers), C build
-        # scripts in libz-sys / openssl-sys / curl-sys fail with
-        # 'zlib.h: No such file or directory' the moment they try to
-        # build the vendored zlib/openssl/libcurl for the target.
+          name: agent-builder-image
+          path: /tmp
+      - name: Load builder image
+        run: docker load -i /tmp/agent-builder.tar && docker tag agent-builder:ci agent-builder
+      - name: cargo test
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential pkg-config perl make \
-            gcc-aarch64-linux-gnu \
-            libc6-dev-arm64-cross \
-            linux-libc-dev-arm64-cross
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: "1.94.1"
-          targets: aarch64-unknown-linux-gnu
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: aarch64-cross
-      - name: Diagnostics (fail-tolerant)
-        run: |
-          set +e
-          echo "::group::os"
-          cat /etc/os-release
-          echo "::endgroup::"
-          echo "::group::rust"
-          rustc -V
-          cargo -V
-          rustup show
-          echo "::endgroup::"
-          echo "::group::cross toolchain"
-          which aarch64-linux-gnu-gcc
-          aarch64-linux-gnu-gcc --version | head -1
-          which aarch64-linux-gnu-ar
-          echo "::endgroup::"
-          echo "::group::cargo config"
-          cat .cargo/config.toml || echo "(no .cargo/config.toml at $(pwd))"
-          echo "::endgroup::"
-      - name: cargo check (aarch64)
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
-          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
-        # Capture both streams, then surface the tail as ::error::
-        # annotations so the failure reason is visible on the PR
-        # checks page without needing log auth.
-        run: |
-          set +e
-          cargo check -v --workspace --target aarch64-unknown-linux-gnu \
-            --locked --frozen --offline 2>&1 | tee /tmp/check.log
-          RC=${PIPESTATUS[0]}
-          echo "::notice::cargo check exit=$RC ($(wc -l </tmp/check.log) log lines)"
-          if [ "$RC" -ne 0 ]; then
-            echo "::group::tail of cargo check log"
-            tail -120 /tmp/check.log
-            echo "::endgroup::"
-            echo "::error::cargo check failed (exit $RC); see tail above"
-            tail -20 /tmp/check.log | sed 's/%/%25/g; s/\r/%0D/g; s/\n/%0A/g' | while IFS= read -r line; do
-              [ -n "$line" ] && echo "::error::$line"
-            done
-          fi
-          exit "$RC"
-      - name: Upload cargo check log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: aarch64-cargo-check-log
-          path: /tmp/check.log
-          if-no-files-found: warn
-          retention-days: 7
+          .github/scripts/cargo-annotate.sh test \
+            test --workspace --locked --frozen --offline
 
   docker:
+    # Full-image smoke test. Independent of builder-image so a broken
+    # final stage surfaces even if the builder-only artifact succeeded.
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -135,3 +97,4 @@ jobs:
           context: .
           push: false
           tags: agent:ci
+          cache-from: type=gha,scope=builder
