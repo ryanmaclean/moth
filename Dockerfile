@@ -12,16 +12,22 @@
 
 FROM rust:1.94.1-slim-bookworm AS builder
 
-# Native build deps for the vendored C sources (zlib, openssl, libcurl
-# via curl-sys) plus the aarch64 cross compiler + sysroot.
-# gcc-aarch64-linux-gnu ships the cross *compiler* but NOT the
-# aarch64 sysroot. Without libc6-dev-arm64-cross (glibc headers) and
-# linux-libc-dev-arm64-cross (kernel headers), C build scripts in
-# libz-sys / openssl-sys / curl-sys fail with 'zlib.h: No such file
-# or directory' the moment they try to build vendored C for the target.
+# apt deps:
+#   build-essential pkg-config perl make — vendored C sources
+#       (zlib, openssl, libcurl via curl-sys) need these to build.
+#   git — the `git` crate (git/src/lib.rs) shells out to `git(1)` via
+#       Command::new("git") for branch/worktree/status. Without it,
+#       every test in git/src/lib.rs fails Io(NotFound) at `git init`.
+#       rust:slim-bookworm does not bundle git.
+#   gcc-aarch64-linux-gnu — aarch64 cross *compiler*.
+#   libc6-dev-arm64-cross linux-libc-dev-arm64-cross — aarch64
+#       *sysroot* (glibc + kernel headers). Without them, C build
+#       scripts in libz-sys / openssl-sys / curl-sys fail
+#       'zlib.h: No such file or directory' when cross-compiling.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         build-essential pkg-config perl make \
+        git \
         gcc-aarch64-linux-gnu \
         libc6-dev-arm64-cross \
         linux-libc-dev-arm64-cross \
