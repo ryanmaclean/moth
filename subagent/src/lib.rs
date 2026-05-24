@@ -38,9 +38,7 @@ use std::sync::mpsc::SyncSender;
 use std::thread::{self, JoinHandle};
 
 use actor::spawn;
-use harness::{
-    HarnessState, PromptResult, Session, SessionError, SessionMsg, StreamEvent,
-};
+use harness::{HarnessState, PromptResult, Session, SessionError, SessionMsg, StreamEvent};
 
 /// Handle to a spawned subagent. Call [`TaskHandle::join`] to block until the
 /// subagent finishes its single prompt and return its [`PromptResult`].
@@ -64,10 +62,7 @@ impl TaskHandle {
 
 /// Build a child `HarnessState` cloning every field from `parent` except
 /// `default_system`, which is overridden by `role_system` when `Some`.
-fn child_state(
-    parent: &Arc<HarnessState>,
-    role_system: Option<String>,
-) -> Arc<HarnessState> {
+fn child_state(parent: &Arc<HarnessState>, role_system: Option<String>) -> Arc<HarnessState> {
     let default_system = match role_system {
         Some(s) => Some(s),
         None => parent.default_system.clone(),
@@ -109,11 +104,7 @@ pub fn spawn_task(
         let session = spawn(Session::new("subagent", harness));
         let result = session
             .addr
-            .ask(|reply| SessionMsg::Prompt {
-                text: prompt,
-                structured_output_tag: None,
-                reply,
-            })
+            .ask(|reply| SessionMsg::Prompt { text: prompt, structured_output_tag: None, reply })
             .map_err(|_| SessionError::Mailbox)?;
         // Drop the Spawned so the actor thread exits cleanly. We don't
         // surface its join error — the prompt result is the contract.
@@ -159,8 +150,8 @@ mod tests {
 
     use actor::Spawned;
     use harness::{
-        ContentBlock, Instance, InstanceMsg, MockModel, MockSandbox, Model, ModelEvent,
-        Role, Sandbox, SandboxError, Session, ShellResult,
+        ContentBlock, Instance, InstanceMsg, MockModel, MockSandbox, Model, ModelEvent, Role,
+        Sandbox, SandboxError, Session, ShellResult,
     };
 
     /// Thin wrapper letting the test rig peek at recorded commands while the
@@ -278,38 +269,23 @@ mod tests {
 
         // Subagent's request (seen[1]) was a fresh history of just the prompt.
         assert_eq!(seen[1].messages.len(), 1);
-        assert_eq!(
-            seen[1].messages[0].content,
-            vec![ContentBlock::Text("child prompt".into())],
-        );
+        assert_eq!(seen[1].messages[0].content, vec![ContentBlock::Text("child prompt".into())],);
 
         // Parent#2's request must contain ONLY parent#1 transcript + "second".
         // Specifically: user("first"), assistant("parent reply"), user("second").
         let p2 = &seen[2];
         assert_eq!(p2.messages.len(), 3);
         assert_eq!(p2.messages[0].role, Role::User);
-        assert_eq!(
-            p2.messages[0].content,
-            vec![ContentBlock::Text("first".into())],
-        );
+        assert_eq!(p2.messages[0].content, vec![ContentBlock::Text("first".into())],);
         assert_eq!(p2.messages[1].role, Role::Assistant);
-        assert_eq!(
-            p2.messages[1].content,
-            vec![ContentBlock::Text("parent reply".into())],
-        );
+        assert_eq!(p2.messages[1].content, vec![ContentBlock::Text("parent reply".into())],);
         assert_eq!(p2.messages[2].role, Role::User);
-        assert_eq!(
-            p2.messages[2].content,
-            vec![ContentBlock::Text("second".into())],
-        );
+        assert_eq!(p2.messages[2].content, vec![ContentBlock::Text("second".into())],);
         // And — critically — no "child prompt" or "child reply" anywhere.
         for m in &p2.messages {
             for c in &m.content {
                 if let ContentBlock::Text(t) = c {
-                    assert!(
-                        !t.contains("child"),
-                        "parent history leaked subagent content: {t:?}",
-                    );
+                    assert!(!t.contains("child"), "parent history leaked subagent content: {t:?}",);
                 }
             }
         }
@@ -332,11 +308,7 @@ mod tests {
             vec![],
         );
 
-        let task = spawn_task(
-            state,
-            "task".into(),
-            Some("you are a triage bot".into()),
-        );
+        let task = spawn_task(state, "task".into(), Some("you are a triage bot".into()));
         task.join().unwrap();
 
         let seen = model.seen.lock().unwrap();
@@ -431,10 +403,7 @@ mod tests {
         // Sub asks for `bash`, gets a result, then finishes.
         let scripts = vec![
             vec![
-                ModelEvent::ToolUseStart {
-                    id: "toolu_1".into(),
-                    name: "bash".into(),
-                },
+                ModelEvent::ToolUseStart { id: "toolu_1".into(), name: "bash".into() },
                 ModelEvent::ToolUseInputDelta(r#"{"command":"echo sub"}"#.into()),
                 ModelEvent::BlockStop,
                 ModelEvent::Stop { reason: Some("tool_use".into()) },
@@ -444,11 +413,8 @@ mod tests {
                 ModelEvent::Stop { reason: Some("end_turn".into()) },
             ],
         ];
-        let responses = vec![ShellResult {
-            exit_code: 0,
-            stdout: b"sub\n".to_vec(),
-            stderr: Vec::new(),
-        }];
+        let responses =
+            vec![ShellResult { exit_code: 0, stdout: b"sub\n".to_vec(), stderr: Vec::new() }];
         let (instance, state, _model, sandbox) = parent_rig(scripts, responses);
 
         let task = spawn_task(state, "run echo sub".into(), None);
@@ -500,10 +466,7 @@ mod tests {
     fn spawn_task_streaming_emits_tool_events() {
         let scripts = vec![
             vec![
-                ModelEvent::ToolUseStart {
-                    id: "t1".into(),
-                    name: "bash".into(),
-                },
+                ModelEvent::ToolUseStart { id: "t1".into(), name: "bash".into() },
                 ModelEvent::ToolUseInputDelta(r#"{"command":"echo sub"}"#.into()),
                 ModelEvent::BlockStop,
                 ModelEvent::Stop { reason: Some("tool_use".into()) },
@@ -513,11 +476,8 @@ mod tests {
                 ModelEvent::Stop { reason: Some("end_turn".into()) },
             ],
         ];
-        let responses = vec![ShellResult {
-            exit_code: 0,
-            stdout: b"sub\n".to_vec(),
-            stderr: Vec::new(),
-        }];
+        let responses =
+            vec![ShellResult { exit_code: 0, stdout: b"sub\n".to_vec(), stderr: Vec::new() }];
         let (instance, state, _model, _sb) = parent_rig(scripts, responses);
 
         let (tx, rx) = sync_channel::<StreamEvent>(256);
@@ -555,19 +515,14 @@ mod tests {
         // serialise on its Mutex and not test parallelism.)
         fn rig_with_text(text: &str) -> (Spawned<InstanceMsg>, Arc<HarnessState>) {
             let sandbox = Arc::new(MockSandbox::new(vec![]));
-            let instance = spawn(Instance::new(
-                "inst",
-                Box::new(SandboxRef(sandbox)) as Box<dyn Sandbox>,
-            ));
+            let instance =
+                spawn(Instance::new("inst", Box::new(SandboxRef(sandbox)) as Box<dyn Sandbox>));
             let model = Arc::new(MockModel::single(vec![
                 ModelEvent::TextDelta(text.into()),
                 ModelEvent::Stop { reason: Some("end_turn".into()) },
             ]));
-            let state = Arc::new(HarnessState::new(
-                "p",
-                model as Arc<dyn Model>,
-                instance.addr.clone(),
-            ));
+            let state =
+                Arc::new(HarnessState::new("p", model as Arc<dyn Model>, instance.addr.clone()));
             (instance, state)
         }
 
@@ -598,10 +553,7 @@ mod tests {
         let mut scripts = Vec::new();
         for _ in 0..20 {
             scripts.push(vec![
-                ModelEvent::ToolUseStart {
-                    id: "t".into(),
-                    name: "bash".into(),
-                },
+                ModelEvent::ToolUseStart { id: "t".into(), name: "bash".into() },
                 ModelEvent::ToolUseInputDelta(r#"{"command":"true"}"#.into()),
                 ModelEvent::BlockStop,
                 ModelEvent::Stop { reason: Some("tool_use".into()) },
@@ -627,10 +579,7 @@ mod tests {
         let mut scripts = Vec::new();
         for _ in 0..20 {
             scripts.push(vec![
-                ModelEvent::ToolUseStart {
-                    id: "t".into(),
-                    name: "bash".into(),
-                },
+                ModelEvent::ToolUseStart { id: "t".into(), name: "bash".into() },
                 ModelEvent::ToolUseInputDelta(r#"{"command":"true"}"#.into()),
                 ModelEvent::BlockStop,
                 ModelEvent::Stop { reason: Some("tool_use".into()) },
@@ -663,18 +612,12 @@ mod tests {
         // same tool instance. We assert it by checking object identity on
         // the cloned Vec.
         let (instance, state, _model, _sb) = parent_rig(vec![], vec![]);
-        let parent_tool_ptrs: Vec<*const ()> = state
-            .tools
-            .iter()
-            .map(|t| Arc::as_ptr(t) as *const ())
-            .collect();
+        let parent_tool_ptrs: Vec<*const ()> =
+            state.tools.iter().map(|t| Arc::as_ptr(t) as *const ()).collect();
 
         let child = child_state(&state, None);
-        let child_tool_ptrs: Vec<*const ()> = child
-            .tools
-            .iter()
-            .map(|t| Arc::as_ptr(t) as *const ())
-            .collect();
+        let child_tool_ptrs: Vec<*const ()> =
+            child.tools.iter().map(|t| Arc::as_ptr(t) as *const ()).collect();
 
         assert_eq!(parent_tool_ptrs, child_tool_ptrs);
         drop(state);
@@ -691,10 +634,7 @@ mod tests {
                 // Two parallel single-tool prompts — but we'll only run one
                 // streaming child; the other branch is unused for this test.
                 vec![
-                    ModelEvent::ToolUseStart {
-                        id: "t1".into(),
-                        name: "bash".into(),
-                    },
+                    ModelEvent::ToolUseStart { id: "t1".into(), name: "bash".into() },
                     ModelEvent::ToolUseInputDelta(r#"{"command":"a"}"#.into()),
                     ModelEvent::BlockStop,
                     ModelEvent::Stop { reason: Some("tool_use".into()) },
@@ -704,11 +644,7 @@ mod tests {
                     ModelEvent::Stop { reason: Some("end_turn".into()) },
                 ],
             ],
-            vec![ShellResult {
-                exit_code: 0,
-                stdout: b"a\n".to_vec(),
-                stderr: Vec::new(),
-            }],
+            vec![ShellResult { exit_code: 0, stdout: b"a\n".to_vec(), stderr: Vec::new() }],
         );
 
         let task = spawn_task(state.clone(), "run".into(), None);
@@ -777,10 +713,7 @@ mod tests {
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].messages.len(), 1);
         assert_eq!(seen[0].messages[0].role, Role::User);
-        assert_eq!(
-            seen[0].messages[0].content,
-            vec![ContentBlock::Text("the only prompt".into())],
-        );
+        assert_eq!(seen[0].messages[0].content, vec![ContentBlock::Text("the only prompt".into())],);
 
         instance.join().unwrap();
     }

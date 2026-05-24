@@ -112,16 +112,11 @@ pub fn is_tool_use_pair_boundary(messages: &[ChatMessage], idx: usize) -> bool {
     if prev.role != Role::Assistant || next.role != Role::User {
         return false;
     }
-    let has_tool_use = prev
-        .content
-        .iter()
-        .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
+    let has_tool_use = prev.content.iter().any(|b| matches!(b, ContentBlock::ToolUse { .. }));
     if !has_tool_use {
         return false;
     }
-    next.content
-        .iter()
-        .any(|b| matches!(b, ContentBlock::ToolResult { .. }))
+    next.content.iter().any(|b| matches!(b, ContentBlock::ToolResult { .. }))
 }
 
 /// Model-driven compactor. Stand-alone helper the caller invokes between
@@ -205,9 +200,7 @@ impl Compactor {
             return Ok(messages);
         }
 
-        let synthetic = ChatMessage::assistant(format!(
-            "[Earlier turns summarised:]\n{summary}"
-        ));
+        let synthetic = ChatMessage::assistant(format!("[Earlier turns summarised:]\n{summary}"));
         let tail_len = messages.len() - split;
         let mut out = Vec::with_capacity(1 + tail_len);
         out.push(synthetic);
@@ -310,7 +303,8 @@ mod tests {
             user_tool_result("t1", "file.txt\n"),
         ];
         // "hi" = 2; "bash" (4) + input (17) = 21; tool_result content = 9.
-        let expected = 2 + 4 + "{\"command\":\"ls\"}".chars().count() + "file.txt\n".chars().count();
+        let expected =
+            2 + 4 + "{\"command\":\"ls\"}".chars().count() + "file.txt\n".chars().count();
         assert_eq!(estimate_chars(&msgs), expected);
     }
 
@@ -411,11 +405,11 @@ mod tests {
         // Force a candidate split that lands on a pair boundary; verify we
         // back up by 1 so both pair members live in the head.
         let msgs = vec![
-            user_text("aa"),                                    // 0
-            assist_tool_use("t1", "bash", "x"),                 // 1 (5 chars: "bash"+"x"=5)
-            user_tool_result("t1", "ok"),                       // 2 (2 chars)
-            user_text("aa"),                                    // 3
-            assist_text("bb"),                                  // 4
+            user_text("aa"),                    // 0
+            assist_tool_use("t1", "bash", "x"), // 1 (5 chars: "bash"+"x"=5)
+            user_tool_result("t1", "ok"),       // 2 (2 chars)
+            user_text("aa"),                    // 3
+            assist_text("bb"),                  // 4
         ];
         // Final 2 kept = indices 3,4 (4 chars). Budget 6 → can fit one more
         // message of <=2 chars at index 2 (the tool_result, 2 chars). That
@@ -430,23 +424,14 @@ mod tests {
 
     fn many_msgs(n: usize, per_chars: usize) -> Vec<ChatMessage> {
         let s = "x".repeat(per_chars);
-        (0..n)
-            .map(|i| {
-                if i % 2 == 0 {
-                    user_text(&s)
-                } else {
-                    assist_text(&s)
-                }
-            })
-            .collect()
+        (0..n).map(|i| if i % 2 == 0 { user_text(&s) } else { assist_text(&s) }).collect()
     }
 
     #[test]
     fn maybe_compact_below_threshold_returns_unchanged() {
         // target_chars=100, threshold=200. Total = 4 * 10 = 40, well under.
-        let model = Arc::new(MockModel::single(vec![ModelEvent::TextDelta(
-            "should not be called".into(),
-        )]));
+        let model =
+            Arc::new(MockModel::single(vec![ModelEvent::TextDelta("should not be called".into())]));
         let compactor = Compactor::new(model.clone(), 100);
         let msgs = many_msgs(4, 10);
         let out = compactor.maybe_compact(msgs.clone()).unwrap();
@@ -495,9 +480,7 @@ mod tests {
 
     #[test]
     fn maybe_compact_preserves_tail_verbatim() {
-        let model = Arc::new(MockModel::single(vec![ModelEvent::TextDelta(
-            "summary here".into(),
-        )]));
+        let model = Arc::new(MockModel::single(vec![ModelEvent::TextDelta("summary here".into())]));
         let compactor = Compactor::new(model, 20);
         let mut msgs = many_msgs(8, 10);
         // Tag the final two so we can identify them.
@@ -522,9 +505,7 @@ mod tests {
     fn maybe_compact_passes_summarisation_prompt_to_model() {
         // Confirm the request the model sees mentions "Summarise" and
         // includes head content (here: "ORIGINAL-HEAD-TEXT").
-        let model = Arc::new(MockModel::single(vec![ModelEvent::TextDelta(
-            "ok".into(),
-        )]));
+        let model = Arc::new(MockModel::single(vec![ModelEvent::TextDelta("ok".into())]));
         let compactor = Compactor::new(model.clone(), 20);
         let mut msgs = many_msgs(8, 10);
         msgs[0] = user_text("ORIGINAL-HEAD-TEXT");
@@ -545,9 +526,7 @@ mod tests {
     fn maybe_compact_with_tool_blocks_in_head_summarises_them_too() {
         // A history with tool_use + tool_result in the head; ensure the
         // prompt encodes them with tool markers.
-        let model = Arc::new(MockModel::single(vec![ModelEvent::TextDelta(
-            "compacted".into(),
-        )]));
+        let model = Arc::new(MockModel::single(vec![ModelEvent::TextDelta("compacted".into())]));
         let compactor = Compactor::new(model.clone(), 20);
         let msgs = vec![
             user_text("aaaaaaaaaa"),
@@ -578,7 +557,8 @@ mod tests {
             fn stream(
                 &self,
                 _req: ModelRequest,
-            ) -> Box<dyn Iterator<Item = Result<ModelEvent, harness::ModelError>> + Send> {
+            ) -> Box<dyn Iterator<Item = Result<ModelEvent, harness::ModelError>> + Send>
+            {
                 Box::new(std::iter::once(Err(harness::ModelError("boom".into()))))
             }
         }
@@ -596,9 +576,8 @@ mod tests {
         // even after backing up we can't safely compact. Build a 3-msg
         // history with a tool pair right at the end so backing-up wipes
         // the split to 0.
-        let model = Arc::new(MockModel::single(vec![ModelEvent::TextDelta(
-            "should never be used".into(),
-        )]));
+        let model =
+            Arc::new(MockModel::single(vec![ModelEvent::TextDelta("should never be used".into())]));
         // target_chars=5, threshold=10. msgs total >> 10 to trigger.
         let compactor = Compactor::new(model.clone(), 5);
         // 3 messages: assist(tool_use), user(tool_result), assist(text)
@@ -630,9 +609,7 @@ mod tests {
     fn maybe_compact_synthetic_message_is_assistant_role() {
         // Doc-promise: the synthetic message is Assistant-role so it doesn't
         // look like a fresh user prompt to the model.
-        let model = Arc::new(MockModel::single(vec![ModelEvent::TextDelta(
-            "synthesised".into(),
-        )]));
+        let model = Arc::new(MockModel::single(vec![ModelEvent::TextDelta("synthesised".into())]));
         let compactor = Compactor::new(model, 20);
         let msgs = many_msgs(8, 10);
         let out = compactor.maybe_compact(msgs).unwrap();

@@ -68,10 +68,7 @@ pub fn parse(input: &[u8]) -> Result<Json, Error> {
     let v = p.value()?;
     p.skip_ws();
     if p.pos != p.bytes.len() {
-        return Err(Error::InvalidResponse(format!(
-            "trailing bytes at {}",
-            p.pos
-        )));
+        return Err(Error::InvalidResponse(format!("trailing bytes at {}", p.pos)));
     }
     Ok(v)
 }
@@ -117,10 +114,7 @@ impl Parser<'_> {
             self.pos += word.len();
             Ok(())
         } else {
-            Err(Error::InvalidResponse(format!(
-                "expected keyword at {}",
-                self.pos
-            )))
+            Err(Error::InvalidResponse(format!("expected keyword at {}", self.pos)))
         }
     }
 
@@ -143,10 +137,7 @@ impl Parser<'_> {
                 Ok(Json::Null)
             }
             Some(b) if b == b'-' || b.is_ascii_digit() => self.number(),
-            other => Err(Error::InvalidResponse(format!(
-                "unexpected {:?} at {}",
-                other, self.pos
-            ))),
+            other => Err(Error::InvalidResponse(format!("unexpected {:?} at {}", other, self.pos))),
         }
     }
 
@@ -223,19 +214,13 @@ impl Parser<'_> {
                         let cp = self.hex4()?;
                         if (0xD800..=0xDBFF).contains(&cp) {
                             if self.bump() != Some(b'\\') || self.bump() != Some(b'u') {
-                                return Err(Error::InvalidResponse(
-                                    "lone high surrogate".into(),
-                                ));
+                                return Err(Error::InvalidResponse("lone high surrogate".into()));
                             }
                             let lo = self.hex4()?;
                             if !(0xDC00..=0xDFFF).contains(&lo) {
-                                return Err(Error::InvalidResponse(
-                                    "invalid low surrogate".into(),
-                                ));
+                                return Err(Error::InvalidResponse("invalid low surrogate".into()));
                             }
-                            let c = 0x10000
-                                + ((cp - 0xD800) << 10)
-                                + (lo - 0xDC00);
+                            let c = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
                             match char::from_u32(c) {
                                 Some(ch) => out.push(ch),
                                 None => {
@@ -256,17 +241,12 @@ impl Parser<'_> {
                         }
                     }
                     other => {
-                        return Err(Error::InvalidResponse(format!(
-                            "bad escape {:?}",
-                            other
-                        )));
+                        return Err(Error::InvalidResponse(format!("bad escape {:?}", other)));
                     }
                 },
                 Some(b) => {
                     if b < 0x20 {
-                        return Err(Error::InvalidResponse(
-                            "control char in string".into(),
-                        ));
+                        return Err(Error::InvalidResponse("control char in string".into()));
                     }
                     let start = self.pos - 1;
                     let mut end = self.pos;
@@ -294,9 +274,7 @@ impl Parser<'_> {
     fn hex4(&mut self) -> Result<u32, Error> {
         let mut v = 0u32;
         for _ in 0..4 {
-            let b = self
-                .bump()
-                .ok_or_else(|| Error::InvalidResponse("short \\u escape".into()))?;
+            let b = self.bump().ok_or_else(|| Error::InvalidResponse("short \\u escape".into()))?;
             let d = match b {
                 b'0'..=b'9' => (b - b'0') as u32,
                 b'a'..=b'f' => (b - b'a' + 10) as u32,

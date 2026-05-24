@@ -63,8 +63,8 @@ fn install_signals() {
 use actor::spawn;
 use git::{AgentStatus, Branch, BranchStrategy, HeadStrategy, MergeToHeadStrategy};
 use harness::{
-    AnthropicModel, AuditedShell, BashTool, HarnessState, Instance, MockModel, Model,
-    ModelEvent, OpenAiModel, Sandbox, Session, SessionMsg, SessionStore, Tool,
+    AnthropicModel, AuditedShell, BashTool, HarnessState, Instance, MockModel, Model, ModelEvent,
+    OpenAiModel, Sandbox, Session, SessionMsg, SessionStore, Tool,
 };
 use server::{AgentHandler, EventSink, HandlerError, Server, ServerConfig};
 
@@ -323,8 +323,7 @@ fn connect_mcp(specs: &[String]) -> Result<McpConn, String> {
     for spec in specs {
         let parts: Vec<&str> = spec.split_whitespace().collect();
         let (cmd, args) = parts.split_first().ok_or("empty --mcp value")?;
-        let client = mcp::McpClient::stdio(cmd, args)
-            .map_err(|e| format!("mcp {cmd}: {e:?}"))?;
+        let client = mcp::McpClient::stdio(cmd, args).map_err(|e| format!("mcp {cmd}: {e:?}"))?;
         for t in client.tools() {
             tools.push(Arc::new(t));
         }
@@ -398,9 +397,7 @@ fn line_col(src: &str, pos: usize) -> (usize, usize) {
 fn extract_pos(msg: &str) -> Option<usize> {
     let mut last = None;
     for token in msg.split_whitespace() {
-        if let Ok(n) =
-            token.trim_end_matches(|c: char| !c.is_ascii_digit()).parse::<usize>()
-        {
+        if let Ok(n) = token.trim_end_matches(|c: char| !c.is_ascii_digit()).parse::<usize>() {
             last = Some(n);
         }
     }
@@ -419,8 +416,8 @@ fn extract_pos(msg: &str) -> Option<usize> {
 /// `path:line:col: <message>` so editors can jump straight to the bad
 /// token.
 fn load_mock_script(path: &std::path::Path) -> Result<Vec<Vec<ModelEvent>>, String> {
-    let raw = std::fs::read_to_string(path)
-        .map_err(|e| format!("{}: read: {e}", path.display()))?;
+    let raw =
+        std::fs::read_to_string(path).map_err(|e| format!("{}: read: {e}", path.display()))?;
     let parsed = anthropic::json::parse(raw.as_bytes()).map_err(|e| {
         let msg = format!("{e}");
         let (line, col) = match extract_pos(&msg) {
@@ -432,10 +429,7 @@ fn load_mock_script(path: &std::path::Path) -> Result<Vec<Vec<ModelEvent>>, Stri
     let turns = match parsed.get("turns") {
         Some(anthropic::json::Json::Arr(t)) => t,
         _ => {
-            return Err(format!(
-                "{}: top-level key 'turns' must be an array",
-                path.display()
-            ));
+            return Err(format!("{}: top-level key 'turns' must be an array", path.display()));
         }
     };
     let mut out: Vec<Vec<ModelEvent>> = Vec::with_capacity(turns.len());
@@ -443,10 +437,7 @@ fn load_mock_script(path: &std::path::Path) -> Result<Vec<Vec<ModelEvent>>, Stri
         let events = match turn_json {
             anthropic::json::Json::Arr(e) => e,
             _ => {
-                return Err(format!(
-                    "{}: turns[{ti}] must be an array of events",
-                    path.display()
-                ));
+                return Err(format!("{}: turns[{ti}] must be an array of events", path.display()));
             }
         };
         let mut turn = Vec::with_capacity(events.len());
@@ -484,10 +475,7 @@ fn parse_event(j: &anthropic::json::Json) -> Result<ModelEvent, String> {
                 .get("name")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| "tool_use_start: missing 'name'".to_string())?;
-            Ok(ModelEvent::ToolUseStart {
-                id: id.to_string(),
-                name: name.to_string(),
-            })
+            Ok(ModelEvent::ToolUseStart { id: id.to_string(), name: name.to_string() })
         }
         "tool_use_input_delta" => {
             let s = j
@@ -571,11 +559,7 @@ impl Tool for TaskTool {
     fn input_schema(&self) -> &str {
         r#"{"type":"object","properties":{"prompt":{"type":"string","description":"The prompt to give the child agent."},"role":{"type":"string","description":"Optional system prompt for the child."}},"required":["prompt"]}"#
     }
-    fn call(
-        &self,
-        input: &str,
-        _ctx: &harness::ToolCtx,
-    ) -> Result<String, harness::ToolError> {
+    fn call(&self, input: &str, _ctx: &harness::ToolCtx) -> Result<String, harness::ToolError> {
         let v = anthropic::json::parse(input.as_bytes())
             .map_err(|e| harness::ToolError(format!("invalid task input: {e:?}")))?;
         let prompt = match v.get("prompt") {
@@ -791,9 +775,8 @@ fn run_cmd(mut args: Vec<String>) -> ExitCode {
         .with_metrics(metrics_client);
     if let Some(budget) = common.compact_budget {
         let compactor = compact::Compactor::new(model.clone(), budget);
-        let cb: Arc<harness::CompactFn> = Arc::new(move |msgs| {
-            compactor.maybe_compact(msgs.clone()).unwrap_or(msgs)
-        });
+        let cb: Arc<harness::CompactFn> =
+            Arc::new(move |msgs| compactor.maybe_compact(msgs.clone()).unwrap_or(msgs));
         state_build = state_build.with_compactor(cb);
     }
     let state = Arc::new(state_build);
@@ -841,10 +824,7 @@ fn run_cmd(mut args: Vec<String>) -> ExitCode {
         if CANCEL.load(Ordering::SeqCst) {
             drop(rx);
             eprintln!("[cancelling on SIGINT]");
-            break (
-                ExitCode::from(130),
-                AgentStatus::Failure("cancelled by signal".into()),
-            );
+            break (ExitCode::from(130), AgentStatus::Failure("cancelled by signal".into()));
         }
         let ev = match rx.recv() {
             Ok(ev) => ev,
@@ -890,10 +870,7 @@ fn run_cmd(mut args: Vec<String>) -> ExitCode {
             }
             harness::StreamEvent::Cancelled => {
                 eprintln!("[cancelled]");
-                break (
-                    ExitCode::from(130),
-                    AgentStatus::Failure("cancelled".into()),
-                );
+                break (ExitCode::from(130), AgentStatus::Failure("cancelled".into()));
             }
             harness::StreamEvent::Error(e) => {
                 eprintln!("session error: {e:?}");
@@ -958,7 +935,8 @@ fn render_skill(name: &str, args: &HashMap<String, String>) -> Result<String, St
         .map(PathBuf::from)
         .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     let skill = tmpl::load_skill(&root, name).map_err(|e| format!("{e:?}"))?;
-    let args_ref: HashMap<&str, String> = args.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+    let args_ref: HashMap<&str, String> =
+        args.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
     skill.render(&args_ref).map_err(|e| format!("{e:?}"))
 }
 
@@ -1047,11 +1025,8 @@ fn serve_cmd(mut args: Vec<String>) -> ExitCode {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
     });
-    let result = srv.serve_listener_with_shutdown(
-        listener,
-        ServerConfig::default(),
-        shutdown.clone(),
-    );
+    let result =
+        srv.serve_listener_with_shutdown(listener, ServerConfig::default(), shutdown.clone());
     shutdown.store(true, Ordering::Release); // stop the bridge thread
     let _ = bridge.join();
     drop(mcp_clients);
@@ -1109,8 +1084,7 @@ impl AgentHandler for ChatHandler {
                 }
             }
         });
-        let (log_tx, log_rx) =
-            std::sync::mpsc::sync_channel::<harness::StreamEvent>(1024);
+        let (log_tx, log_rx) = std::sync::mpsc::sync_channel::<harness::StreamEvent>(1024);
         let log_thread = runlog.as_ref().map(|r| {
             let r = r.clone();
             std::thread::spawn(move || {
@@ -1145,19 +1119,14 @@ impl AgentHandler for ChatHandler {
                 }
                 harness::StreamEvent::BlockStop => sink.emit(Some("block_stop"), ""),
                 harness::StreamEvent::ToolResult { tool_use_id, content, is_error } => {
-                    sink.emit(
-                        Some("tool_result"),
-                        &format!("{tool_use_id}\t{is_error}\t{content}"),
-                    )
+                    sink.emit(Some("tool_result"), &format!("{tool_use_id}\t{is_error}\t{content}"))
                 }
                 harness::StreamEvent::TurnComplete { turn, stop_reason } => sink.emit(
                     Some("turn_complete"),
                     &format!("{}\t{}", turn, stop_reason.as_deref().unwrap_or("")),
                 ),
-                harness::StreamEvent::Done(pr) => sink.emit(
-                    Some("done"),
-                    &format!("turns={}\tcompleted={}", pr.turns, pr.completed),
-                ),
+                harness::StreamEvent::Done(pr) => sink
+                    .emit(Some("done"), &format!("turns={}\tcompleted={}", pr.turns, pr.completed)),
                 harness::StreamEvent::Cancelled => sink.emit(Some("cancelled"), ""),
                 harness::StreamEvent::Error(e) => {
                     final_err = Some(HandlerError(format!("{e:?}")));
@@ -1208,10 +1177,7 @@ fn parse_prompt(body: &[u8]) -> Result<String, String> {
 
 fn unix_ms_now() -> u128 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0)
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)
 }
 
 /// `agent mcp-serve` — speak MCP JSON-RPC over stdio so other agents can
@@ -1241,7 +1207,8 @@ fn mcp_serve_cmd(mut args: Vec<String>) -> ExitCode {
     let sandbox: Box<dyn Sandbox> = Box::new(AuditedShell::new(vshell::VShell::new()));
     let inst = spawn(Instance::new("mcp-serve", sandbox));
 
-    let mut srv = mcp::server::Server::new("sandcastle", env!("CARGO_PKG_VERSION"), inst.addr.clone());
+    let mut srv =
+        mcp::server::Server::new("sandcastle", env!("CARGO_PKG_VERSION"), inst.addr.clone());
     for t in tools {
         srv.register(t);
     }

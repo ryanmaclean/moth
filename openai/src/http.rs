@@ -71,12 +71,7 @@ struct Ctx {
     delivered: AtomicBool,
 }
 
-extern "C" fn write_cb(
-    ptr: *mut c_char,
-    size: usize,
-    nmemb: usize,
-    user: *mut c_void,
-) -> usize {
+extern "C" fn write_cb(ptr: *mut c_char, size: usize, nmemb: usize, user: *mut c_void) -> usize {
     let total = size.saturating_mul(nmemb);
     if total == 0 {
         return 0;
@@ -112,19 +107,13 @@ extern "C" fn xferinfo_cb(
     i32::from(ctx.aborted.load(Ordering::Relaxed))
 }
 
-pub(crate) fn post_stream(
-    api_key: &str,
-    base_url: &str,
-    body: String,
-) -> Result<Stream, Error> {
+pub(crate) fn post_stream(api_key: &str, base_url: &str, body: String) -> Result<Stream, Error> {
     let host = host_of(base_url);
     let breaker_cfg = wire::retry::BreakerConfig::default();
     match wire::retry::check(&host, &breaker_cfg) {
         wire::retry::BreakerVerdict::Allow | wire::retry::BreakerVerdict::HalfOpenProbe => {}
         wire::retry::BreakerVerdict::Open => {
-            return Err(Error::Http(format!(
-                "circuit open for {host} (recent upstream failures)"
-            )));
+            return Err(Error::Http(format!("circuit open for {host} (recent upstream failures)")));
         }
     }
 
@@ -172,15 +161,8 @@ pub(crate) fn post_stream(
 /// → "api.openai.com"). Defaults to the whole input if parsing fails so
 /// the breaker still keys consistently per caller-supplied URL.
 fn host_of(base_url: &str) -> String {
-    let after_scheme = base_url
-        .split_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or(base_url);
-    after_scheme
-        .split(['/', ':', '?'])
-        .next()
-        .unwrap_or(base_url)
-        .to_string()
+    let after_scheme = base_url.split_once("://").map(|(_, rest)| rest).unwrap_or(base_url);
+    after_scheme.split(['/', ':', '?']).next().unwrap_or(base_url).to_string()
 }
 
 fn join_url(base: &str, path: &str) -> String {
@@ -276,36 +258,11 @@ unsafe fn run_easy(
 
         setopt_ptr(easy, c::CURLOPT_URL, url.as_ptr() as *const c_void, "URL")?;
         setopt_long(easy, c::CURLOPT_POST, 1, "POST")?;
-        setopt_ptr(
-            easy,
-            c::CURLOPT_POSTFIELDS,
-            body.as_ptr() as *const c_void,
-            "POSTFIELDS",
-        )?;
-        setopt_long(
-            easy,
-            c::CURLOPT_POSTFIELDSIZE,
-            body.len() as i64,
-            "POSTFIELDSIZE",
-        )?;
-        setopt_ptr(
-            easy,
-            c::CURLOPT_HTTPHEADER,
-            headers as *const c_void,
-            "HTTPHEADER",
-        )?;
-        setopt_ptr(
-            easy,
-            c::CURLOPT_WRITEFUNCTION,
-            write_cb as *const c_void,
-            "WRITEFUNCTION",
-        )?;
-        setopt_ptr(
-            easy,
-            c::CURLOPT_WRITEDATA,
-            ctx as *const c_void,
-            "WRITEDATA",
-        )?;
+        setopt_ptr(easy, c::CURLOPT_POSTFIELDS, body.as_ptr() as *const c_void, "POSTFIELDS")?;
+        setopt_long(easy, c::CURLOPT_POSTFIELDSIZE, body.len() as i64, "POSTFIELDSIZE")?;
+        setopt_ptr(easy, c::CURLOPT_HTTPHEADER, headers as *const c_void, "HTTPHEADER")?;
+        setopt_ptr(easy, c::CURLOPT_WRITEFUNCTION, write_cb as *const c_void, "WRITEFUNCTION")?;
+        setopt_ptr(easy, c::CURLOPT_WRITEDATA, ctx as *const c_void, "WRITEDATA")?;
         // Cancellation: xferinfo_cb returns non-zero when ctx.aborted is set,
         // which lets curl break out of connect/recv stalls without waiting
         // for the next byte to flow through write_cb.
@@ -316,12 +273,7 @@ unsafe fn run_easy(
             xferinfo_cb as *const c_void,
             "XFERINFOFUNCTION",
         )?;
-        setopt_ptr(
-            easy,
-            CURLOPT_XFERINFODATA,
-            ctx as *const c_void,
-            "XFERINFODATA",
-        )?;
+        setopt_ptr(easy, CURLOPT_XFERINFODATA, ctx as *const c_void, "XFERINFODATA")?;
         setopt_long(easy, c::CURLOPT_FOLLOWLOCATION, 1, "FOLLOWLOCATION")?;
         // Connection-level timeouts so a half-open or LB-dropped TCP socket
         // can't wedge the worker thread indefinitely. No hard CURLOPT_TIMEOUT
@@ -610,16 +562,10 @@ mod tests {
         let body = b"{}".to_vec();
 
         let (tx, _rx) = std::sync::mpsc::sync_channel::<Chunk>(1);
-        let ctx = Ctx {
-            tx,
-            aborted: AtomicBool::new(false),
-            delivered: AtomicBool::new(false),
-        };
+        let ctx = Ctx { tx, aborted: AtomicBool::new(false), delivered: AtomicBool::new(false) };
 
         let started = std::time::Instant::now();
-        let result = unsafe {
-            run_easy(&url, &auth_header, &content_type, &accept, &body, &ctx)
-        };
+        let result = unsafe { run_easy(&url, &auth_header, &content_type, &accept, &body, &ctx) };
         let elapsed = started.elapsed();
 
         stop.store(true, Ordering::Relaxed);
@@ -643,18 +589,10 @@ mod tests {
     #[test]
     fn xferinfo_cb_returns_nonzero_when_aborted() {
         let (tx, _rx) = std::sync::mpsc::sync_channel::<Chunk>(1);
-        let ctx = Ctx {
-            tx,
-            aborted: AtomicBool::new(false),
-            delivered: AtomicBool::new(false),
-        };
+        let ctx = Ctx { tx, aborted: AtomicBool::new(false), delivered: AtomicBool::new(false) };
         let ptr = &ctx as *const Ctx as *mut c_void;
         assert_eq!(xferinfo_cb(ptr, 0.0, 0.0, 0.0, 0.0), 0);
         ctx.aborted.store(true, Ordering::Relaxed);
-        assert_ne!(
-            xferinfo_cb(ptr, 0.0, 0.0, 0.0, 0.0),
-            0,
-            "non-zero signals abort to curl"
-        );
+        assert_ne!(xferinfo_cb(ptr, 0.0, 0.0, 0.0, 0.0), 0, "non-zero signals abort to curl");
     }
 }

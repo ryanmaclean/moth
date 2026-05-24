@@ -57,11 +57,8 @@ pub(crate) fn parse_frame(frame: &[u8]) -> Result<Parsed, Error> {
     // either as a non-stream response that got proxied through, or as the
     // last SSE event when something blew up mid-stream.
     if let Some(err) = v.get("error") {
-        let msg = err
-            .get("message")
-            .and_then(Json::as_str)
-            .unwrap_or("openai stream error")
-            .to_string();
+        let msg =
+            err.get("message").and_then(Json::as_str).unwrap_or("openai stream error").to_string();
         return Err(Error::Http(msg));
     }
 
@@ -109,23 +106,15 @@ fn emit_delta(delta: &Json, out: &mut Vec<Event>) {
             // tool_use block". After the start, subsequent deltas typically
             // carry only `function.arguments`.
             let id = call.get("id").and_then(Json::as_str);
-            let name = call
-                .get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(Json::as_str);
+            let name = call.get("function").and_then(|f| f.get("name")).and_then(Json::as_str);
             if let (Some(id), Some(name)) = (id, name)
                 && !id.is_empty()
                 && !name.is_empty()
             {
-                out.push(Event::ToolUseStart {
-                    id: id.to_string(),
-                    name: name.to_string(),
-                });
+                out.push(Event::ToolUseStart { id: id.to_string(), name: name.to_string() });
             }
-            if let Some(args) = call
-                .get("function")
-                .and_then(|f| f.get("arguments"))
-                .and_then(Json::as_str)
+            if let Some(args) =
+                call.get("function").and_then(|f| f.get("arguments")).and_then(Json::as_str)
                 && !args.is_empty()
             {
                 out.push(Event::ToolUseInputDelta(args.to_string()));
@@ -182,17 +171,11 @@ mod tests {
         let frame = br#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_abc","type":"function","function":{"name":"bash","arguments":""}}]}}]}"#;
         assert_eq!(
             events(frame),
-            vec![Event::ToolUseStart {
-                id: "call_abc".into(),
-                name: "bash".into()
-            }]
+            vec![Event::ToolUseStart { id: "call_abc".into(), name: "bash".into() }]
         );
 
         let frame2 = br#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"command\":"}}]}}]}"#;
-        assert_eq!(
-            events(frame2),
-            vec![Event::ToolUseInputDelta("{\"command\":".into())]
-        );
+        assert_eq!(events(frame2), vec![Event::ToolUseInputDelta("{\"command\":".into())]);
     }
 
     #[test]
@@ -210,10 +193,7 @@ mod tests {
     #[test]
     fn finish_reason_stop_canonicalises_to_end_turn() {
         let frame = br#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}"#;
-        assert_eq!(
-            events(frame),
-            vec![Event::Stop { reason: Some("end_turn".into()) }]
-        );
+        assert_eq!(events(frame), vec![Event::Stop { reason: Some("end_turn".into()) }]);
     }
 
     #[test]
@@ -221,20 +201,14 @@ mod tests {
         let frame = br#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#;
         assert_eq!(
             events(frame),
-            vec![
-                Event::ContentBlockStop,
-                Event::Stop { reason: Some("tool_use".into()) },
-            ]
+            vec![Event::ContentBlockStop, Event::Stop { reason: Some("tool_use".into()) },]
         );
     }
 
     #[test]
     fn finish_reason_length_forwarded_verbatim() {
         let frame = br#"data: {"choices":[{"delta":{},"finish_reason":"length"}]}"#;
-        assert_eq!(
-            events(frame),
-            vec![Event::Stop { reason: Some("length".into()) }]
-        );
+        assert_eq!(events(frame), vec![Event::Stop { reason: Some("length".into()) }]);
     }
 
     #[test]
@@ -267,10 +241,7 @@ mod tests {
     #[test]
     fn malformed_json_errors() {
         let frame = b"data: {not json}";
-        assert!(matches!(
-            parse_frame(frame),
-            Err(Error::InvalidResponse(_))
-        ));
+        assert!(matches!(parse_frame(frame), Err(Error::InvalidResponse(_))));
     }
 
     #[test]
@@ -289,10 +260,7 @@ mod tests {
         let frame = br#"data: {"choices":[{"delta":{"content":"bye"},"finish_reason":"stop"}]}"#;
         assert_eq!(
             events(frame),
-            vec![
-                Event::TextDelta("bye".into()),
-                Event::Stop { reason: Some("end_turn".into()) },
-            ]
+            vec![Event::TextDelta("bye".into()), Event::Stop { reason: Some("end_turn".into()) },]
         );
     }
 

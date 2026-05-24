@@ -84,11 +84,8 @@ where
     if out.status.success() {
         Ok(out)
     } else {
-        let cmd = args
-            .iter()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect::<Vec<_>>()
-            .join(" ");
+        let cmd =
+            args.iter().map(|a| a.to_string_lossy().into_owned()).collect::<Vec<_>>().join(" ");
         Err(GitError::Git {
             command: cmd,
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
@@ -119,12 +116,11 @@ fn ensure_repo(repo_root: &Path) -> Result<(), GitError> {
 
 /// Current branch name (`git symbolic-ref --short HEAD`). Errors on detached HEAD.
 fn current_branch(repo_root: &Path) -> Result<String, GitError> {
-    git_cmd(["symbolic-ref", "--short", "HEAD"], repo_root)
-        .map(stdout_trimmed)
-        .map_err(|e| match e {
-            GitError::Git { .. } => GitError::Other("detached HEAD: no target branch".into()),
-            other => other,
-        })
+    git_cmd(["symbolic-ref", "--short", "HEAD"], repo_root).map(stdout_trimmed).map_err(|e| match e
+    {
+        GitError::Git { .. } => GitError::Other("detached HEAD: no target branch".into()),
+        other => other,
+    })
 }
 
 fn is_dirty(repo_root: &Path) -> Result<bool, GitError> {
@@ -202,11 +198,7 @@ impl BranchStrategy for HeadStrategy {
             return Err(GitError::DirtyTree);
         }
         let branch = current_branch(repo_root)?;
-        Ok(Workspace {
-            path: repo_root.to_owned(),
-            source_branch: branch,
-            target_branch: None,
-        })
+        Ok(Workspace { path: repo_root.to_owned(), source_branch: branch, target_branch: None })
     }
 
     fn finish(&self, _ws: Workspace, _status: AgentStatus) -> Result<(), GitError> {
@@ -244,11 +236,7 @@ impl BranchStrategy for MergeToHeadStrategy {
             ],
             repo_root,
         )?;
-        Ok(Workspace {
-            path: wt_path,
-            source_branch: branch,
-            target_branch: Some(target),
-        })
+        Ok(Workspace { path: wt_path, source_branch: branch, target_branch: Some(target) })
     }
 
     fn finish(&self, ws: Workspace, status: AgentStatus) -> Result<(), GitError> {
@@ -339,11 +327,7 @@ impl BranchStrategy for Branch {
             ],
             repo_root,
         )?;
-        Ok(Workspace {
-            path: wt_path,
-            source_branch: self.name.clone(),
-            target_branch: None,
-        })
+        Ok(Workspace { path: wt_path, source_branch: self.name.clone(), target_branch: None })
     }
 
     fn finish(&self, ws: Workspace, status: AgentStatus) -> Result<(), GitError> {
@@ -404,10 +388,7 @@ mod tests {
     impl TempRepo {
         fn new() -> Self {
             let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
+            let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
             let path = std::env::temp_dir().join(format!(
                 "sandcastle-git-test-{}-{}-{}",
                 std::process::id(),
@@ -474,9 +455,7 @@ mod tests {
     fn head_finish_is_noop_on_failure() {
         let r = TempRepo::new();
         let ws = HeadStrategy.prepare(&r.path).unwrap();
-        HeadStrategy
-            .finish(ws, AgentStatus::Failure("boom".into()))
-            .unwrap();
+        HeadStrategy.finish(ws, AgentStatus::Failure("boom".into())).unwrap();
         assert!(r.path.join(".git").exists());
     }
 
@@ -494,9 +473,7 @@ mod tests {
         let wt_path = ws.path.clone();
         let temp_branch = ws.source_branch.clone();
 
-        MergeToHeadStrategy
-            .finish(ws, AgentStatus::Success)
-            .unwrap();
+        MergeToHeadStrategy.finish(ws, AgentStatus::Success).unwrap();
 
         // Worktree gone, agent's commit reachable from main.
         assert!(!wt_path.exists(), "worktree should be removed on success");
@@ -516,9 +493,7 @@ mod tests {
         let temp_branch = ws.source_branch.clone();
         commit_file(&wt_path, "wip.txt", "wip", "wip commit");
 
-        MergeToHeadStrategy
-            .finish(ws, AgentStatus::Failure("test".into()))
-            .unwrap();
+        MergeToHeadStrategy.finish(ws, AgentStatus::Failure("test".into())).unwrap();
 
         assert!(wt_path.exists(), "worktree should be kept on failure");
         // Branch should still exist for inspection.
@@ -549,9 +524,7 @@ mod tests {
         let parent = ws.path.parent().unwrap();
         assert!(parent.ends_with(".sandcastle/worktrees"));
         assert!(ws.source_branch.starts_with("agent-"));
-        MergeToHeadStrategy
-            .finish(ws, AgentStatus::Success)
-            .unwrap();
+        MergeToHeadStrategy.finish(ws, AgentStatus::Success).unwrap();
     }
 
     // ---- Branch (named) ----
@@ -617,7 +590,8 @@ mod tests {
 
     #[test]
     fn not_a_repo_errors() {
-        let dir = std::env::temp_dir().join(format!("sandcastle-not-a-repo-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("sandcastle-not-a-repo-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let err = HeadStrategy.prepare(&dir).unwrap_err();

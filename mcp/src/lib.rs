@@ -87,14 +87,9 @@ impl McpInner {
     fn request(&self, method: &str, params: Option<&str>) -> Result<Json, McpError> {
         let id = self.next_id();
         let body = jsonrpc::build_request(id, method, params);
-        self.transport
-            .send_line(body.as_bytes())
-            .map_err(McpError::Transport)?;
+        self.transport.send_line(body.as_bytes()).map_err(McpError::Transport)?;
         loop {
-            let line = self
-                .transport
-                .recv_line()
-                .map_err(McpError::Transport)?;
+            let line = self.transport.recv_line().map_err(McpError::Transport)?;
             // Servers may emit blank keep-alives; ignore.
             if line.iter().all(|b| matches!(b, b' ' | b'\t' | b'\r')) {
                 continue;
@@ -135,9 +130,7 @@ impl McpInner {
     /// Send a notification (no id, no response expected).
     fn notify(&self, method: &str, params: Option<&str>) -> Result<(), McpError> {
         let body = jsonrpc::build_notification(method, params);
-        self.transport
-            .send_line(body.as_bytes())
-            .map_err(McpError::Transport)
+        self.transport.send_line(body.as_bytes()).map_err(McpError::Transport)
     }
 }
 
@@ -175,11 +168,7 @@ impl McpClient {
     /// Build a client from an arbitrary transport. Public for tests; in
     /// production, prefer [`McpClient::stdio`].
     pub fn with_transport(transport: Box<dyn Transport>) -> Result<Self, McpError> {
-        let mut inner = McpInner {
-            transport,
-            next_id: AtomicU64::new(1),
-            tools: Vec::new(),
-        };
+        let mut inner = McpInner { transport, next_id: AtomicU64::new(1), tools: Vec::new() };
 
         // ---- initialize ----
         // Per spec, params include protocolVersion, capabilities, and
@@ -191,15 +180,13 @@ impl McpClient {
             r#""clientInfo":{"name":"sandcastle-mcp","version":"0.0.1"}}"#
         );
         let init_envelope = inner.request("initialize", Some(init_params))?;
-        let init_resp = init_envelope.get("result").ok_or_else(|| {
-            McpError::Protocol("initialize response missing 'result'".into())
-        })?;
+        let init_resp = init_envelope
+            .get("result")
+            .ok_or_else(|| McpError::Protocol("initialize response missing 'result'".into()))?;
         // We don't strictly need to inspect serverInfo, but a missing
         // protocolVersion is a clear sign of a non-MCP peer.
         if init_resp.get("protocolVersion").is_none() {
-            return Err(McpError::Protocol(
-                "initialize response missing protocolVersion".into(),
-            ));
+            return Err(McpError::Protocol("initialize response missing protocolVersion".into()));
         }
 
         // ---- initialized notification ----
@@ -207,9 +194,9 @@ impl McpClient {
 
         // ---- tools/list ----
         let list_envelope = inner.request("tools/list", None)?;
-        let list = list_envelope.get("result").ok_or_else(|| {
-            McpError::Protocol("tools/list response missing 'result'".into())
-        })?;
+        let list = list_envelope
+            .get("result")
+            .ok_or_else(|| McpError::Protocol("tools/list response missing 'result'".into()))?;
         inner.tools = parse_tools_list(list)?;
 
         Ok(Self { inner: Arc::new(inner) })
@@ -253,20 +240,16 @@ impl McpInner {
         params.push_str(args);
         params.push('}');
         let envelope = self.request("tools/call", Some(&params))?;
-        let result = envelope.get("result").ok_or_else(|| {
-            McpError::Protocol("tools/call response missing 'result'".into())
-        })?;
+        let result = envelope
+            .get("result")
+            .ok_or_else(|| McpError::Protocol("tools/call response missing 'result'".into()))?;
         // The spec returns `{ content: [...], isError?: bool }`. We
         // concatenate all `text` blocks and ignore others (images,
         // resources). If `isError` is true, surface as a ToolError —
         // matching the harness's tool-error contract.
         let is_error = matches!(result.get("isError"), Some(Json::Bool(true)));
         let text = extract_text(result)?;
-        if is_error {
-            Err(McpError::Server { code: 0, message: text })
-        } else {
-            Ok(text)
-        }
+        if is_error { Err(McpError::Server { code: 0, message: text }) } else { Ok(text) }
     }
 }
 
@@ -293,9 +276,7 @@ impl Tool for McpTool {
     }
 
     fn call(&self, input: &str, _ctx: &ToolCtx) -> Result<String, ToolError> {
-        self.inner
-            .call_tool(&self.name, input)
-            .map_err(|e| ToolError(e.to_string()))
+        self.inner.call_tool(&self.name, input).map_err(|e| ToolError(e.to_string()))
     }
 }
 
@@ -311,11 +292,7 @@ fn parse_tools_list(v: &Json) -> Result<Vec<ToolMeta>, McpError> {
             .and_then(Json::as_str)
             .ok_or_else(|| McpError::Protocol("tool entry missing 'name'".into()))?
             .to_string();
-        let description = t
-            .get("description")
-            .and_then(Json::as_str)
-            .unwrap_or("")
-            .to_string();
+        let description = t.get("description").and_then(Json::as_str).unwrap_or("").to_string();
         // inputSchema is a JSON Schema object. Re-serialise the parsed value
         // so we don't depend on string-level round-tripping from the wire.
         let schema = t
@@ -421,19 +398,11 @@ mod tests {
         }
 
         fn push_response(&self, line: &str) {
-            self.incoming_tx
-                .lock()
-                .unwrap()
-                .send(Ok(line.as_bytes().to_vec()))
-                .unwrap();
+            self.incoming_tx.lock().unwrap().send(Ok(line.as_bytes().to_vec())).unwrap();
         }
 
         fn push_error(&self, msg: &str) {
-            self.incoming_tx
-                .lock()
-                .unwrap()
-                .send(Err(msg.to_string()))
-                .unwrap();
+            self.incoming_tx.lock().unwrap().send(Err(msg.to_string())).unwrap();
         }
 
         fn pop_sent(&self) -> Vec<u8> {
@@ -616,9 +585,7 @@ mod tests {
         mock.push_response(
             r#"{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"image","data":"..."},{"type":"text","text":"only this"}]}}"#,
         );
-        let out = client.tools()[0]
-            .call("{}", &ctx_dummy())
-            .unwrap();
+        let out = client.tools()[0].call("{}", &ctx_dummy()).unwrap();
         assert_eq!(out, "only this");
     }
 
@@ -633,9 +600,7 @@ mod tests {
         mock.push_response(
             r#"{"jsonrpc":"2.0","id":3,"result":{"isError":true,"content":[{"type":"text","text":"boom"}]}}"#,
         );
-        let err = client.tools()[0]
-            .call("{}", &ctx_dummy())
-            .unwrap_err();
+        let err = client.tools()[0].call("{}", &ctx_dummy()).unwrap_err();
         assert!(err.0.contains("boom"));
     }
 
@@ -650,9 +615,7 @@ mod tests {
         mock.push_response(
             r#"{"jsonrpc":"2.0","id":3,"error":{"code":-32602,"message":"missing argument"}}"#,
         );
-        let err = client.tools()[0]
-            .call("{}", &ctx_dummy())
-            .unwrap_err();
+        let err = client.tools()[0].call("{}", &ctx_dummy()).unwrap_err();
         assert!(err.0.contains("-32602"));
         assert!(err.0.contains("missing argument"));
     }
@@ -684,7 +647,9 @@ mod tests {
         }
         // Server emits a notification, then the actual response. The
         // client should silently skip the notification.
-        mock.push_response(r#"{"jsonrpc":"2.0","method":"notifications/log","params":{"msg":"x"}}"#);
+        mock.push_response(
+            r#"{"jsonrpc":"2.0","method":"notifications/log","params":{"msg":"x"}}"#,
+        );
         mock.push_response(
             r#"{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"ok"}]}}"#,
         );
@@ -701,9 +666,7 @@ mod tests {
             let _ = mock.pop_sent();
         }
         mock.push_error("broken pipe");
-        let err = client.tools()[0]
-            .call("{}", &ctx_dummy())
-            .unwrap_err();
+        let err = client.tools()[0].call("{}", &ctx_dummy()).unwrap_err();
         assert!(err.0.contains("broken pipe"));
     }
 

@@ -48,10 +48,7 @@ pub(crate) mod test_store {
 
     impl InMemoryStore {
         pub fn new() -> Self {
-            Self {
-                data: Mutex::new(HashMap::new()),
-                append_calls: Mutex::new(0),
-            }
+            Self { data: Mutex::new(HashMap::new()), append_calls: Mutex::new(0) }
         }
     }
 
@@ -59,16 +56,10 @@ pub(crate) mod test_store {
         fn load(&self, key: &str) -> Result<Option<Vec<ChatMessage>>, StoreError> {
             Ok(self.data.lock().unwrap().get(key).cloned())
         }
-        fn append(
-            &self,
-            key: &str,
-            new_messages: &[ChatMessage],
-        ) -> Result<(), StoreError> {
+        fn append(&self, key: &str, new_messages: &[ChatMessage]) -> Result<(), StoreError> {
             *self.append_calls.lock().unwrap() += 1;
             let mut data = self.data.lock().unwrap();
-            data.entry(key.to_string())
-                .or_default()
-                .extend_from_slice(new_messages);
+            data.entry(key.to_string()).or_default().extend_from_slice(new_messages);
             Ok(())
         }
     }

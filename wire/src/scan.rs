@@ -84,8 +84,7 @@ mod avx2 {
         // Load 32 bytes at i for `a` and 32 bytes at i+1 for `b`; needs i+33 <= len.
         while i + 33 <= haystack.len() {
             let v0 = unsafe { _mm256_loadu_si256(haystack.as_ptr().add(i) as *const __m256i) };
-            let v1 =
-                unsafe { _mm256_loadu_si256(haystack.as_ptr().add(i + 1) as *const __m256i) };
+            let v1 = unsafe { _mm256_loadu_si256(haystack.as_ptr().add(i + 1) as *const __m256i) };
             let m0 = _mm256_cmpeq_epi8(v0, va);
             let m1 = _mm256_cmpeq_epi8(v1, vb);
             let m = _mm256_and_si256(m0, m1);
@@ -117,11 +116,7 @@ mod neon {
     unsafe fn first_match_pos(cmp: uint8x16_t) -> Option<usize> {
         let narrow = vshrn_n_u16::<4>(vreinterpretq_u16_u8(cmp));
         let mask: u64 = vget_lane_u64::<0>(vreinterpret_u64_u8(narrow));
-        if mask == 0 {
-            None
-        } else {
-            Some(mask.trailing_zeros() as usize / 4)
-        }
+        if mask == 0 { None } else { Some(mask.trailing_zeros() as usize / 4) }
     }
 
     #[target_feature(enable = "neon")]
@@ -239,11 +234,7 @@ mod tests {
                 let mut buf = vec![b'.'; len];
                 buf[pos] = b'<';
                 buf[pos + 1] = b'/';
-                assert_eq!(
-                    scan_for_pair(&buf, b'<', b'/'),
-                    Some(pos),
-                    "len={len} pos={pos}"
-                );
+                assert_eq!(scan_for_pair(&buf, b'<', b'/'), Some(pos), "len={len} pos={pos}");
             }
         }
     }

@@ -95,11 +95,7 @@ fn run_agent(args: &[&str]) -> (Option<i32>, String, String) {
 #[test]
 fn mock_model_run_emits_canned_response() {
     let (code, stdout, stderr) = run_agent(&["run", "--mock", "hello from the test"]);
-    assert_eq!(
-        code,
-        Some(0),
-        "non-zero exit\nstdout=<<<{stdout}>>>\nstderr=<<<{stderr}>>>"
-    );
+    assert_eq!(code, Some(0), "non-zero exit\nstdout=<<<{stdout}>>>\nstderr=<<<{stderr}>>>");
     assert!(
         stdout.contains("[mock] received:"),
         "stdout missing canned marker\nstdout=<<<{stdout}>>>\nstderr=<<<{stderr}>>>"
@@ -135,11 +131,7 @@ fn mock_script_loads_and_replays() {
 
     let (code, stdout, stderr) =
         run_agent(&["run", "--mock-script", path.to_str().unwrap(), "anything"]);
-    assert_eq!(
-        code,
-        Some(0),
-        "non-zero exit\nstdout=<<<{stdout}>>>\nstderr=<<<{stderr}>>>"
-    );
+    assert_eq!(code, Some(0), "non-zero exit\nstdout=<<<{stdout}>>>\nstderr=<<<{stderr}>>>");
     // Asserting contiguous concatenation proves both ordering and presence.
     assert!(
         stdout.contains("alpha-beta-gamma"),
@@ -159,13 +151,9 @@ fn mock_script_bad_json_reports_line_col() {
     let path = dir.join("script.json");
     std::fs::write(&path, script).expect("write script");
 
-    let (code, _stdout, stderr) =
-        run_agent(&["run", "--mock-script", path.to_str().unwrap(), "x"]);
+    let (code, _stdout, stderr) = run_agent(&["run", "--mock-script", path.to_str().unwrap(), "x"]);
     assert_ne!(code, Some(0), "expected non-zero exit for bad JSON");
-    assert!(
-        stderr.contains("script.json:"),
-        "stderr missing path prefix\nstderr=<<<{stderr}>>>"
-    );
+    assert!(stderr.contains("script.json:"), "stderr missing path prefix\nstderr=<<<{stderr}>>>");
 
     cleanup(&dir);
 }
@@ -176,15 +164,10 @@ fn tempdir(label: &str) -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
     static SEQ: AtomicU64 = AtomicU64::new(0);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
+    let nanos =
+        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0);
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    let p = std::env::temp_dir().join(format!(
-        "cli-{label}-{}-{nanos}-{n}",
-        std::process::id()
-    ));
+    let p = std::env::temp_dir().join(format!("cli-{label}-{}-{nanos}-{n}", std::process::id()));
     std::fs::create_dir_all(&p).expect("mkdir tempdir");
     p
 }

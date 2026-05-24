@@ -22,16 +22,16 @@ pub(crate) enum Tok {
     /// `=`-style assignment prefix: `KEY=value`. The right side is a Word
     /// because it can contain expansions.
     Assign(String, Word),
-    Semi,       // ; or newline
-    AndIf,      // &&
-    OrIf,       // ||
-    Pipe,       // |
-    Great,      // >
-    DGreat,     // >>
-    Less,       // <
-    Great2,     // 2>
-    DGreat2,    // 2>>
-    Err2Out,    // 2>&1
+    Semi,    // ; or newline
+    AndIf,   // &&
+    OrIf,    // ||
+    Pipe,    // |
+    Great,   // >
+    DGreat,  // >>
+    Less,    // <
+    Great2,  // 2>
+    DGreat2, // 2>>
+    Err2Out, // 2>&1
 }
 
 pub(crate) fn tokenize(src: &str) -> Result<Vec<(Tok, usize)>, ShellError> {
@@ -211,7 +211,10 @@ fn read_word(bytes: &[u8], abs_start: usize) -> Result<(Word, usize), ShellError
                     });
                 }
                 cur.push_str(std::str::from_utf8(&bytes[start..i]).map_err(|e| {
-                    ShellError::ParseError { msg: format!("invalid utf8: {e}"), pos: abs_start + start }
+                    ShellError::ParseError {
+                        msg: format!("invalid utf8: {e}"),
+                        pos: abs_start + start,
+                    }
                 })?);
                 i += 1;
             }
@@ -383,10 +386,7 @@ fn read_dollar(
         }
         let name = std::str::from_utf8(&bytes[start..j]).unwrap();
         if name.is_empty() {
-            return Err(ShellError::ParseError {
-                msg: "empty `${}`".into(),
-                pos: abs_start + i,
-            });
+            return Err(ShellError::ParseError { msg: "empty `${}`".into(), pos: abs_start + i });
         }
         parts.push(WordPart::Var(name.to_string()));
         Ok(j + 1)

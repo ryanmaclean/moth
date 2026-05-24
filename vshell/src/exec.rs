@@ -110,12 +110,10 @@ impl VShell {
                     self.env.insert(k, val);
                     self.last_exit = 0;
                 }
-                Item::Seq(seq) => {
-                    match self.run_sequence(&seq, Io::capture(stdout, stderr))? {
-                        Flow::Done(code) => self.last_exit = code,
-                        Flow::Exit(code) => return Ok(code),
-                    }
-                }
+                Item::Seq(seq) => match self.run_sequence(&seq, Io::capture(stdout, stderr))? {
+                    Flow::Done(code) => self.last_exit = code,
+                    Flow::Exit(code) => return Ok(code),
+                },
             }
         }
         Ok(self.last_exit)
@@ -236,8 +234,7 @@ impl VShell {
         }
 
         // Wire stdio.
-        let want_stderr_to_stdout =
-            cmd.redirects.iter().any(|r| matches!(r, Redirect::Err2Out));
+        let want_stderr_to_stdout = cmd.redirects.iter().any(|r| matches!(r, Redirect::Err2Out));
 
         if let Some(path) = rio.stdin_file.take() {
             child_cmd.stdin(Stdio::from(File::open(&path).map_err(ShellError::Io)?));
@@ -267,10 +264,7 @@ impl VShell {
             // Re-open the file in append mode to match POSIX semantics for `>file 2>&1`.
             // Simplification: reopen the same path with append, which works for our redirects.
             if let Some(path) = redirect_target_path(cmd, self, io.stderr)? {
-                let f = OpenOptions::new()
-                    .append(true)
-                    .open(path)
-                    .map_err(ShellError::Io)?;
+                let f = OpenOptions::new().append(true).open(path).map_err(ShellError::Io)?;
                 child_cmd.stderr(Stdio::from(f));
             } else {
                 child_cmd.stderr(Stdio::piped());
@@ -314,8 +308,7 @@ impl VShell {
             spawn_reader(stderr_pipe, OUTPUT_CAP_BYTES, overflow.clone(), OVERFLOW_STDERR);
 
         let deadline = Instant::now().checked_add(self.timeout);
-        let outcome =
-            wait_with_supervision(&mut child, deadline, self.cancel.as_ref(), &overflow);
+        let outcome = wait_with_supervision(&mut child, deadline, self.cancel.as_ref(), &overflow);
 
         if let Some(j) = stdin_join {
             let _ = j.join();
@@ -435,11 +428,8 @@ impl VShell {
                 }
             }
             Builtin::Exit => {
-                let code = if argv.len() > 1 {
-                    argv[1].parse().unwrap_or(2)
-                } else {
-                    self.last_exit
-                };
+                let code =
+                    if argv.len() > 1 { argv[1].parse().unwrap_or(2) } else { self.last_exit };
                 io.stdout.extend_from_slice(&out_local);
                 io.stderr.extend_from_slice(&err_local);
                 return Ok(Flow::Exit(code));
@@ -495,11 +485,7 @@ impl VShell {
             }
             Redirect::StdoutAppend(w) | Redirect::StderrAppend(w) => {
                 let p = self.expand_word_to_path(w)?;
-                OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&p)
-                    .map_err(ShellError::Io)?;
+                OpenOptions::new().create(true).append(true).open(&p).map_err(ShellError::Io)?;
             }
             Redirect::Stdin(_) | Redirect::Err2Out => {}
         }

@@ -59,11 +59,7 @@ impl MockModel {
     /// [`Model::stream`] replays `scripts[0]`, the second replays
     /// `scripts[1]`, and so on; once exhausted the cursor wraps to 0.
     pub fn new(scripts: Vec<Vec<ModelEvent>>) -> Self {
-        Self {
-            scripts: Mutex::new(scripts),
-            cursor: Mutex::new(0),
-            seen: Mutex::new(Vec::new()),
-        }
+        Self { scripts: Mutex::new(scripts), cursor: Mutex::new(0), seen: Mutex::new(Vec::new()) }
     }
 
     /// Convenience for the common single-turn case (e.g. one `TextDelta`

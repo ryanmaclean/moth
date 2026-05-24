@@ -126,13 +126,11 @@ mod tests {
 
     #[test]
     fn bash_tool_executes_via_instance() {
-        let sb: Box<dyn Sandbox> = Box::new(MockSandbox::new(vec![
-            crate::sandbox::ShellResult {
-                exit_code: 0,
-                stdout: b"hello\n".to_vec(),
-                stderr: Vec::new(),
-            },
-        ]));
+        let sb: Box<dyn Sandbox> = Box::new(MockSandbox::new(vec![crate::sandbox::ShellResult {
+            exit_code: 0,
+            stdout: b"hello\n".to_vec(),
+            stderr: Vec::new(),
+        }]));
         let inst = spawn(Instance::new("t", sb));
         let ctx = ToolCtx { instance: &inst.addr };
         let out = BashTool.call(r#"{"command":"echo hello"}"#, &ctx).unwrap();
@@ -142,13 +140,11 @@ mod tests {
 
     #[test]
     fn bash_tool_propagates_nonzero_exit_and_stderr() {
-        let sb: Box<dyn Sandbox> = Box::new(MockSandbox::new(vec![
-            crate::sandbox::ShellResult {
-                exit_code: 2,
-                stdout: b"out\n".to_vec(),
-                stderr: b"oops\n".to_vec(),
-            },
-        ]));
+        let sb: Box<dyn Sandbox> = Box::new(MockSandbox::new(vec![crate::sandbox::ShellResult {
+            exit_code: 2,
+            stdout: b"out\n".to_vec(),
+            stderr: b"oops\n".to_vec(),
+        }]));
         let inst = spawn(Instance::new("t", sb));
         let ctx = ToolCtx { instance: &inst.addr };
         let out = BashTool.call(r#"{"command":"x"}"#, &ctx).unwrap();

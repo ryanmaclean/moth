@@ -514,10 +514,7 @@ mod tests {
         let elapsed = start.elapsed();
         // Should kill via SIGTERM within ~1s; SIGKILL grace is 5s but `sleep`
         // exits on SIGTERM immediately.
-        assert!(
-            elapsed < Duration::from_secs(3),
-            "expected fast timeout, took {elapsed:?}"
-        );
+        assert!(elapsed < Duration::from_secs(3), "expected fast timeout, took {elapsed:?}");
         assert_eq!(r.exit_code, 124, "stderr: {}", s(&r.stderr));
         assert!(
             s(&r.stderr).contains("timeout"),
@@ -555,9 +552,8 @@ mod tests {
     #[test]
     fn cancel_token_set_terminates_in_flight_child() {
         let cancel = Arc::new(AtomicBool::new(false));
-        let mut sh = VShell::new()
-            .with_timeout(Duration::from_secs(60))
-            .with_cancel(cancel.clone());
+        let mut sh =
+            VShell::new().with_timeout(Duration::from_secs(60)).with_cancel(cancel.clone());
 
         // Flip the flag after 100ms from another thread.
         let flipper = {
@@ -573,10 +569,7 @@ mod tests {
         let elapsed = start.elapsed();
         let _ = flipper.join();
 
-        assert!(
-            elapsed < Duration::from_secs(2),
-            "cancel should kill promptly, took {elapsed:?}"
-        );
+        assert!(elapsed < Duration::from_secs(2), "cancel should kill promptly, took {elapsed:?}");
         assert_eq!(r.exit_code, 130, "stderr: {}", s(&r.stderr));
         assert!(s(&r.stderr).contains("cancelled"));
     }

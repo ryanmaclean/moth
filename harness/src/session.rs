@@ -21,9 +21,7 @@ use actor::{Actor, ActorRef};
 use wire::find_tag;
 
 use crate::instance::InstanceMsg;
-use crate::model::{
-    ChatMessage, ContentBlock, Model, ModelEvent, ModelRequest, Role, ToolDef,
-};
+use crate::model::{ChatMessage, ContentBlock, Model, ModelEvent, ModelRequest, Role, ToolDef};
 use crate::persist::SessionStore;
 use crate::sandbox::{SandboxError, ShellResult};
 use crate::tools::{Tool, ToolCtx, default_tools};
@@ -39,8 +37,7 @@ const MAX_TURNS_PER_PROMPT: usize = 64;
 /// Callback that may shorten `messages` (typically by summarising older
 /// turns). Called by the iteration loop BEFORE each turn. Implementations
 /// should be best-effort: return the input unchanged on error.
-pub type CompactFn =
-    dyn Fn(Vec<ChatMessage>) -> Vec<ChatMessage> + Send + Sync;
+pub type CompactFn = dyn Fn(Vec<ChatMessage>) -> Vec<ChatMessage> + Send + Sync;
 
 pub struct HarnessState {
     pub name: String,
@@ -116,13 +113,7 @@ pub struct Session {
 
 impl Session {
     pub fn new(name: impl Into<String>, harness: Arc<HarnessState>) -> Self {
-        Self {
-            name: name.into(),
-            history: Vec::new(),
-            harness,
-            store: None,
-            last_persisted_len: 0,
-        }
+        Self { name: name.into(), history: Vec::new(), harness, store: None, last_persisted_len: 0 }
     }
 
     /// Attach a persistence store and load any previous history under
@@ -325,10 +316,9 @@ impl Session {
                 {
                     match store.snapshot(&self.name, &self.history) {
                         Ok(()) => self.last_persisted_len = self.history.len(),
-                        Err(e) => eprintln!(
-                            "session store snapshot failed for {}: {}",
-                            self.name, e
-                        ),
+                        Err(e) => {
+                            eprintln!("session store snapshot failed for {}: {}", self.name, e)
+                        }
                     }
                 }
             }
@@ -364,14 +354,14 @@ impl Session {
                     }
                     Ok(ModelEvent::ToolUseStart { id, name }) => {
                         if !current_text.is_empty() {
-                            blocks.push(ContentBlock::Text(
-                                Arc::from(std::mem::take(&mut current_text)),
-                            ));
+                            blocks.push(ContentBlock::Text(Arc::from(std::mem::take(
+                                &mut current_text,
+                            ))));
                         }
-                        if !emit(events, StreamEvent::ToolUseStart {
-                            id: id.clone(),
-                            name: name.clone(),
-                        }) {
+                        if !emit(
+                            events,
+                            StreamEvent::ToolUseStart { id: id.clone(), name: name.clone() },
+                        ) {
                             cancelled = true;
                             break;
                         }
@@ -411,9 +401,7 @@ impl Session {
 
             // Flush any pending blocks the stream didn't terminate cleanly.
             if !current_text.is_empty() {
-                blocks.push(ContentBlock::Text(
-                    Arc::from(std::mem::take(&mut current_text)),
-                ));
+                blocks.push(ContentBlock::Text(Arc::from(std::mem::take(&mut current_text))));
             }
             if let Some((id, name, input)) = current_tool.take() {
                 blocks.push(ContentBlock::ToolUse {
@@ -448,17 +436,17 @@ impl Session {
 
             // Emit per-turn summary BEFORE we possibly execute tools — this
             // lets observers (runlog, telemetry) checkpoint per turn.
-            if !emit(events, StreamEvent::TurnComplete { turn: turns, stop_reason: stop_reason.clone() }) {
+            if !emit(
+                events,
+                StreamEvent::TurnComplete { turn: turns, stop_reason: stop_reason.clone() },
+            ) {
                 let _ = emit(events, StreamEvent::Cancelled);
                 self.persist_tail();
                 outcome.set("cancelled");
                 return Ok(None);
             }
 
-            if completed
-                || tool_uses.is_empty()
-                || stop_reason.as_deref() == Some("end_turn")
-            {
+            if completed || tool_uses.is_empty() || stop_reason.as_deref() == Some("end_turn") {
                 break;
             }
 
@@ -466,11 +454,14 @@ impl Session {
             for (id, name, input) in tool_uses {
                 let block = self.execute_tool(&id, &name, &input);
                 if let ContentBlock::ToolResult { tool_use_id, content, is_error } = &block
-                    && !emit(events, StreamEvent::ToolResult {
-                        tool_use_id: tool_use_id.to_string(),
-                        content: content.to_string(),
-                        is_error: *is_error,
-                    })
+                    && !emit(
+                        events,
+                        StreamEvent::ToolResult {
+                            tool_use_id: tool_use_id.to_string(),
+                            content: content.to_string(),
+                            is_error: *is_error,
+                        },
+                    )
                 {
                     // Cancellation between tool calls: append what we have
                     // and bail.
@@ -518,11 +509,7 @@ impl Session {
         let result = tool.call(input, &ctx);
         let elapsed_ms = tool_started.elapsed().as_secs_f64() * 1000.0;
         let outcome = if result.is_ok() { "ok" } else { "error" };
-        self.harness.metrics.count(
-            "agent.tool.calls",
-            1,
-            &[("name", name), ("outcome", outcome)],
-        );
+        self.harness.metrics.count("agent.tool.calls", 1, &[("name", name), ("outcome", outcome)]);
         self.harness.metrics.timer(
             "agent.tool.duration_ms",
             elapsed_ms,
@@ -566,11 +553,7 @@ struct PromptOutcomeGuard<'a> {
 
 impl<'a> PromptOutcomeGuard<'a> {
     fn new(metrics: &'a metrics::Client) -> Self {
-        Self {
-            metrics,
-            start: std::time::Instant::now(),
-            outcome: std::cell::Cell::new("dropped"),
-        }
+        Self { metrics, start: std::time::Instant::now(), outcome: std::cell::Cell::new("dropped") }
     }
     fn set(&self, o: &'static str) {
         self.outcome.set(o);
@@ -580,11 +563,7 @@ impl<'a> PromptOutcomeGuard<'a> {
 impl<'a> Drop for PromptOutcomeGuard<'a> {
     fn drop(&mut self) {
         let ms = self.start.elapsed().as_secs_f64() * 1000.0;
-        self.metrics.timer(
-            "agent.prompt.duration_ms",
-            ms,
-            &[("outcome", self.outcome.get())],
-        );
+        self.metrics.timer("agent.prompt.duration_ms", ms, &[("outcome", self.outcome.get())]);
     }
 }
 
@@ -599,12 +578,8 @@ mod tests {
     fn rig(
         model_scripts: Vec<Vec<ModelEvent>>,
         sandbox_responses: Vec<ShellResult>,
-    ) -> (
-        actor::Spawned<InstanceMsg>,
-        actor::Spawned<SessionMsg>,
-        Arc<MockModel>,
-        Arc<MockSandbox>,
-    ) {
+    ) -> (actor::Spawned<InstanceMsg>, actor::Spawned<SessionMsg>, Arc<MockModel>, Arc<MockSandbox>)
+    {
         let sandbox = Arc::new(MockSandbox::new(sandbox_responses));
         let instance = spawn(Instance::new("inst-1", Box::new(SandboxRef(sandbox.clone()))));
         let model = Arc::new(MockModel::new(model_scripts));
@@ -704,20 +679,11 @@ mod tests {
         let second = &seen[1];
         assert_eq!(second.messages.len(), 3);
         assert_eq!(second.messages[0].role, Role::User);
-        assert_eq!(
-            second.messages[0].content,
-            vec![ContentBlock::Text("one".into())]
-        );
+        assert_eq!(second.messages[0].content, vec![ContentBlock::Text("one".into())]);
         assert_eq!(second.messages[1].role, Role::Assistant);
-        assert_eq!(
-            second.messages[1].content,
-            vec![ContentBlock::Text("first reply".into())]
-        );
+        assert_eq!(second.messages[1].content, vec![ContentBlock::Text("first reply".into())]);
         assert_eq!(second.messages[2].role, Role::User);
-        assert_eq!(
-            second.messages[2].content,
-            vec![ContentBlock::Text("two".into())]
-        );
+        assert_eq!(second.messages[2].content, vec![ContentBlock::Text("two".into())]);
 
         session.join().unwrap();
         instance.join().unwrap();
@@ -781,19 +747,13 @@ mod tests {
 
     #[test]
     fn shell_routes_through_instance() {
-        let recorded_response = ShellResult {
-            exit_code: 0,
-            stdout: b"ok\n".to_vec(),
-            stderr: Vec::new(),
-        };
+        let recorded_response =
+            ShellResult { exit_code: 0, stdout: b"ok\n".to_vec(), stderr: Vec::new() };
         let (instance, session, _model, _sb) = rig(vec![], vec![recorded_response]);
 
         let res = session
             .addr
-            .ask(|reply| SessionMsg::Shell {
-                cmd: "echo ok".into(),
-                reply,
-            })
+            .ask(|reply| SessionMsg::Shell { cmd: "echo ok".into(), reply })
             .unwrap()
             .unwrap();
 
@@ -818,10 +778,7 @@ mod tests {
         let (instance, session, model, sandbox) = rig(
             vec![
                 vec![
-                    ModelEvent::ToolUseStart {
-                        id: "toolu_1".into(),
-                        name: "bash".into(),
-                    },
+                    ModelEvent::ToolUseStart { id: "toolu_1".into(), name: "bash".into() },
                     ModelEvent::ToolUseInputDelta(r#"{"command":"echo hi"}"#.into()),
                     ModelEvent::BlockStop,
                     ModelEvent::Stop { reason: Some("tool_use".into()) },
@@ -831,11 +788,7 @@ mod tests {
                     ModelEvent::Stop { reason: Some("end_turn".into()) },
                 ],
             ],
-            vec![ShellResult {
-                exit_code: 0,
-                stdout: b"hi\n".to_vec(),
-                stderr: Vec::new(),
-            }],
+            vec![ShellResult { exit_code: 0, stdout: b"hi\n".to_vec(), stderr: Vec::new() }],
         );
 
         let res = session
@@ -880,10 +833,7 @@ mod tests {
         let scripts: Vec<Vec<ModelEvent>> = (0..MAX_TURNS_PER_PROMPT + 2)
             .map(|_| {
                 vec![
-                    ModelEvent::ToolUseStart {
-                        id: "toolu_x".into(),
-                        name: "bash".into(),
-                    },
+                    ModelEvent::ToolUseStart { id: "toolu_x".into(), name: "bash".into() },
                     ModelEvent::ToolUseInputDelta(r#"{"command":"true"}"#.into()),
                     ModelEvent::BlockStop,
                     ModelEvent::Stop { reason: Some("tool_use".into()) },
@@ -891,11 +841,7 @@ mod tests {
             })
             .collect();
         let responses: Vec<ShellResult> = (0..MAX_TURNS_PER_PROMPT + 2)
-            .map(|_| ShellResult {
-                exit_code: 0,
-                stdout: Vec::new(),
-                stderr: Vec::new(),
-            })
+            .map(|_| ShellResult { exit_code: 0, stdout: Vec::new(), stderr: Vec::new() })
             .collect();
 
         let (instance, session, _model, _sb) = rig(scripts, responses);
@@ -923,15 +869,11 @@ mod tests {
         store
             .append(
                 "resumed",
-                &[
-                    ChatMessage::user("hello?"),
-                    ChatMessage::assistant("earlier reply"),
-                ],
+                &[ChatMessage::user("hello?"), ChatMessage::assistant("earlier reply")],
             )
             .unwrap();
 
-        let sandbox: Box<dyn crate::sandbox::Sandbox> =
-            Box::new(MockSandbox::new(vec![]));
+        let sandbox: Box<dyn crate::sandbox::Sandbox> = Box::new(MockSandbox::new(vec![]));
         let instance = spawn(Instance::new("inst", sandbox));
         let model = Arc::new(MockModel::single(vec![
             ModelEvent::TextDelta("new reply".into()),
@@ -959,10 +901,7 @@ mod tests {
         assert_eq!(seen.len(), 1);
         // Resumed user, resumed assistant, new user — 3 messages.
         assert_eq!(seen[0].messages.len(), 3);
-        assert_eq!(
-            seen[0].messages[0].content,
-            vec![ContentBlock::Text("hello?".into())]
-        );
+        assert_eq!(seen[0].messages[0].content, vec![ContentBlock::Text("hello?".into())]);
 
         // Store saw an append call after the prompt.
         assert!(*store.append_calls.lock().unwrap() >= 1);
@@ -979,10 +918,7 @@ mod tests {
         let (instance, session, model, _sb) = rig(
             vec![
                 vec![
-                    ModelEvent::ToolUseStart {
-                        id: "toolu_1".into(),
-                        name: "bash".into(),
-                    },
+                    ModelEvent::ToolUseStart { id: "toolu_1".into(), name: "bash".into() },
                     ModelEvent::ToolUseInputDelta("not json".into()),
                     ModelEvent::BlockStop,
                     ModelEvent::Stop { reason: Some("tool_use".into()) },
@@ -1115,10 +1051,7 @@ mod tests {
         let (instance, session, _model, sandbox) = rig(
             vec![
                 vec![
-                    ModelEvent::ToolUseStart {
-                        id: "toolu_1".into(),
-                        name: "bash".into(),
-                    },
+                    ModelEvent::ToolUseStart { id: "toolu_1".into(), name: "bash".into() },
                     ModelEvent::ToolUseInputDelta(r#"{"command":"echo hi"}"#.into()),
                     ModelEvent::BlockStop,
                     ModelEvent::Stop { reason: Some("tool_use".into()) },
@@ -1128,11 +1061,7 @@ mod tests {
                     ModelEvent::Stop { reason: Some("end_turn".into()) },
                 ],
             ],
-            vec![ShellResult {
-                exit_code: 0,
-                stdout: b"hi\n".to_vec(),
-                stderr: Vec::new(),
-            }],
+            vec![ShellResult { exit_code: 0, stdout: b"hi\n".to_vec(), stderr: Vec::new() }],
         );
 
         let (tx, rx) = sync_channel::<StreamEvent>(256);
@@ -1185,8 +1114,7 @@ mod tests {
             msgs
         });
 
-        let sandbox: Box<dyn crate::sandbox::Sandbox> =
-            Box::new(MockSandbox::new(vec![]));
+        let sandbox: Box<dyn crate::sandbox::Sandbox> = Box::new(MockSandbox::new(vec![]));
         let inst = spawn(Instance::new("ci", sandbox));
         let model = Arc::new(MockModel::new(vec![
             vec![
@@ -1226,8 +1154,8 @@ mod tests {
         // Two prompts → two turns → compactor invoked twice.
         let seen = calls.lock().unwrap();
         assert_eq!(seen.len(), 2);
-        assert_eq!(seen[0].len(), 1);     // just `one`
-        assert_eq!(seen[1].len(), 3);     // user(one), assistant(first), user(two)
+        assert_eq!(seen[0].len(), 1); // just `one`
+        assert_eq!(seen[1].len(), 3); // user(one), assistant(first), user(two)
 
         sess.join().unwrap();
         inst.join().unwrap();
@@ -1241,19 +1169,16 @@ mod tests {
         // run a prompt that fires a tool call, then drain the socket and
         // grep for the expected metric lines.
         let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
-        receiver
-            .set_read_timeout(Some(std::time::Duration::from_millis(200)))
-            .unwrap();
+        receiver.set_read_timeout(Some(std::time::Duration::from_millis(200))).unwrap();
         let addr = receiver.local_addr().unwrap().to_string();
         let client = std::sync::Arc::new(metrics::Client::new(addr).unwrap());
 
-        let sandbox: Box<dyn crate::sandbox::Sandbox> = Box::new(MockSandbox::new(vec![
-            crate::sandbox::ShellResult {
+        let sandbox: Box<dyn crate::sandbox::Sandbox> =
+            Box::new(MockSandbox::new(vec![crate::sandbox::ShellResult {
                 exit_code: 0,
                 stdout: b"ok\n".to_vec(),
                 stderr: Vec::new(),
-            },
-        ]));
+            }]));
         let inst = spawn(Instance::new("ci", sandbox));
         let model = Arc::new(MockModel::new(vec![
             vec![
@@ -1268,8 +1193,7 @@ mod tests {
             ],
         ]));
         let state = Arc::new(
-            HarnessState::new("m", model as Arc<dyn Model>, inst.addr.clone())
-                .with_metrics(client),
+            HarnessState::new("m", model as Arc<dyn Model>, inst.addr.clone()).with_metrics(client),
         );
         let sess = spawn(Session::new("s", state));
 

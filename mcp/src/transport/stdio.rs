@@ -33,21 +33,10 @@ impl StdioTransport {
     /// silently dropped on a buffer that no one's reading).
     pub fn spawn(command: &str, args: &[&str]) -> Result<Self, String> {
         let mut cmd = Command::new(command);
-        cmd.args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| format!("spawn {command}: {e}"))?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| "stdin not piped".to_string())?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| "stdout not piped".to_string())?;
+        cmd.args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit());
+        let mut child = cmd.spawn().map_err(|e| format!("spawn {command}: {e}"))?;
+        let stdin = child.stdin.take().ok_or_else(|| "stdin not piped".to_string())?;
+        let stdout = child.stdout.take().ok_or_else(|| "stdout not piped".to_string())?;
         Ok(Self {
             child: Mutex::new(child),
             stdin: Mutex::new(stdin),
@@ -68,9 +57,7 @@ impl StdioTransport {
 impl Transport for StdioTransport {
     fn send_line(&self, line: &[u8]) -> Result<(), String> {
         let mut stdin = self.stdin.lock().map_err(|e| e.to_string())?;
-        stdin
-            .write_all(line)
-            .map_err(|e| format!("write: {e}"))?;
+        stdin.write_all(line).map_err(|e| format!("write: {e}"))?;
         stdin.write_all(b"\n").map_err(|e| format!("write: {e}"))?;
         stdin.flush().map_err(|e| format!("flush: {e}"))?;
         Ok(())

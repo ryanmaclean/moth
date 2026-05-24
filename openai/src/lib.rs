@@ -41,10 +41,7 @@ pub struct Client {
 
 impl Client {
     pub fn new(api_key: String) -> Self {
-        Self {
-            api_key,
-            base_url: "https://api.openai.com".into(),
-        }
+        Self { api_key, base_url: "https://api.openai.com".into() }
     }
 
     /// Override the API host. Useful for OpenRouter, LM Studio, Ollama, etc.
@@ -119,13 +116,18 @@ pub enum Role {
 #[derive(Debug, PartialEq)]
 pub enum Event {
     TextDelta(String),
-    ToolUseStart { id: String, name: String },
+    ToolUseStart {
+        id: String,
+        name: String,
+    },
     ToolUseInputDelta(String),
     ContentBlockStop,
     /// `reason` is canonicalised to the anthropic vocabulary where possible
     /// (`stop`→`end_turn`, `tool_calls`→`tool_use`) so a caller driving both
     /// providers can share the loop termination logic.
-    Stop { reason: Option<String> },
+    Stop {
+        reason: Option<String>,
+    },
     Other(String),
 }
 
@@ -202,9 +204,8 @@ impl Iterator for EventStream {
                 Ok(Chunk::Data(b)) => {
                     if let Err(e) = self.framer.push(&b) {
                         self.done = true;
-                        self.terminal = Some(Error::InvalidResponse(format!(
-                            "frame exceeds 4 MiB cap: {e}"
-                        )));
+                        self.terminal =
+                            Some(Error::InvalidResponse(format!("frame exceeds 4 MiB cap: {e}")));
                     }
                 }
                 Ok(Chunk::End(Ok(_))) => {
@@ -251,9 +252,8 @@ impl EventStream {
                 Ok(Chunk::Data(b)) => {
                     if let Err(e) = self.framer.push(&b) {
                         self.done = true;
-                        self.terminal = Some(Error::InvalidResponse(format!(
-                            "frame exceeds 4 MiB cap: {e}"
-                        )));
+                        self.terminal =
+                            Some(Error::InvalidResponse(format!("frame exceeds 4 MiB cap: {e}")));
                     }
                 }
                 Ok(Chunk::End(Ok(_))) => {
@@ -562,9 +562,9 @@ mod tests {
             tools: vec![],
         };
         let body = serialize_request(&req);
-        assert!(body.contains(
-            r#"{"role":"tool","tool_call_id":"call_1","content":"file1\nfile2\n"}"#
-        ));
+        assert!(
+            body.contains(r#"{"role":"tool","tool_call_id":"call_1","content":"file1\nfile2\n"}"#)
+        );
         // No user wrapper, no `tool_calls` field.
         assert!(!body.contains(r#""role":"user""#));
     }
@@ -577,14 +577,8 @@ mod tests {
             messages: vec![Message {
                 role: Role::User,
                 content: vec![
-                    ContentBlock::ToolResult {
-                        tool_use_id: "call_1".into(),
-                        content: "a".into(),
-                    },
-                    ContentBlock::ToolResult {
-                        tool_use_id: "call_2".into(),
-                        content: "b".into(),
-                    },
+                    ContentBlock::ToolResult { tool_use_id: "call_1".into(), content: "a".into() },
+                    ContentBlock::ToolResult { tool_use_id: "call_2".into(), content: "b".into() },
                 ],
             }],
             system: None,

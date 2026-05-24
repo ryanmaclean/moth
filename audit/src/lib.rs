@@ -167,10 +167,9 @@ impl Scanner {
                 .and_then(Json::as_str)
                 .ok_or_else(|| ScannerError::BadJson(format!("patterns[{i}] missing 'label'")))?
                 .to_string();
-            let sev_str = item
-                .get("severity")
-                .and_then(Json::as_str)
-                .ok_or_else(|| ScannerError::BadJson(format!("patterns[{i}] missing 'severity'")))?;
+            let sev_str = item.get("severity").and_then(Json::as_str).ok_or_else(|| {
+                ScannerError::BadJson(format!("patterns[{i}] missing 'severity'"))
+            })?;
             let severity = parse_severity(sev_str)?;
             let needle_str = item
                 .get("needle")
@@ -179,11 +178,7 @@ impl Scanner {
             if needle_str.is_empty() {
                 return Err(ScannerError::EmptyNeedle);
             }
-            patterns.push(Pattern {
-                needle: needle_str.as_bytes().to_vec(),
-                severity,
-                label,
-            });
+            patterns.push(Pattern { needle: needle_str.as_bytes().to_vec(), severity, label });
         }
 
         Ok(Self::new(patterns))
@@ -222,11 +217,7 @@ impl Scanner {
             for &pi in &nodes[state].output {
                 let p = &self.patterns[pi as usize];
                 let offset = i + 1 - p.needle.len();
-                out.push(Finding {
-                    label: p.label.clone(),
-                    severity: p.severity,
-                    offset,
-                });
+                out.push(Finding { label: p.label.clone(), severity: p.severity, offset });
             }
         }
         out
@@ -234,10 +225,7 @@ impl Scanner {
 
     /// Convenience: `Block`-severity findings only.
     pub fn blocking(&self, haystack: &[u8]) -> Vec<Finding> {
-        self.scan(haystack)
-            .into_iter()
-            .filter(|f| f.severity == Severity::Block)
-            .collect()
+        self.scan(haystack).into_iter().filter(|f| f.severity == Severity::Block).collect()
     }
 
     /// Serialise this scanner's pattern set back to the JSON file format.
@@ -314,10 +302,7 @@ impl LiveScanner {
 
     /// Convenience: read a pattern file from disk and `swap` to it.
     /// If parsing fails the existing scanner is left untouched.
-    pub fn reload_from_path(
-        &self,
-        path: impl AsRef<std::path::Path>,
-    ) -> Result<(), ScannerError> {
+    pub fn reload_from_path(&self, path: impl AsRef<std::path::Path>) -> Result<(), ScannerError> {
         let next = Scanner::from_path(path)?;
         self.swap(next);
         Ok(())
@@ -777,11 +762,8 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::thread;
 
-        let live = StdArc::new(LiveScanner::new(Scanner::new(vec![pat(
-            b"x",
-            Severity::Warn,
-            "x",
-        )])));
+        let live =
+            StdArc::new(LiveScanner::new(Scanner::new(vec![pat(b"x", Severity::Warn, "x")])));
         let stop = StdArc::new(AtomicBool::new(false));
 
         // Two readers, looping `load + scan`.

@@ -26,7 +26,9 @@ fn bench_json_text_delta_event() {
 fn bench_json_1k_object() {
     // 1 KiB-ish JSON object with mixed scalars and a nested array.
     // Stays within RFC 8259, no string escapes.
-    let mut s = String::from(r#"{"id":"msg_01ABCDEFG","type":"message","role":"assistant","model":"claude-opus-4-7","content":[{"type":"text","text":""#);
+    let mut s = String::from(
+        r#"{"id":"msg_01ABCDEFG","type":"message","role":"assistant","model":"claude-opus-4-7","content":[{"type":"text","text":""#,
+    );
     while s.len() < 950 {
         s.push_str("lorem ipsum dolor sit amet ");
     }

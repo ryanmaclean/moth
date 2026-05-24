@@ -3,9 +3,7 @@
 //! `model.rs` / `sandbox.rs`; the adapters keep all the per-provider
 //! type mapping out of the orchestration layer.
 
-use crate::model::{
-    ChatMessage, ContentBlock, Model, ModelError, ModelEvent, ModelRequest, Role,
-};
+use crate::model::{ChatMessage, ContentBlock, Model, ModelError, ModelEvent, ModelRequest, Role};
 use crate::sandbox::{Sandbox, SandboxError, ShellResult};
 
 pub struct AnthropicModel {
@@ -175,11 +173,7 @@ fn map_oa_event(
 impl Sandbox for vshell::VShell {
     fn execute(&mut self, cmd: &str) -> Result<ShellResult, SandboxError> {
         let r = vshell::VShell::execute(self, cmd);
-        Ok(ShellResult {
-            exit_code: r.exit_code,
-            stdout: r.stdout,
-            stderr: r.stderr,
-        })
+        Ok(ShellResult { exit_code: r.exit_code, stdout: r.stdout, stderr: r.stderr })
     }
 }
 
@@ -228,9 +222,7 @@ mod tests {
         let inst = spawn(Instance::new("t1", sandbox));
 
         let (tx, rx) = sync_channel(1);
-        inst.addr
-            .send(InstanceMsg::Shell { cmd: "echo hello".to_string(), reply: tx })
-            .unwrap();
+        inst.addr.send(InstanceMsg::Shell { cmd: "echo hello".to_string(), reply: tx }).unwrap();
         let result = rx.recv().unwrap().unwrap();
         assert_eq!(result.exit_code, 0);
         assert_eq!(result.stdout, b"hello\n");
@@ -245,9 +237,7 @@ mod tests {
         let inst = spawn(Instance::new("t2", sandbox));
 
         let (tx, rx) = sync_channel(1);
-        inst.addr
-            .send(InstanceMsg::Shell { cmd: "false".to_string(), reply: tx })
-            .unwrap();
+        inst.addr.send(InstanceMsg::Shell { cmd: "false".to_string(), reply: tx }).unwrap();
         assert_eq!(rx.recv().unwrap().unwrap().exit_code, 1);
 
         inst.join().unwrap();
@@ -281,9 +271,7 @@ mod tests {
         assert!(pr.structured.is_none());
 
         let (tx, rx) = sync_channel(1);
-        sess.addr
-            .send(SessionMsg::Shell { cmd: "pwd".to_string(), reply: tx })
-            .unwrap();
+        sess.addr.send(SessionMsg::Shell { cmd: "pwd".to_string(), reply: tx }).unwrap();
         let sr = rx.recv().unwrap().unwrap();
         assert_eq!(sr.exit_code, 0);
         assert!(!sr.stdout.is_empty());
@@ -294,8 +282,7 @@ mod tests {
 
     #[test]
     fn audited_shell_blocks_pipe_to_bash() {
-        let sandbox: Box<dyn Sandbox> =
-            Box::new(AuditedShell::new(vshell::VShell::new()));
+        let sandbox: Box<dyn Sandbox> = Box::new(AuditedShell::new(vshell::VShell::new()));
         let inst = spawn(Instance::new("audited", sandbox));
 
         let (tx, rx) = sync_channel(1);
@@ -314,14 +301,11 @@ mod tests {
 
     #[test]
     fn audited_shell_passes_benign_commands() {
-        let sandbox: Box<dyn Sandbox> =
-            Box::new(AuditedShell::new(vshell::VShell::new()));
+        let sandbox: Box<dyn Sandbox> = Box::new(AuditedShell::new(vshell::VShell::new()));
         let inst = spawn(Instance::new("audited2", sandbox));
 
         let (tx, rx) = sync_channel(1);
-        inst.addr
-            .send(InstanceMsg::Shell { cmd: "echo ok".to_string(), reply: tx })
-            .unwrap();
+        inst.addr.send(InstanceMsg::Shell { cmd: "echo ok".to_string(), reply: tx }).unwrap();
         let r = rx.recv().unwrap().unwrap();
         assert_eq!(r.exit_code, 0);
         assert_eq!(r.stdout, b"ok\n");

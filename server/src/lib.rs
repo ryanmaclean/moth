@@ -161,11 +161,8 @@ impl Server {
                 // Bound the wait at 30s so a stuck handler can't hang
                 // process exit indefinitely; orchestrators that want
                 // longer drains should configure preStop separately.
-                let deadline = std::time::Instant::now()
-                    + std::time::Duration::from_secs(30);
-                while active.load(Ordering::Acquire) > 0
-                    && std::time::Instant::now() < deadline
-                {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                while active.load(Ordering::Acquire) > 0 && std::time::Instant::now() < deadline {
                     std::thread::sleep(std::time::Duration::from_millis(20));
                 }
                 return Ok(());
@@ -190,12 +187,7 @@ impl Server {
                     break;
                 }
                 if active
-                    .compare_exchange(
-                        current,
-                        current + 1,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    )
+                    .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
                     .is_ok()
                 {
                     // Successfully reserved a slot — apply timeouts and
@@ -274,11 +266,7 @@ impl Server {
         }
     }
 
-    fn dispatch(
-        &self,
-        req: Request,
-        stream: &mut TcpStream,
-    ) -> (ResponseKind, io::Result<()>) {
+    fn dispatch(&self, req: Request, stream: &mut TcpStream) -> (ResponseKind, io::Result<()>) {
         // Resolve the per-request correlation id: use the client-supplied
         // `X-Request-ID` if valid, otherwise mint a synthetic one. We do
         // this even for paths that won't reach a handler so ops endpoints
@@ -290,14 +278,8 @@ impl Server {
         // tenant-specific and shouldn't surface in the handler map.
         if req.method == "GET" {
             return match req.path.split('?').next().unwrap_or(&req.path) {
-                "/healthz" => (
-                    ResponseKind::Buffered,
-                    write_ops(stream, "ok\n", &request_id),
-                ),
-                "/readyz" => (
-                    ResponseKind::Buffered,
-                    write_ops(stream, "ok\n", &request_id),
-                ),
+                "/healthz" => (ResponseKind::Buffered, write_ops(stream, "ok\n", &request_id)),
+                "/readyz" => (ResponseKind::Buffered, write_ops(stream, "ok\n", &request_id)),
                 // Any other GET is 405 — `/agents/*` is POST-only.
                 _ => (
                     ResponseKind::Buffered,
@@ -484,30 +466,19 @@ fn parse_request<R: BufRead>(reader: &mut R) -> Result<Request, ParseError> {
 /// the request line), a peer that closes or read-times-out before sending
 /// any bytes returns `Ok(None)` — that's a clean keep-alive idle close,
 /// not a 408.
-fn read_line<R: BufRead>(
-    reader: &mut R,
-    allow_idle: bool,
-) -> Result<Option<String>, ParseError> {
+fn read_line<R: BufRead>(reader: &mut R, allow_idle: bool) -> Result<Option<String>, ParseError> {
     let mut buf = Vec::with_capacity(128);
     let mut any = false;
     loop {
         let chunk = match reader.fill_buf() {
             Ok(c) => c,
             Err(e) if is_timeout(&e) => {
-                return if any || !allow_idle {
-                    Err(ParseError::Timeout)
-                } else {
-                    Ok(None)
-                };
+                return if any || !allow_idle { Err(ParseError::Timeout) } else { Ok(None) };
             }
             Err(_) => return Err(ParseError::Malformed),
         };
         if chunk.is_empty() {
-            return if any || !allow_idle {
-                Err(ParseError::Malformed)
-            } else {
-                Ok(None)
-            };
+            return if any || !allow_idle { Err(ParseError::Malformed) } else { Ok(None) };
         }
         any = true;
         if let Some(pos) = chunk.iter().position(|&b| b == b'\n') {
@@ -588,9 +559,8 @@ fn write_ops(w: &mut dyn Write, body_text: &str, request_id: &str) -> io::Result
 /// always differ. Not crypto-random — for log/metric joins only.
 fn generate_request_id() -> String {
     static SEQ: AtomicUsize = AtomicUsize::new(0);
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
+    let now =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
     let ms = now.as_millis();
     let nanos = now.subsec_nanos();
     let pid = std::process::id();
@@ -794,8 +764,7 @@ mod tests {
     #[test]
     fn one_mib_body_ok() {
         let (addr, _h) = spawn_server();
-        let mut req =
-            b"POST /agents/len/x HTTP/1.1\r\nContent-Length: 1048576\r\n\r\n".to_vec();
+        let mut req = b"POST /agents/len/x HTTP/1.1\r\nContent-Length: 1048576\r\n\r\n".to_vec();
         req.extend(std::iter::repeat_n(b'a', MAX_BODY));
         let resp = send(addr, &req);
         let (head, body) = split_headers_body(&resp);
@@ -821,8 +790,7 @@ mod tests {
     #[test]
     fn chunked_encoding_rejected() {
         let (addr, _h) = spawn_server();
-        let req =
-            b"POST /agents/echo/x HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
+        let req = b"POST /agents/echo/x HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
         let resp = send(addr, req);
         assert!(resp.starts_with(b"HTTP/1.1 400"));
     }
@@ -842,9 +810,7 @@ mod tests {
     fn multiple_sequential_requests_work() {
         let (addr, _h) = spawn_server();
         for i in 0..5 {
-            let req = format!(
-                "POST /agents/echo/id{i} HTTP/1.1\r\nContent-Length: 0\r\n\r\n"
-            );
+            let req = format!("POST /agents/echo/id{i} HTTP/1.1\r\nContent-Length: 0\r\n\r\n");
             let resp = send(addr, req.as_bytes());
             let (head, body) = split_headers_body(&resp);
             assert!(head.starts_with("HTTP/1.1 200 OK"));
@@ -919,9 +885,7 @@ mod tests {
             let count = count.clone();
             let errors = errors.clone();
             workers.push(thread::spawn(move || {
-                let req = format!(
-                    "POST /agents/echo/id{i} HTTP/1.1\r\nContent-Length: 0\r\n\r\n"
-                );
+                let req = format!("POST /agents/echo/id{i} HTTP/1.1\r\nContent-Length: 0\r\n\r\n");
                 let resp = send(addr, req.as_bytes());
                 let body = String::from_utf8_lossy(&resp).to_string();
                 if body.contains(&format!("event: start\ndata: id{i}\n\n")) {
@@ -953,10 +917,7 @@ mod tests {
     /// "partial request then stall".
     #[test]
     fn idle_connection_closes_after_read_timeout() {
-        let cfg = ServerConfig {
-            read_timeout: Duration::from_millis(100),
-            ..Default::default()
-        };
+        let cfg = ServerConfig { read_timeout: Duration::from_millis(100), ..Default::default() };
         let (addr, _h) = spawn_server_with(cfg);
         let mut s = TcpStream::connect(addr).unwrap();
         s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
@@ -972,10 +933,7 @@ mod tests {
     /// gets a 408 from the server.
     #[test]
     fn read_timeout_mid_request_returns_408() {
-        let cfg = ServerConfig {
-            read_timeout: Duration::from_millis(150),
-            ..Default::default()
-        };
+        let cfg = ServerConfig { read_timeout: Duration::from_millis(150), ..Default::default() };
         let (addr, _h) = spawn_server_with(cfg);
         let mut s = TcpStream::connect(addr).unwrap();
         s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
@@ -1010,10 +968,7 @@ mod tests {
                 Ok(())
             }
         }
-        let cfg = ServerConfig {
-            write_timeout: Duration::from_millis(200),
-            ..Default::default()
-        };
+        let cfg = ServerConfig { write_timeout: Duration::from_millis(200), ..Default::default() };
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let mut server = Server::new();
@@ -1023,8 +978,7 @@ mod tests {
         });
 
         let mut s = TcpStream::connect(addr).unwrap();
-        s.write_all(b"POST /agents/flood/x HTTP/1.1\r\nContent-Length: 0\r\n\r\n")
-            .unwrap();
+        s.write_all(b"POST /agents/flood/x HTTP/1.1\r\nContent-Length: 0\r\n\r\n").unwrap();
         // Don't read. The server's write_timeout should fire and the
         // handler thread should exit cleanly within a few seconds. We
         // probe by waiting then doing one short read to confirm no panic.
@@ -1075,8 +1029,7 @@ mod tests {
         let mut held = Vec::new();
         for _ in 0..4 {
             let mut s = TcpStream::connect(addr).unwrap();
-            s.write_all(b"POST /agents/block/x HTTP/1.1\r\nContent-Length: 0\r\n\r\n")
-                .unwrap();
+            s.write_all(b"POST /agents/block/x HTTP/1.1\r\nContent-Length: 0\r\n\r\n").unwrap();
             // Wait for the "hold" SSE event so we know the handler is
             // running and the slot is in use.
             s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
@@ -1120,7 +1073,11 @@ mod tests {
         s.write_all(b"POST /nope HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n").unwrap();
         let mut second = Vec::new();
         read_one_response(&mut s, &mut buf, &mut second);
-        assert!(second.starts_with(b"HTTP/1.1 404"), "second: {:?}", String::from_utf8_lossy(&second));
+        assert!(
+            second.starts_with(b"HTTP/1.1 404"),
+            "second: {:?}",
+            String::from_utf8_lossy(&second)
+        );
     }
 
     /// `Connection: close` on a non-SSE response terminates the socket
@@ -1161,10 +1118,7 @@ mod tests {
     /// a 1ms read timeout makes a slow client trip 408 almost immediately.
     #[test]
     fn serve_with_plumbs_config() {
-        let cfg = ServerConfig {
-            read_timeout: Duration::from_millis(50),
-            ..Default::default()
-        };
+        let cfg = ServerConfig { read_timeout: Duration::from_millis(50), ..Default::default() };
         let (addr, _h) = spawn_server_with(cfg);
         let mut s = TcpStream::connect(addr).unwrap();
         s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
@@ -1264,10 +1218,7 @@ mod tests {
         let resp = send(addr, req);
         let (head, body) = split_headers_body(&resp);
         assert!(head.starts_with("HTTP/1.1 200 OK"));
-        assert!(
-            head.contains("X-Request-ID: my-trace-123"),
-            "header missing X-Request-ID: {head}"
-        );
+        assert!(head.contains("X-Request-ID: my-trace-123"), "header missing X-Request-ID: {head}");
         let body = String::from_utf8(body).unwrap();
         assert!(
             body.contains("event: req\ndata: my-trace-123\n\n"),
@@ -1290,10 +1241,7 @@ mod tests {
             .lines()
             .find_map(|l| l.strip_prefix("X-Request-ID: "))
             .expect("X-Request-ID header present");
-        assert!(
-            header_id.starts_with("req-"),
-            "synthetic id has wrong prefix: {header_id:?}"
-        );
+        assert!(header_id.starts_with("req-"), "synthetic id has wrong prefix: {header_id:?}");
         // Shape: req-<ms>-<8 hex>
         let rest = &header_id["req-".len()..];
         let (ms, hex) = rest.split_once('-').expect("ms-hex split");

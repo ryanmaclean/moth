@@ -31,10 +31,7 @@ pub(crate) fn parse_frame(frame: &[u8]) -> Result<Event, Error> {
 
     if data.is_empty() {
         return Ok(Event::Other(
-            event_name
-                .and_then(|n| std::str::from_utf8(n).ok())
-                .unwrap_or("")
-                .to_string(),
+            event_name.and_then(|n| std::str::from_utf8(n).ok()).unwrap_or("").to_string(),
         ));
     }
 
@@ -72,16 +69,12 @@ pub(crate) fn parse_frame(frame: &[u8]) -> Result<Event, Error> {
                 let id = block
                     .get("id")
                     .and_then(Json::as_str)
-                    .ok_or_else(|| {
-                        Error::InvalidResponse("tool_use start: no id".into())
-                    })?
+                    .ok_or_else(|| Error::InvalidResponse("tool_use start: no id".into()))?
                     .to_string();
                 let name = block
                     .get("name")
                     .and_then(Json::as_str)
-                    .ok_or_else(|| {
-                        Error::InvalidResponse("tool_use start: no name".into())
-                    })?
+                    .ok_or_else(|| Error::InvalidResponse("tool_use start: no name".into()))?
                     .to_string();
                 Ok(Event::ToolUseStart { id, name })
             } else {
@@ -89,9 +82,9 @@ pub(crate) fn parse_frame(frame: &[u8]) -> Result<Event, Error> {
             }
         }
         "content_block_delta" => {
-            let delta = v.get("delta").ok_or_else(|| {
-                Error::InvalidResponse("content_block_delta: no delta".into())
-            })?;
+            let delta = v
+                .get("delta")
+                .ok_or_else(|| Error::InvalidResponse("content_block_delta: no delta".into()))?;
             let delta_ty = delta.get("type").and_then(Json::as_str).ok_or_else(|| {
                 Error::InvalidResponse("content_block_delta: no delta type".into())
             })?;
@@ -100,9 +93,7 @@ pub(crate) fn parse_frame(frame: &[u8]) -> Result<Event, Error> {
                     let text = delta
                         .get("text")
                         .and_then(Json::as_str)
-                        .ok_or_else(|| {
-                            Error::InvalidResponse("text_delta: no text".into())
-                        })?
+                        .ok_or_else(|| Error::InvalidResponse("text_delta: no text".into()))?
                         .to_string();
                     Ok(Event::TextDelta(text))
                 }
@@ -111,9 +102,7 @@ pub(crate) fn parse_frame(frame: &[u8]) -> Result<Event, Error> {
                         .get("partial_json")
                         .and_then(Json::as_str)
                         .ok_or_else(|| {
-                            Error::InvalidResponse(
-                                "input_json_delta: no partial_json".into(),
-                            )
+                            Error::InvalidResponse("input_json_delta: no partial_json".into())
                         })?
                         .to_string();
                     Ok(Event::ToolUseInputDelta(partial))
@@ -123,10 +112,8 @@ pub(crate) fn parse_frame(frame: &[u8]) -> Result<Event, Error> {
         }
         "content_block_stop" => Ok(Event::ContentBlockStop),
         "message_delta" => {
-            let stop_reason = v
-                .get("delta")
-                .and_then(|d| d.get("stop_reason"))
-                .and_then(|sr| match sr {
+            let stop_reason =
+                v.get("delta").and_then(|d| d.get("stop_reason")).and_then(|sr| match sr {
                     Json::Str(s) => Some(s.clone()),
                     _ => None,
                 });
@@ -181,10 +168,7 @@ mod tests {
     fn text_delta_with_escapes() {
         let frame = br#"event: content_block_delta
 data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"a\n\"b\""}}"#;
-        assert_eq!(
-            parse_frame(frame).unwrap(),
-            Event::TextDelta("a\n\"b\"".into())
-        );
+        assert_eq!(parse_frame(frame).unwrap(), Event::TextDelta("a\n\"b\"".into()));
     }
 
     #[test]
@@ -193,10 +177,7 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
 data: {"type":"message_start","message":{"id":"msg_01","model":"claude-opus-4-7","role":"assistant","content":[],"stop_reason":null}}"#;
         assert_eq!(
             parse_frame(frame).unwrap(),
-            Event::MessageStart {
-                id: "msg_01".into(),
-                model: "claude-opus-4-7".into()
-            }
+            Event::MessageStart { id: "msg_01".into(), model: "claude-opus-4-7".into() }
         );
     }
 
@@ -206,10 +187,7 @@ data: {"type":"message_start","message":{"id":"msg_01","model":"claude-opus-4-7"
 data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_01","name":"get_weather","input":{}}}"#;
         assert_eq!(
             parse_frame(frame).unwrap(),
-            Event::ToolUseStart {
-                id: "toolu_01".into(),
-                name: "get_weather".into()
-            }
+            Event::ToolUseStart { id: "toolu_01".into(), name: "get_weather".into() }
         );
     }
 
@@ -217,10 +195,7 @@ data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use"
     fn input_json_delta() {
         let frame = br#"event: content_block_delta
 data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"location\":"}}"#;
-        assert_eq!(
-            parse_frame(frame).unwrap(),
-            Event::ToolUseInputDelta("{\"location\":".into())
-        );
+        assert_eq!(parse_frame(frame).unwrap(), Event::ToolUseInputDelta("{\"location\":".into()));
     }
 
     #[test]
@@ -236,9 +211,7 @@ data: {"type":"content_block_stop","index":0}"#;
 data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":5}}"#;
         assert_eq!(
             parse_frame(frame).unwrap(),
-            Event::MessageDelta {
-                stop_reason: Some("end_turn".into())
-            }
+            Event::MessageDelta { stop_reason: Some("end_turn".into()) }
         );
     }
 
@@ -246,10 +219,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":
     fn message_delta_null_stop_reason() {
         let frame = br#"event: message_delta
 data: {"type":"message_delta","delta":{"stop_reason":null}}"#;
-        assert_eq!(
-            parse_frame(frame).unwrap(),
-            Event::MessageDelta { stop_reason: None }
-        );
+        assert_eq!(parse_frame(frame).unwrap(), Event::MessageDelta { stop_reason: None });
     }
 
     #[test]
@@ -269,10 +239,7 @@ data: {"type":"message_stop"}"#;
     fn unknown_event_type() {
         let frame = br#"event: future_thing
 data: {"type":"future_thing","x":1}"#;
-        assert_eq!(
-            parse_frame(frame).unwrap(),
-            Event::Other("future_thing".into())
-        );
+        assert_eq!(parse_frame(frame).unwrap(), Event::Other("future_thing".into()));
     }
 
     #[test]

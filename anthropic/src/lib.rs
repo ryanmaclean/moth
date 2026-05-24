@@ -29,12 +29,7 @@ impl Client {
     pub fn stream(&self, req: Request) -> Result<EventStream, Error> {
         let body = serialize_request(&req);
         let stream = post_stream(&self.api_key, body)?;
-        Ok(EventStream {
-            stream,
-            framer: SseFramer::new(),
-            done: false,
-            terminal: None,
-        })
+        Ok(EventStream { stream, framer: SseFramer::new(), done: false, terminal: None })
     }
 }
 
@@ -146,9 +141,8 @@ impl Iterator for EventStream {
                 Ok(Chunk::Data(b)) => {
                     if let Err(e) = self.framer.push(&b) {
                         self.done = true;
-                        self.terminal = Some(Error::InvalidResponse(format!(
-                            "frame exceeds 4 MiB cap: {e}"
-                        )));
+                        self.terminal =
+                            Some(Error::InvalidResponse(format!("frame exceeds 4 MiB cap: {e}")));
                     }
                 }
                 Ok(Chunk::End(Ok(_))) => {
@@ -181,9 +175,8 @@ impl EventStream {
                 Ok(Chunk::Data(b)) => {
                     if let Err(e) = self.framer.push(&b) {
                         self.done = true;
-                        self.terminal = Some(Error::InvalidResponse(format!(
-                            "frame exceeds 4 MiB cap: {e}"
-                        )));
+                        self.terminal =
+                            Some(Error::InvalidResponse(format!("frame exceeds 4 MiB cap: {e}")));
                     }
                 }
                 Ok(Chunk::End(Ok(_))) => {

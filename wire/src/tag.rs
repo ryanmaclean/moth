@@ -64,10 +64,7 @@ mod tests {
 
     #[test]
     fn basic() {
-        assert_eq!(
-            find_tag(b"<promise>COMPLETE</promise>", b"promise"),
-            Some(&b"COMPLETE"[..])
-        );
+        assert_eq!(find_tag(b"<promise>COMPLETE</promise>", b"promise"), Some(&b"COMPLETE"[..]));
     }
 
     #[test]

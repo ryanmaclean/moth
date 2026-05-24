@@ -79,11 +79,8 @@ pub fn substitute_warn_unused(
     args: &HashMap<&str, String>,
 ) -> Result<(String, Vec<String>), TmplError> {
     let (out, used) = substitute_impl(template, args)?;
-    let unused: Vec<String> = args
-        .keys()
-        .filter(|k| !used.contains(&k.to_string()))
-        .map(|k| k.to_string())
-        .collect();
+    let unused: Vec<String> =
+        args.keys().filter(|k| !used.contains(&k.to_string())).map(|k| k.to_string()).collect();
     Ok((out, unused))
 }
 
@@ -112,9 +109,7 @@ fn substitute_impl(
         // Find closing `}}` after the opening pair.
         let key_start = open + 2;
         if key_start > bytes.len() {
-            return Err(TmplError::BadFrontmatter(
-                "unterminated '{{' at end of template".into(),
-            ));
+            return Err(TmplError::BadFrontmatter("unterminated '{{' at end of template".into()));
         }
         let close_rel = scan_for_pair(&bytes[key_start..], b'}', b'}').ok_or_else(|| {
             TmplError::BadFrontmatter(format!(
@@ -141,9 +136,7 @@ fn substitute_impl(
 
 fn validate_key(key: &str, at: usize) -> Result<(), TmplError> {
     if key.is_empty() {
-        return Err(TmplError::BadFrontmatter(format!(
-            "empty key in '{{{{}}}}' at byte {at}"
-        )));
+        return Err(TmplError::BadFrontmatter(format!("empty key in '{{{{}}}}' at byte {at}")));
     }
     let mut chars = key.chars();
     let first = chars.next().unwrap();
@@ -403,11 +396,8 @@ mod tests {
 
     #[test]
     fn substitute_many_args() {
-        let out = substitute(
-            "{{A}}-{{B}}-{{C}}",
-            &args(&[("A", "1"), ("B", "2"), ("C", "3")]),
-        )
-        .unwrap();
+        let out =
+            substitute("{{A}}-{{B}}-{{C}}", &args(&[("A", "1"), ("B", "2"), ("C", "3")])).unwrap();
         assert_eq!(out, "1-2-3");
     }
 
@@ -482,11 +472,9 @@ mod tests {
 
     #[test]
     fn substitute_warn_unused_returns_unused_keys() {
-        let (out, unused) = substitute_warn_unused(
-            "use {{A}}",
-            &args(&[("A", "1"), ("B", "2"), ("C", "3")]),
-        )
-        .unwrap();
+        let (out, unused) =
+            substitute_warn_unused("use {{A}}", &args(&[("A", "1"), ("B", "2"), ("C", "3")]))
+                .unwrap();
         assert_eq!(out, "use 1");
         let mut unused = unused;
         unused.sort();
@@ -506,10 +494,7 @@ mod tests {
 
     fn unique_root(label: &str) -> PathBuf {
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let t = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let dir = std::env::temp_dir().join(format!("tmpl-test-{label}-{t}-{n}"));
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -539,9 +524,7 @@ mod tests {
         assert_eq!(s.name, "triage");
         assert_eq!(s.description.as_deref(), Some("Triage incoming issues"));
         assert_eq!(s.args, vec!["issue_number".to_string(), "severity".to_string()]);
-        let rendered = s
-            .render(&args(&[("ISSUE_NUMBER", "42"), ("SEVERITY", "high")]))
-            .unwrap();
+        let rendered = s.render(&args(&[("ISSUE_NUMBER", "42"), ("SEVERITY", "high")])).unwrap();
         assert_eq!(rendered, "Issue 42 (sev high).\n");
     }
 
@@ -595,11 +578,7 @@ mod tests {
     #[test]
     fn load_role_basic() {
         let root = unique_root("role-basic");
-        write_role(
-            &root,
-            "reviewer",
-            "---\nname: code-reviewer\n---\nYou are a code reviewer.\n",
-        );
+        write_role(&root, "reviewer", "---\nname: code-reviewer\n---\nYou are a code reviewer.\n");
         let r = load_role(&root, "reviewer").unwrap();
         assert_eq!(r.name, "code-reviewer");
         assert_eq!(r.system_prompt, "You are a code reviewer.\n");

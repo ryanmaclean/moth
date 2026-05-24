@@ -73,24 +73,14 @@ impl Client {
         let sock = UdpSocket::bind("0.0.0.0:0")?;
         sock.set_nonblocking(true)?;
         sock.connect(&addr)?;
-        Ok(Self {
-            sock: Some(sock),
-            addr,
-            prefix: String::new(),
-            constant_tags: Vec::new(),
-        })
+        Ok(Self { sock: Some(sock), addr, prefix: String::new(), constant_tags: Vec::new() })
     }
 
     /// Disabled client: every emit call is a no-op. Use this when
     /// `DOGSTATSD_ADDR` isn't set so call sites don't need conditionals.
     #[must_use]
     pub fn disabled() -> Self {
-        Self {
-            sock: None,
-            addr: String::new(),
-            prefix: String::new(),
-            constant_tags: Vec::new(),
-        }
+        Self { sock: None, addr: String::new(), prefix: String::new(), constant_tags: Vec::new() }
     }
 
     /// Build from `DOGSTATSD_ADDR`. Disabled when unset or invalid.
@@ -335,38 +325,23 @@ mod tests {
 
     #[test]
     fn single_tag() {
-        let s = render(
-            &m("agent.foo", Value::Int(1), Kind::Counter, &[("name", "value")]),
-            "",
-            &[],
-        );
+        let s =
+            render(&m("agent.foo", Value::Int(1), Kind::Counter, &[("name", "value")]), "", &[]);
         assert_eq!(s, "agent.foo:1|c|#name:value");
     }
 
     #[test]
     fn constant_tags_then_per_call() {
         let ct = vec![("env".into(), "prod".into()), ("host".into(), "h1".into())];
-        let s = render(
-            &m("agent.foo", Value::Int(1), Kind::Counter, &[("route", "/x")]),
-            "",
-            &ct,
-        );
+        let s = render(&m("agent.foo", Value::Int(1), Kind::Counter, &[("route", "/x")]), "", &ct);
         assert_eq!(s, "agent.foo:1|c|#env:prod,host:h1,route:/x");
     }
 
     #[test]
     fn tag_value_sanitisation() {
         // Each of `|`, `\n`, `,`, `:` becomes `_`.
-        let s = render(
-            &m(
-                "agent.foo",
-                Value::Int(1),
-                Kind::Counter,
-                &[("k", "a|b\nc,d:e")],
-            ),
-            "",
-            &[],
-        );
+        let s =
+            render(&m("agent.foo", Value::Int(1), Kind::Counter, &[("k", "a|b\nc,d:e")]), "", &[]);
         assert_eq!(s, "agent.foo:1|c|#k:a_b_c_d_e");
     }
 
@@ -403,10 +378,8 @@ mod tests {
 
     #[test]
     fn builder_chain() {
-        let c = Client::disabled()
-            .with_prefix("svc")
-            .with_tag("env", "test")
-            .with_tag("region", "lax");
+        let c =
+            Client::disabled().with_prefix("svc").with_tag("env", "test").with_tag("region", "lax");
         assert_eq!(c.prefix, "svc");
         assert_eq!(c.constant_tags.len(), 2);
         assert_eq!(c.constant_tags[0], ("env".into(), "test".into()));

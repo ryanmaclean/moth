@@ -40,19 +40,13 @@ impl SseFramer {
     /// has already been cleared and is no longer a useful container.
     pub fn push(&mut self, chunk: &[u8]) -> Result<(), FramerError> {
         if self.poisoned {
-            return Err(FramerError::Overflow {
-                max: self.max,
-                attempted: chunk.len(),
-            });
+            return Err(FramerError::Overflow { max: self.max, attempted: chunk.len() });
         }
         if self.buf.len().saturating_add(chunk.len()) > self.max {
             self.poisoned = true;
             self.buf.clear();
             self.buf.shrink_to_fit();
-            return Err(FramerError::Overflow {
-                max: self.max,
-                attempted: chunk.len(),
-            });
+            return Err(FramerError::Overflow { max: self.max, attempted: chunk.len() });
         }
         self.buf.extend_from_slice(chunk);
         Ok(())
@@ -110,10 +104,7 @@ mod tests {
     fn two_frames_one_chunk() {
         let mut f = SseFramer::new();
         f.push(b"event: a\ndata: 1\n\ndata: 2\n\n").unwrap();
-        assert_eq!(
-            drain(&mut f),
-            vec![b"event: a\ndata: 1".to_vec(), b"data: 2".to_vec()]
-        );
+        assert_eq!(drain(&mut f), vec![b"event: a\ndata: 1".to_vec(), b"data: 2".to_vec()]);
     }
 
     #[test]

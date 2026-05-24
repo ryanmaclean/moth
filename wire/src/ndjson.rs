@@ -33,19 +33,13 @@ impl NdjsonSplitter {
     /// the same error without doing any work.
     pub fn push(&mut self, chunk: &[u8]) -> Result<(), FramerError> {
         if self.poisoned {
-            return Err(FramerError::Overflow {
-                max: self.max,
-                attempted: chunk.len(),
-            });
+            return Err(FramerError::Overflow { max: self.max, attempted: chunk.len() });
         }
         if self.buf.len().saturating_add(chunk.len()) > self.max {
             self.poisoned = true;
             self.buf.clear();
             self.buf.shrink_to_fit();
-            return Err(FramerError::Overflow {
-                max: self.max,
-                attempted: chunk.len(),
-            });
+            return Err(FramerError::Overflow { max: self.max, attempted: chunk.len() });
         }
         self.buf.extend_from_slice(chunk);
         Ok(())
@@ -99,10 +93,7 @@ mod tests {
     fn three_lines_one_chunk() {
         let mut s = NdjsonSplitter::new();
         s.push(b"a\nbb\nccc\n").unwrap();
-        assert_eq!(
-            drain(&mut s),
-            vec![b"a".to_vec(), b"bb".to_vec(), b"ccc".to_vec()]
-        );
+        assert_eq!(drain(&mut s), vec![b"a".to_vec(), b"bb".to_vec(), b"ccc".to_vec()]);
     }
 
     #[test]

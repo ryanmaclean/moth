@@ -70,11 +70,7 @@ fn parse_error(v: &Json) -> Option<McpError> {
         Json::Num(n) => n.parse::<i64>().ok()?,
         _ => return None,
     };
-    let message = v
-        .get("message")
-        .and_then(Json::as_str)
-        .unwrap_or("")
-        .to_string();
+    let message = v.get("message").and_then(Json::as_str).unwrap_or("").to_string();
     Some(McpError::Server { code, message })
 }
 
@@ -117,10 +113,7 @@ mod tests {
     #[test]
     fn build_request_with_params() {
         let s = build_request(7, "tools/call", Some(r#"{"name":"x"}"#));
-        assert_eq!(
-            s,
-            r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"x"}}"#
-        );
+        assert_eq!(s, r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"x"}}"#);
     }
 
     #[test]
@@ -165,8 +158,8 @@ mod tests {
 
     #[test]
     fn classify_notification_has_method_no_id() {
-        let v = parse_json(br#"{"jsonrpc":"2.0","method":"notifications/log","params":{}}"#)
-            .unwrap();
+        let v =
+            parse_json(br#"{"jsonrpc":"2.0","method":"notifications/log","params":{}}"#).unwrap();
         assert!(matches!(classify(&v), FrameKind::Notification));
     }
 

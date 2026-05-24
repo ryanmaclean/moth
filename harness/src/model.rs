@@ -114,9 +114,7 @@ mod tests {
             input: r#"{"command":"ls"}"#.into(),
         };
         let (id0, name0, input0) = match &block {
-            ContentBlock::ToolUse { id, name, input } => {
-                (id.clone(), name.clone(), input.clone())
-            }
+            ContentBlock::ToolUse { id, name, input } => (id.clone(), name.clone(), input.clone()),
             _ => panic!(),
         };
         // After our clones above: block holds 1 + we hold 1 each = 2.

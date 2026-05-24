@@ -100,11 +100,9 @@ impl FileStore {
         match fs::rename(&legacy, &snap) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(StoreError(format!(
-                "migrate {} -> {}: {e}",
-                legacy.display(),
-                snap.display()
-            ))),
+            Err(e) => {
+                Err(StoreError(format!("migrate {} -> {}: {e}", legacy.display(), snap.display())))
+            }
         }
     }
 
@@ -177,11 +175,7 @@ impl FileStore {
             .map_err(|e| StoreError(format!("write {}: {e}", tmp.display())))?;
         fs::rename(&tmp, &snap).map_err(|e| {
             let _ = fs::remove_file(&tmp);
-            StoreError(format!(
-                "rename {} -> {}: {e}",
-                tmp.display(),
-                snap.display()
-            ))
+            StoreError(format!("rename {} -> {}: {e}", tmp.display(), snap.display()))
         })?;
         // Best-effort log truncation — a leftover log just means slower
         // loads until the next compact succeeds; not a correctness issue
@@ -201,10 +195,7 @@ fn validate_key(key: &str) -> Result<(), StoreError> {
         return Err(StoreError("empty key".into()));
     }
     if key.len() > MAX_KEY_LEN {
-        return Err(StoreError(format!(
-            "key too long ({} > {MAX_KEY_LEN})",
-            key.len()
-        )));
+        return Err(StoreError(format!("key too long ({} > {MAX_KEY_LEN})", key.len())));
     }
     if key.starts_with('.') {
         return Err(StoreError(format!("key may not start with '.': {key:?}")));
@@ -247,9 +238,7 @@ impl SessionStore for FileStore {
         if self.should_auto_snapshot(&log) {
             // `read_full` returns `None` only if neither file exists — but
             // we already saw the log, so it must be `Some`.
-            let history = self
-                .read_full(key)?
-                .unwrap_or_default();
+            let history = self.read_full(key)?.unwrap_or_default();
             self.compact(key, &history)?;
         }
 
@@ -295,28 +284,20 @@ fn serialize_snapshot(history: &[ChatMessage]) -> String {
 }
 
 fn parse_snapshot(bytes: &[u8], path: &Path) -> Result<Vec<ChatMessage>, StoreError> {
-    let v = json::parse(bytes)
-        .map_err(|e| StoreError(format!("parse {}: {e}", path.display())))?;
+    let v = json::parse(bytes).map_err(|e| StoreError(format!("parse {}: {e}", path.display())))?;
     let version = v
         .get("version")
         .ok_or_else(|| StoreError(format!("{}: missing version", path.display())))?;
     match version {
         Json::Num(n) if n == &WIRE_VERSION.to_string() => {}
         other => {
-            return Err(StoreError(format!(
-                "{}: unsupported version {:?}",
-                path.display(),
-                other
-            )));
+            return Err(StoreError(format!("{}: unsupported version {:?}", path.display(), other)));
         }
     }
     let messages = match v.get("messages") {
         Some(Json::Arr(a)) => a,
         _ => {
-            return Err(StoreError(format!(
-                "{}: messages not an array",
-                path.display()
-            )));
+            return Err(StoreError(format!("{}: messages not an array", path.display())));
         }
     };
     let mut out = Vec::with_capacity(messages.len());
@@ -346,11 +327,7 @@ fn serialize_log_record(out: &mut String, msgs: &[ChatMessage]) {
     out.push_str("]}");
 }
 
-fn apply_log(
-    bytes: &[u8],
-    path: &Path,
-    history: &mut Vec<ChatMessage>,
-) -> Result<(), StoreError> {
+fn apply_log(bytes: &[u8], path: &Path, history: &mut Vec<ChatMessage>) -> Result<(), StoreError> {
     for (idx, raw) in bytes.split(|b| *b == b'\n').enumerate() {
         // Trim CR for tolerant Windows-edit handling.
         let line = match raw.last() {
@@ -360,13 +337,8 @@ fn apply_log(
         if line.is_empty() {
             continue;
         }
-        let v = json::parse(line).map_err(|e| {
-            StoreError(format!(
-                "parse {} line {}: {e}",
-                path.display(),
-                idx + 1
-            ))
-        })?;
+        let v = json::parse(line)
+            .map_err(|e| StoreError(format!("parse {} line {}: {e}", path.display(), idx + 1)))?;
         let arr = match v.get("messages") {
             Some(Json::Arr(a)) => a,
             _ => {
@@ -379,11 +351,7 @@ fn apply_log(
         };
         for (mi, m) in arr.iter().enumerate() {
             let parsed = parse_message(m).map_err(|e| {
-                StoreError(format!(
-                    "{} line {} message[{mi}]: {e}",
-                    path.display(),
-                    idx + 1
-                ))
+                StoreError(format!("{} line {} message[{mi}]: {e}", path.display(), idx + 1))
             })?;
             history.push(parsed);
         }
@@ -444,10 +412,7 @@ fn serialize_block(s: &mut String, b: &ContentBlock) {
 }
 
 fn parse_message(v: &Json) -> Result<ChatMessage, String> {
-    let role = v
-        .get("role")
-        .and_then(Json::as_str)
-        .ok_or_else(|| "missing role".to_string())?;
+    let role = v.get("role").and_then(Json::as_str).ok_or_else(|| "missing role".to_string())?;
     let role = match role {
         "user" => Role::User,
         "assistant" => Role::Assistant,
@@ -465,10 +430,7 @@ fn parse_message(v: &Json) -> Result<ChatMessage, String> {
 }
 
 fn parse_block(v: &Json) -> Result<ContentBlock, String> {
-    let ty = v
-        .get("type")
-        .and_then(Json::as_str)
-        .ok_or_else(|| "missing type".to_string())?;
+    let ty = v.get("type").and_then(Json::as_str).ok_or_else(|| "missing type".to_string())?;
     match ty {
         "text" => {
             let text = v
@@ -486,9 +448,7 @@ fn parse_block(v: &Json) -> Result<ContentBlock, String> {
                 .get("name")
                 .and_then(Json::as_str)
                 .ok_or_else(|| "tool_use: missing name".to_string())?;
-            let input = v
-                .get("input")
-                .ok_or_else(|| "tool_use: missing input".to_string())?;
+            let input = v.get("input").ok_or_else(|| "tool_use: missing input".to_string())?;
             Ok(ContentBlock::ToolUse {
                 id: id.into(),
                 name: name.into(),
@@ -578,10 +538,8 @@ mod tests {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn scratch() -> PathBuf {
-        let n = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
+        let n =
+            SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0);
         let c = COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!("persist-test-{n}-{c}"));
         fs::create_dir_all(&dir).unwrap();
@@ -604,9 +562,7 @@ mod tests {
         assert_eq!(loaded[0].role, Role::User);
         assert!(matches!(&loaded[0].content[0], ContentBlock::Text(t) if &**t == "hi"));
         assert_eq!(loaded[1].role, Role::Assistant);
-        assert!(
-            matches!(&loaded[1].content[0], ContentBlock::Text(t) if &**t == "hello there")
-        );
+        assert!(matches!(&loaded[1].content[0], ContentBlock::Text(t) if &**t == "hello there"));
         cleanup(&root);
     }
 
@@ -679,9 +635,7 @@ mod tests {
     fn key_rejects_backslash() {
         let root = scratch();
         let store = FileStore::new(&root);
-        let err = store
-            .append("a\\b", &[ChatMessage::user("x")])
-            .unwrap_err();
+        let err = store.append("a\\b", &[ChatMessage::user("x")]).unwrap_err();
         assert!(err.0.contains("separators"), "got: {}", err.0);
         cleanup(&root);
     }
@@ -692,9 +646,7 @@ mod tests {
         let store = FileStore::new(&root);
         let err = store.append("..", &[ChatMessage::user("x")]).unwrap_err();
         assert!(err.0.contains("..") || err.0.contains('.'), "got: {}", err.0);
-        let err = store
-            .append("foo..bar", &[ChatMessage::user("x")])
-            .unwrap_err();
+        let err = store.append("foo..bar", &[ChatMessage::user("x")]).unwrap_err();
         assert!(err.0.contains(".."), "got: {}", err.0);
         cleanup(&root);
     }
@@ -703,9 +655,7 @@ mod tests {
     fn key_rejects_leading_dot() {
         let root = scratch();
         let store = FileStore::new(&root);
-        let err = store
-            .append(".hidden", &[ChatMessage::user("x")])
-            .unwrap_err();
+        let err = store.append(".hidden", &[ChatMessage::user("x")]).unwrap_err();
         assert!(err.0.contains("'.'"), "got: {}", err.0);
         cleanup(&root);
     }
@@ -733,9 +683,7 @@ mod tests {
     fn key_rejects_control_chars() {
         let root = scratch();
         let store = FileStore::new(&root);
-        let err = store
-            .append("a\nb", &[ChatMessage::user("x")])
-            .unwrap_err();
+        let err = store.append("a\nb", &[ChatMessage::user("x")]).unwrap_err();
         assert!(err.0.contains("control"), "got: {}", err.0);
         cleanup(&root);
     }
@@ -788,11 +736,7 @@ mod tests {
     fn corrupt_unknown_version_returns_err() {
         let root = scratch();
         let store = FileStore::new(&root);
-        fs::write(
-            root.join("v.snapshot.json"),
-            br#"{"version":99,"messages":[]}"#,
-        )
-        .unwrap();
+        fs::write(root.join("v.snapshot.json"), br#"{"version":99,"messages":[]}"#).unwrap();
         let err = store.load("v").unwrap_err();
         assert!(err.0.contains("version"), "got: {}", err.0);
         cleanup(&root);
@@ -802,13 +746,9 @@ mod tests {
     fn rejected_key_does_not_clobber_existing_log() {
         let root = scratch();
         let store = FileStore::new(&root);
-        store
-            .append("keep", &[ChatMessage::user("original")])
-            .unwrap();
+        store.append("keep", &[ChatMessage::user("original")]).unwrap();
         let before = fs::read(root.join("keep.log.jsonl")).unwrap();
-        let err = store
-            .append("../keep", &[ChatMessage::user("evil")])
-            .unwrap_err();
+        let err = store.append("../keep", &[ChatMessage::user("evil")]).unwrap_err();
         assert!(err.0.contains("..") || err.0.contains("separators"));
         let after = fs::read(root.join("keep.log.jsonl")).unwrap();
         assert_eq!(before, after);
@@ -817,10 +757,8 @@ mod tests {
 
     #[test]
     fn open_creates_root() {
-        let n = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
+        let n =
+            SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0);
         let dir = std::env::temp_dir().join(format!("persist-open-{n}/nested"));
         assert!(!dir.exists());
         let store = FileStore::open(&dir).unwrap();
@@ -834,9 +772,7 @@ mod tests {
         let root = scratch();
         let store = FileStore::new(&root);
         store.append("s", &[ChatMessage::user("first")]).unwrap();
-        store
-            .append("s", &[ChatMessage::user("second"), ChatMessage::assistant("ack")])
-            .unwrap();
+        store.append("s", &[ChatMessage::user("second"), ChatMessage::assistant("ack")]).unwrap();
         let loaded = store.load("s").unwrap().unwrap();
         assert_eq!(loaded.len(), 3);
         assert!(matches!(&loaded[0].content[0], ContentBlock::Text(t) if &**t == "first"));
@@ -887,8 +823,7 @@ mod tests {
             content: vec![ContentBlock::ToolUse {
                 id: "tu_x".into(),
                 name: "edit".into(),
-                input: r#"{"path":"/tmp/f","edits":[{"old":"a","new":"b"}],"flag":true}"#
-                    .into(),
+                input: r#"{"path":"/tmp/f","edits":[{"old":"a","new":"b"}],"flag":true}"#.into(),
             }],
         }];
         store.append("nest", &history).unwrap();
@@ -943,7 +878,9 @@ mod tests {
         assert!(!root.join("s.log.jsonl").exists());
         let loaded = store.load("s").unwrap().unwrap();
         assert_eq!(loaded.len(), 1);
-        assert!(matches!(&loaded[0].content[0], ContentBlock::Text(t) if &**t == "compacted-summary"));
+        assert!(
+            matches!(&loaded[0].content[0], ContentBlock::Text(t) if &**t == "compacted-summary")
+        );
         cleanup(&root);
     }
 
@@ -958,11 +895,8 @@ mod tests {
         // The next append should have flipped the log: it must be small
         // (one record) because everything before got rolled into the
         // snapshot.
-        let log_lines = fs::read(root.join("a.log.jsonl"))
-            .unwrap()
-            .iter()
-            .filter(|b| **b == b'\n')
-            .count();
+        let log_lines =
+            fs::read(root.join("a.log.jsonl")).unwrap().iter().filter(|b| **b == b'\n').count();
         assert!(
             (log_lines as u64) < SNAPSHOT_RECORDS,
             "log should have shrunk after auto-snapshot, saw {log_lines} lines"
@@ -1005,8 +939,7 @@ mod tests {
             let s = store.clone();
             handles.push(thread::spawn(move || {
                 for i in 0..per_worker {
-                    s.append("c", &[ChatMessage::user(format!("w{w}-i{i}"))])
-                        .unwrap();
+                    s.append("c", &[ChatMessage::user(format!("w{w}-i{i}"))]).unwrap();
                 }
             }));
         }

@@ -86,14 +86,10 @@ impl Tool for ReadTool {
 
         let meta = std::fs::symlink_metadata(&full).map_err(io_err)?;
         if sandboxed && meta.file_type().is_symlink() {
-            return Err(ToolError(format!(
-                "refusing to follow symlink: {path}"
-            )));
+            return Err(ToolError(format!("refusing to follow symlink: {path}")));
         }
         if sandboxed && hard_linked(&meta) {
-            return Err(ToolError(format!(
-                "refusing hard-linked file (st_nlink > 1): {path}"
-            )));
+            return Err(ToolError(format!("refusing hard-linked file (st_nlink > 1): {path}")));
         }
         // When sandboxed `resolve_existing` already vetted every
         // component, including the leaf, so by here the file cannot be
@@ -120,8 +116,7 @@ impl Tool for ReadTool {
         if bytes[..sniff_len].contains(&0) {
             return Err(ToolError("file appears binary".into()));
         }
-        let text = std::str::from_utf8(&bytes)
-            .map_err(|e| ToolError(format!("not UTF-8: {e}")))?;
+        let text = std::str::from_utf8(&bytes).map_err(|e| ToolError(format!("not UTF-8: {e}")))?;
 
         Ok(format_numbered(text, offset, limit))
     }
@@ -164,9 +159,7 @@ impl Tool for WriteTool {
             // it — so the target file is still safe.
             match std::fs::symlink_metadata(&full) {
                 Ok(meta) if meta.file_type().is_symlink() => {
-                    return Err(ToolError(format!(
-                        "refusing to write through symlink: {path}"
-                    )));
+                    return Err(ToolError(format!("refusing to write through symlink: {path}")));
                 }
                 Ok(meta) if hard_linked(&meta) => {
                     return Err(ToolError(format!(
@@ -205,9 +198,7 @@ impl Tool for EditTool {
         if sandboxed {
             let meta = std::fs::symlink_metadata(&full).map_err(io_err)?;
             if meta.file_type().is_symlink() {
-                return Err(ToolError(format!(
-                    "refusing to edit through symlink: {path}"
-                )));
+                return Err(ToolError(format!("refusing to edit through symlink: {path}")));
             }
             if hard_linked(&meta) {
                 return Err(ToolError(format!(
@@ -216,8 +207,7 @@ impl Tool for EditTool {
             }
         }
         let bytes = std::fs::read(&full).map_err(io_err)?;
-        let text = std::str::from_utf8(&bytes)
-            .map_err(|e| ToolError(format!("not UTF-8: {e}")))?;
+        let text = std::str::from_utf8(&bytes).map_err(|e| ToolError(format!("not UTF-8: {e}")))?;
 
         let count = text.matches(&old_text).count();
         if count == 0 {
@@ -230,11 +220,7 @@ impl Tool for EditTool {
         }
         let replaced = text.replacen(&old_text, &new_text, 1);
         atomic_write(&full, replaced.as_bytes())?;
-        Ok(format!(
-            "edited {}: {} chars replaced",
-            full.display(),
-            old_text.len()
-        ))
+        Ok(format!("edited {}: {} chars replaced", full.display(), old_text.len()))
     }
 }
 
@@ -332,10 +318,7 @@ fn atomic_write(dest: &Path, content: &[u8]) -> Result<(), ToolError> {
 
     // Write + fsync the data, then drop the handle so rename(2) doesn't
     // race with any pending buffered writes inside std.
-    let write_res = file
-        .write_all(content)
-        .and_then(|()| file.sync_data())
-        .map_err(io_err);
+    let write_res = file.write_all(content).and_then(|()| file.sync_data()).map_err(io_err);
     drop(file);
     if let Err(e) = write_res {
         let _ = std::fs::remove_file(&tmp);
@@ -374,15 +357,9 @@ fn atomic_write(dest: &Path, content: &[u8]) -> Result<(), ToolError> {
     tmp_name.push(format!(".{}.{}.tmp", std::process::id(), counter));
     let tmp = parent.join(&tmp_name);
 
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp)
-        .map_err(io_err)?;
-    let write_res = file
-        .write_all(content)
-        .and_then(|()| file.sync_data())
-        .map_err(io_err);
+    let mut file =
+        std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp).map_err(io_err)?;
+    let write_res = file.write_all(content).and_then(|()| file.sync_data()).map_err(io_err);
     drop(file);
     if let Err(e) = write_res {
         let _ = std::fs::remove_file(&tmp);
@@ -437,15 +414,12 @@ fn resolve_existing(root: Option<&Path>, path: &str) -> Result<PathBuf, ToolErro
     };
 
     if p.is_absolute() {
-        return Err(ToolError(format!(
-            "absolute paths not allowed under sandbox root: {path}"
-        )));
+        return Err(ToolError(format!("absolute paths not allowed under sandbox root: {path}")));
     }
 
     let comps = user_components(path)?;
-    let canonical_root = root
-        .canonicalize()
-        .map_err(|e| ToolError(format!("sandbox root unreadable: {e}")))?;
+    let canonical_root =
+        root.canonicalize().map_err(|e| ToolError(format!("sandbox root unreadable: {e}")))?;
 
     let mut cur = canonical_root.clone();
     for part in &comps {
@@ -463,13 +437,10 @@ fn resolve_existing(root: Option<&Path>, path: &str) -> Result<PathBuf, ToolErro
         // running prefix must stay inside the canonical root. This also
         // catches obscure filesystems (bind mounts, hard-link tricks)
         // where the lexical join wandered out of bounds.
-        let canon = cur
-            .canonicalize()
-            .map_err(|e| ToolError(format!("cannot resolve path: {e}")))?;
+        let canon =
+            cur.canonicalize().map_err(|e| ToolError(format!("cannot resolve path: {e}")))?;
         if !canon.starts_with(&canonical_root) {
-            return Err(ToolError(format!(
-                "resolved path escapes sandbox root: {path}"
-            )));
+            return Err(ToolError(format!("resolved path escapes sandbox root: {path}")));
         }
     }
     Ok(cur)
@@ -499,15 +470,12 @@ fn resolve_for_write(root: Option<&Path>, path: &str) -> Result<PathBuf, ToolErr
     };
 
     if p.is_absolute() {
-        return Err(ToolError(format!(
-            "absolute paths not allowed under sandbox root: {path}"
-        )));
+        return Err(ToolError(format!("absolute paths not allowed under sandbox root: {path}")));
     }
 
     let comps = user_components(path)?;
-    let canonical_root = root
-        .canonicalize()
-        .map_err(|e| ToolError(format!("sandbox root unreadable: {e}")))?;
+    let canonical_root =
+        root.canonicalize().map_err(|e| ToolError(format!("sandbox root unreadable: {e}")))?;
 
     if comps.is_empty() {
         return Err(ToolError(format!("empty path: {path}")));
@@ -532,9 +500,7 @@ fn resolve_for_write(root: Option<&Path>, path: &str) -> Result<PathBuf, ToolErr
                     .canonicalize()
                     .map_err(|e| ToolError(format!("cannot resolve path: {e}")))?;
                 if !canon.starts_with(&canonical_root) {
-                    return Err(ToolError(format!(
-                        "resolved path escapes sandbox root: {path}"
-                    )));
+                    return Err(ToolError(format!("resolved path escapes sandbox root: {path}")));
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -601,16 +567,11 @@ mod tests {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn unique(label: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
+        let nanos =
+            SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0);
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
         let mut p = std::env::temp_dir();
-        p.push(format!(
-            "fstools-{label}-{}-{nanos}-{n}",
-            std::process::id()
-        ));
+        p.push(format!("fstools-{label}-{}-{nanos}-{n}", std::process::id()));
         p
     }
 
@@ -694,9 +655,7 @@ mod tests {
     fn read_missing_path_field() {
         let h = Harness::new();
         let ctx = ToolCtx { instance: h.addr() };
-        let err = ReadTool { root: None }
-            .call(r#"{"offset":1}"#, &ctx)
-            .unwrap_err();
+        let err = ReadTool { root: None }.call(r#"{"offset":1}"#, &ctx).unwrap_err();
         assert!(err.0.contains("missing field 'path'"), "got: {}", err.0);
     }
 
@@ -715,14 +674,8 @@ mod tests {
         let h = Harness::new();
         let ctx = ToolCtx { instance: h.addr() };
         let tool = ReadTool { root: Some(dir.clone()) };
-        let err = tool
-            .call(r#"{"path":"../etc/passwd"}"#, &ctx)
-            .unwrap_err();
-        assert!(
-            err.0.contains("path traversal not allowed"),
-            "got: {}",
-            err.0
-        );
+        let err = tool.call(r#"{"path":"../etc/passwd"}"#, &ctx).unwrap_err();
+        assert!(err.0.contains("path traversal not allowed"), "got: {}", err.0);
         cleanup(&dir);
     }
 
@@ -733,14 +686,8 @@ mod tests {
         let h = Harness::new();
         let ctx = ToolCtx { instance: h.addr() };
         let tool = ReadTool { root: Some(dir.clone()) };
-        let err = tool
-            .call(r#"{"path":"/etc/passwd"}"#, &ctx)
-            .unwrap_err();
-        assert!(
-            err.0.contains("absolute paths not allowed"),
-            "got: {}",
-            err.0
-        );
+        let err = tool.call(r#"{"path":"/etc/passwd"}"#, &ctx).unwrap_err();
+        assert!(err.0.contains("absolute paths not allowed"), "got: {}", err.0);
         cleanup(&dir);
     }
 
@@ -815,10 +762,8 @@ mod tests {
         let h = Harness::new();
         let ctx = ToolCtx { instance: h.addr() };
         let tool = WriteTool { root: None };
-        let input = format!(
-            r#"{{"path":"{}","content":"hello"}}"#,
-            json_escape(&path.to_string_lossy())
-        );
+        let input =
+            format!(r#"{{"path":"{}","content":"hello"}}"#, json_escape(&path.to_string_lossy()));
         let out = tool.call(&input, &ctx).unwrap();
         assert!(out.starts_with("wrote 5 bytes to "));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello");
@@ -832,10 +777,8 @@ mod tests {
         let h = Harness::new();
         let ctx = ToolCtx { instance: h.addr() };
         let tool = WriteTool { root: None };
-        let input = format!(
-            r#"{{"path":"{}","content":"ok"}}"#,
-            json_escape(&path.to_string_lossy())
-        );
+        let input =
+            format!(r#"{{"path":"{}","content":"ok"}}"#, json_escape(&path.to_string_lossy()));
         tool.call(&input, &ctx).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "ok");
         cleanup(&dir);
@@ -845,9 +788,7 @@ mod tests {
     fn write_missing_path_field() {
         let h = Harness::new();
         let ctx = ToolCtx { instance: h.addr() };
-        let err = WriteTool { root: None }
-            .call(r#"{"content":"x"}"#, &ctx)
-            .unwrap_err();
+        let err = WriteTool { root: None }.call(r#"{"content":"x"}"#, &ctx).unwrap_err();
         assert!(err.0.contains("missing field 'path'"));
     }
 
@@ -897,10 +838,8 @@ mod tests {
         let h = Harness::new();
         let ctx = ToolCtx { instance: h.addr() };
         let tool = WriteTool { root: None };
-        let input = format!(
-            r#"{{"path":"{}","content":"hello"}}"#,
-            json_escape(&path.to_string_lossy())
-        );
+        let input =
+            format!(r#"{{"path":"{}","content":"hello"}}"#, json_escape(&path.to_string_lossy()));
         tool.call(&input, &ctx).unwrap();
         let entries: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
@@ -986,10 +925,8 @@ mod tests {
         let blocker = dir.join("blocker");
         std::fs::write(&blocker, b"i am a file").unwrap();
         let path = blocker.join("under_a_file").join("nope.txt");
-        let input = format!(
-            r#"{{"path":"{}","content":"x"}}"#,
-            json_escape(&path.to_string_lossy())
-        );
+        let input =
+            format!(r#"{{"path":"{}","content":"x"}}"#, json_escape(&path.to_string_lossy()));
         let err = WriteTool { root: None }.call(&input, &ctx).unwrap_err();
         assert!(!err.0.is_empty());
         cleanup(&dir);
@@ -1054,9 +991,8 @@ mod tests {
     fn edit_missing_path_field() {
         let h = Harness::new();
         let ctx = ToolCtx { instance: h.addr() };
-        let err = EditTool { root: None }
-            .call(r#"{"old_text":"a","new_text":"b"}"#, &ctx)
-            .unwrap_err();
+        let err =
+            EditTool { root: None }.call(r#"{"old_text":"a","new_text":"b"}"#, &ctx).unwrap_err();
         assert!(err.0.contains("missing field 'path'"));
     }
 
@@ -1080,10 +1016,7 @@ mod tests {
         let h = Harness::new();
         let ctx = ToolCtx { instance: h.addr() };
         let err = EditTool { root: Some(dir.clone()) }
-            .call(
-                r#"{"path":"../etc/passwd","old_text":"a","new_text":"b"}"#,
-                &ctx,
-            )
+            .call(r#"{"path":"../etc/passwd","old_text":"a","new_text":"b"}"#, &ctx)
             .unwrap_err();
         assert!(err.0.contains("path traversal not allowed"));
         cleanup(&dir);
@@ -1120,11 +1053,7 @@ mod tests {
             let err = ReadTool { root: Some(root.clone()) }
                 .call(r#"{"path":"innocent"}"#, &ctx)
                 .unwrap_err();
-            assert!(
-                err.0.contains("symlink") || err.0.contains("escapes"),
-                "got: {}",
-                err.0
-            );
+            assert!(err.0.contains("symlink") || err.0.contains("escapes"), "got: {}", err.0);
             cleanup(root.parent().unwrap());
         }
 
@@ -1234,10 +1163,7 @@ mod tests {
             let h = Harness::new();
             let ctx = ToolCtx { instance: h.addr() };
             let err = EditTool { root: Some(root.clone()) }
-                .call(
-                    r#"{"path":"innocent","old_text":"SECRET","new_text":"PWNED"}"#,
-                    &ctx,
-                )
+                .call(r#"{"path":"innocent","old_text":"SECRET","new_text":"PWNED"}"#, &ctx)
                 .unwrap_err();
             assert!(err.0.contains("symlink"), "got: {}", err.0);
             assert_eq!(std::fs::read_to_string(&secret).unwrap(), "SECRET");
@@ -1257,10 +1183,7 @@ mod tests {
             let h = Harness::new();
             let ctx = ToolCtx { instance: h.addr() };
             let err = EditTool { root: Some(root.clone()) }
-                .call(
-                    r#"{"path":"dir/f.txt","old_text":"alpha","new_text":"beta"}"#,
-                    &ctx,
-                )
+                .call(r#"{"path":"dir/f.txt","old_text":"alpha","new_text":"beta"}"#, &ctx)
                 .unwrap_err();
             assert!(err.0.contains("symlink"), "got: {}", err.0);
             assert_eq!(std::fs::read_to_string(elsewhere.join("f.txt")).unwrap(), "alpha");
@@ -1279,10 +1202,7 @@ mod tests {
             WriteTool { root: Some(root.clone()) }
                 .call(r#"{"path":"x/y/z.txt","content":"ok"}"#, &ctx)
                 .unwrap();
-            assert_eq!(
-                std::fs::read_to_string(root.join("x/y/z.txt")).unwrap(),
-                "ok"
-            );
+            assert_eq!(std::fs::read_to_string(root.join("x/y/z.txt")).unwrap(), "ok");
             cleanup(&parent);
         }
 
@@ -1300,10 +1220,7 @@ mod tests {
             symlink(&target, &link).unwrap();
             let h = Harness::new();
             let ctx = ToolCtx { instance: h.addr() };
-            let input = format!(
-                r#"{{"path":"{}"}}"#,
-                json_escape(&link.to_string_lossy())
-            );
+            let input = format!(r#"{{"path":"{}"}}"#, json_escape(&link.to_string_lossy()));
             let out = ReadTool { root: None }.call(&input, &ctx).unwrap();
             assert!(out.contains("value"), "got: {}", out);
             cleanup(&parent);
@@ -1320,9 +1237,8 @@ mod tests {
             symlink(root.join("a"), root.join("b")).unwrap();
             let h = Harness::new();
             let ctx = ToolCtx { instance: h.addr() };
-            let err = ReadTool { root: Some(root.clone()) }
-                .call(r#"{"path":"a"}"#, &ctx)
-                .unwrap_err();
+            let err =
+                ReadTool { root: Some(root.clone()) }.call(r#"{"path":"a"}"#, &ctx).unwrap_err();
             // Should be a ToolError with non-empty message, not a panic.
             assert!(!err.0.is_empty());
             cleanup(&parent);
@@ -1355,10 +1271,7 @@ mod tests {
             WriteTool { root: Some(root.clone()) }
                 .call(r#"{"path":"dir/f.txt","content":"hello"}"#, &ctx)
                 .unwrap();
-            assert_eq!(
-                std::fs::read_to_string(root.join("dir/f.txt")).unwrap(),
-                "hello"
-            );
+            assert_eq!(std::fs::read_to_string(root.join("dir/f.txt")).unwrap(), "hello");
             cleanup(&parent);
         }
 
@@ -1372,15 +1285,9 @@ mod tests {
             let h = Harness::new();
             let ctx = ToolCtx { instance: h.addr() };
             EditTool { root: Some(root.clone()) }
-                .call(
-                    r#"{"path":"f.txt","old_text":"world","new_text":"there"}"#,
-                    &ctx,
-                )
+                .call(r#"{"path":"f.txt","old_text":"world","new_text":"there"}"#, &ctx)
                 .unwrap();
-            assert_eq!(
-                std::fs::read_to_string(root.join("f.txt")).unwrap(),
-                "hello there\n"
-            );
+            assert_eq!(std::fs::read_to_string(root.join("f.txt")).unwrap(), "hello there\n");
             cleanup(&parent);
         }
 
@@ -1397,11 +1304,7 @@ mod tests {
             let err = ReadTool { root: Some(root.clone()) }
                 .call(r#"{"path":"a.txt"}"#, &ctx)
                 .unwrap_err();
-            assert!(
-                err.0.contains("hard-linked"),
-                "expected hard-link refusal, got: {}",
-                err.0
-            );
+            assert!(err.0.contains("hard-linked"), "expected hard-link refusal, got: {}", err.0);
             cleanup(&parent);
         }
 
@@ -1416,10 +1319,7 @@ mod tests {
             let h = Harness::new();
             let ctx = ToolCtx { instance: h.addr() };
             let err = WriteTool { root: Some(root.clone()) }
-                .call(
-                    r#"{"path":"a.txt","content":"replacement"}"#,
-                    &ctx,
-                )
+                .call(r#"{"path":"a.txt","content":"replacement"}"#, &ctx)
                 .unwrap_err();
             assert!(err.0.contains("hard-linked"), "got: {}", err.0);
             // Confirm neither name was overwritten.
@@ -1438,10 +1338,7 @@ mod tests {
             let h = Harness::new();
             let ctx = ToolCtx { instance: h.addr() };
             let err = EditTool { root: Some(root.clone()) }
-                .call(
-                    r#"{"path":"a.txt","old_text":"world","new_text":"there"}"#,
-                    &ctx,
-                )
+                .call(r#"{"path":"a.txt","old_text":"world","new_text":"there"}"#, &ctx)
                 .unwrap_err();
             assert!(err.0.contains("hard-linked"), "got: {}", err.0);
             cleanup(&parent);
@@ -1458,13 +1355,7 @@ mod tests {
             let h = Harness::new();
             let ctx = ToolCtx { instance: h.addr() };
             let out = ReadTool { root: None }
-                .call(
-                    &format!(
-                        r#"{{"path":"{}"}}"#,
-                        parent.join("a.txt").to_string_lossy()
-                    ),
-                    &ctx,
-                )
+                .call(&format!(r#"{{"path":"{}"}}"#, parent.join("a.txt").to_string_lossy()), &ctx)
                 .unwrap();
             assert!(out.contains("shared content"));
             cleanup(&parent);

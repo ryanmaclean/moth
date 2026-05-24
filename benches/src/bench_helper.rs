@@ -28,9 +28,7 @@ pub fn bench<F: FnMut()>(name: &str, mut f: F) -> Duration {
     samples.sort();
     let median_batch = samples[SAMPLES / 2];
     let ns_per_op = median_batch.as_nanos() / BATCH as u128;
-    eprintln!(
-        "{name}: {ns_per_op} ns/op (median over {SAMPLES} batches of {BATCH})"
-    );
+    eprintln!("{name}: {ns_per_op} ns/op (median over {SAMPLES} batches of {BATCH})");
     Duration::from_nanos(ns_per_op as u64)
 }
 

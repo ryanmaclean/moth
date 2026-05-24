@@ -267,11 +267,7 @@ mod tests {
         let mut calls = 0;
         let result: Result<i32, &str> = with_backoff(&policy, |attempt| {
             calls += 1;
-            if attempt < 3 {
-                Outcome::Retryable("transient")
-            } else {
-                Outcome::Ok(7)
-            }
+            if attempt < 3 { Outcome::Retryable("transient") } else { Outcome::Ok(7) }
         });
         assert_eq!(calls, 3);
         assert_eq!(result, Ok(7));
@@ -297,10 +293,7 @@ mod tests {
 
     #[test]
     fn breaker_opens_after_threshold() {
-        let cfg = BreakerConfig {
-            failure_threshold: 3,
-            ..BreakerConfig::default()
-        };
+        let cfg = BreakerConfig { failure_threshold: 3, ..BreakerConfig::default() };
         let host = "h1.example.com";
         assert_eq!(check(host, &cfg), BreakerVerdict::Allow);
         record_failure(host, &cfg);
@@ -348,10 +341,7 @@ mod tests {
 
     #[test]
     fn different_hosts_have_independent_breakers() {
-        let cfg = BreakerConfig {
-            failure_threshold: 2,
-            ..BreakerConfig::default()
-        };
+        let cfg = BreakerConfig { failure_threshold: 2, ..BreakerConfig::default() };
         record_failure("a.example.com", &cfg);
         record_failure("a.example.com", &cfg);
         assert_eq!(check("a.example.com", &cfg), BreakerVerdict::Open);
@@ -360,10 +350,7 @@ mod tests {
 
     #[test]
     fn success_resets_failure_streak() {
-        let cfg = BreakerConfig {
-            failure_threshold: 3,
-            ..BreakerConfig::default()
-        };
+        let cfg = BreakerConfig { failure_threshold: 3, ..BreakerConfig::default() };
         let host = "h4.example.com";
         record_failure(host, &cfg);
         record_failure(host, &cfg);

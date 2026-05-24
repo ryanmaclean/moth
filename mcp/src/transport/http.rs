@@ -234,42 +234,17 @@ fn post(
 
         setopt_ptr(easy, c::CURLOPT_URL, url_c.as_ptr() as *const c_void, "URL")?;
         setopt_long(easy, c::CURLOPT_POST, 1, "POST")?;
-        setopt_ptr(
-            easy,
-            c::CURLOPT_POSTFIELDS,
-            body.as_ptr() as *const c_void,
-            "POSTFIELDS",
-        )?;
-        setopt_long(
-            easy,
-            c::CURLOPT_POSTFIELDSIZE,
-            body.len() as i64,
-            "POSTFIELDSIZE",
-        )?;
-        setopt_ptr(
-            easy,
-            c::CURLOPT_HTTPHEADER,
-            headers as *const c_void,
-            "HTTPHEADER",
-        )?;
-        setopt_ptr(
-            easy,
-            c::CURLOPT_WRITEFUNCTION,
-            write_cb as *const c_void,
-            "WRITEFUNCTION",
-        )?;
+        setopt_ptr(easy, c::CURLOPT_POSTFIELDS, body.as_ptr() as *const c_void, "POSTFIELDS")?;
+        setopt_long(easy, c::CURLOPT_POSTFIELDSIZE, body.len() as i64, "POSTFIELDSIZE")?;
+        setopt_ptr(easy, c::CURLOPT_HTTPHEADER, headers as *const c_void, "HTTPHEADER")?;
+        setopt_ptr(easy, c::CURLOPT_WRITEFUNCTION, write_cb as *const c_void, "WRITEFUNCTION")?;
         setopt_ptr(
             easy,
             c::CURLOPT_WRITEDATA,
             (&mut body_buf as *mut Vec<u8>) as *const c_void,
             "WRITEDATA",
         )?;
-        setopt_ptr(
-            easy,
-            c::CURLOPT_HEADERFUNCTION,
-            header_cb as *const c_void,
-            "HEADERFUNCTION",
-        )?;
+        setopt_ptr(easy, c::CURLOPT_HEADERFUNCTION, header_cb as *const c_void, "HEADERFUNCTION")?;
         setopt_ptr(
             easy,
             c::CURLOPT_HEADERDATA,
@@ -320,7 +295,8 @@ fn parse_headers(buf: &[u8]) -> (bool, Option<String>) {
             continue;
         };
         let name = &line[..colon];
-        let value = line[colon + 1..].iter().copied().skip_while(|b| *b == b' ').collect::<Vec<_>>();
+        let value =
+            line[colon + 1..].iter().copied().skip_while(|b| *b == b' ').collect::<Vec<_>>();
         if eq_ignore_ascii_case(name, b"content-type") {
             // Content-Type may carry params (charset=utf-8 etc.); we only
             // need the bare type.
@@ -340,19 +316,12 @@ fn parse_headers(buf: &[u8]) -> (bool, Option<String>) {
 }
 
 fn eq_ignore_ascii_case(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len()
-        && a.iter()
-            .zip(b.iter())
-            .all(|(x, y)| x.eq_ignore_ascii_case(y))
+    a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.eq_ignore_ascii_case(y))
 }
 
 fn trim_ascii(s: &[u8]) -> &[u8] {
     let start = s.iter().position(|b| !b.is_ascii_whitespace()).unwrap_or(s.len());
-    let end = s
-        .iter()
-        .rposition(|b| !b.is_ascii_whitespace())
-        .map(|i| i + 1)
-        .unwrap_or(start);
+    let end = s.iter().rposition(|b| !b.is_ascii_whitespace()).map(|i| i + 1).unwrap_or(start);
     &s[start..end]
 }
 
@@ -442,8 +411,8 @@ fn curl_err(code: c::CURLcode, where_: &str) -> String {
 /// callers (tests, multiple McpClient instances).
 unsafe fn curl_global_init_once() {
     static INIT: std::sync::Once = std::sync::Once::new();
-    INIT.call_once(|| {
-        unsafe { c::curl_global_init(c::CURL_GLOBAL_DEFAULT); }
+    INIT.call_once(|| unsafe {
+        c::curl_global_init(c::CURL_GLOBAL_DEFAULT);
     });
 }
 
@@ -572,12 +541,7 @@ mod tests {
             }
         });
 
-        Mock {
-            addr: format!("http://{addr}/mcp"),
-            captured,
-            _handle: handle,
-            running,
-        }
+        Mock { addr: format!("http://{addr}/mcp"), captured, _handle: handle, running }
     }
 
     fn handle_one(
@@ -629,10 +593,7 @@ mod tests {
         // captured Vec between perform completing and the mock loop pushing.
         captured_sink.lock().unwrap().push(captured);
 
-        let mut resp = format!(
-            "HTTP/1.1 {} {}\r\n",
-            reply.status, reply.status_text
-        );
+        let mut resp = format!("HTTP/1.1 {} {}\r\n", reply.status, reply.status_text);
         resp.push_str(&format!("content-type: {}\r\n", reply.content_type));
         resp.push_str(&format!("content-length: {}\r\n", reply.body.len()));
         if let Some(sid) = &reply.session_id {
@@ -706,7 +667,8 @@ mod tests {
         let mut replies = handshake_replies();
         replies.push(Reply::json(
             200,
-            br#"{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"hi"}]}}"#.to_vec(),
+            br#"{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"hi"}]}}"#
+                .to_vec(),
         ));
         let mock = start_mock(replies);
         let client = McpClient::http(&mock.addr).unwrap();
@@ -753,7 +715,8 @@ mod tests {
         replies[0] = Reply::json(200, init_reply(1)).with_session("sess-abc");
         replies.push(Reply::json(
             200,
-            br#"{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"ok"}]}}"#.to_vec(),
+            br#"{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"ok"}]}}"#
+                .to_vec(),
         ));
         let mock = start_mock(replies);
         let client = McpClient::http(&mock.addr).unwrap();
@@ -919,10 +882,7 @@ mod tests {
         );
         // curl_easy_perform yields CURLE_OPERATION_TIMEDOUT (28); the post()
         // helper packages it as "curl perform: ... (code 28)".
-        assert!(
-            err.contains("code 28"),
-            "expected CURLE_OPERATION_TIMEDOUT, got {err}"
-        );
+        assert!(err.contains("code 28"), "expected CURLE_OPERATION_TIMEDOUT, got {err}");
     }
 
     #[test]

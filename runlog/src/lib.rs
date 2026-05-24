@@ -75,10 +75,7 @@ impl From<io::Error> for RunLogError {
 impl RunLog {
     /// Open `<dir>/<run_id>.jsonl` for append. Creates parent dirs. Writes
     /// an opening `start` record so every file is non-empty and timestamped.
-    pub fn open(
-        dir: impl AsRef<Path>,
-        run_id: impl Into<String>,
-    ) -> Result<Self, RunLogError> {
+    pub fn open(dir: impl AsRef<Path>, run_id: impl Into<String>) -> Result<Self, RunLogError> {
         Self::open_inner(dir.as_ref(), run_id.into(), None)
     }
 
@@ -102,12 +99,7 @@ impl RunLog {
         let path = dir.join(format!("{run_id}.jsonl"));
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
         let started_at = SystemTime::now();
-        let log = Self {
-            file: Mutex::new(file),
-            run_id,
-            request_id,
-            started_at,
-        };
+        let log = Self { file: Mutex::new(file), run_id, request_id, started_at };
         let started_ms = unix_ms(started_at);
         let mut payload = String::new();
         payload.push_str(r#"{"started_at_unix_ms":"#);
@@ -134,10 +126,7 @@ impl RunLog {
     /// `final_event` is the variant name of the last terminal event seen
     /// (`done` / `cancelled` / `error`) or `None` if the sender dropped
     /// before emitting one.
-    pub fn drain(
-        &self,
-        rx: Receiver<StreamEvent>,
-    ) -> Result<TerminalSummary, RunLogError> {
+    pub fn drain(&self, rx: Receiver<StreamEvent>) -> Result<TerminalSummary, RunLogError> {
         let mut final_event: Option<&'static str> = None;
         let mut turns: usize = 0;
         let mut completed = false;
@@ -180,11 +169,7 @@ impl RunLog {
 
     /// Manually write a record. Used internally for `start`; exposed so
     /// callers can emit their own markers around a streaming prompt.
-    pub fn write_record(
-        &self,
-        kind: &str,
-        payload: &str,
-    ) -> Result<(), RunLogError> {
+    pub fn write_record(&self, kind: &str, payload: &str) -> Result<(), RunLogError> {
         let ts = unix_ms(SystemTime::now());
         let mut line = String::with_capacity(payload.len() + 64);
         line.push_str(r#"{"ts_ms":"#);
@@ -315,10 +300,8 @@ mod tests {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn scratch() -> PathBuf {
-        let n = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
+        let n =
+            SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0);
         let c = COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!("runlog-test-{n}-{c}"));
         std::fs::create_dir_all(&dir).unwrap();
@@ -408,10 +391,7 @@ mod tests {
         let dir = scratch();
         let log = RunLog::open(&dir, "r1").unwrap();
         let (tx, rx) = sync_channel(8);
-        tx.send(StreamEvent::ToolUseStart {
-            id: "tu_1".into(),
-            name: "bash".into(),
-        }).unwrap();
+        tx.send(StreamEvent::ToolUseStart { id: "tu_1".into(), name: "bash".into() }).unwrap();
         drop(tx);
         log.drain(rx).unwrap();
         let lines = read_lines(&dir, "r1");
@@ -428,7 +408,8 @@ mod tests {
             tool_use_id: "tu_1".into(),
             content: "boom".into(),
             is_error: true,
-        }).unwrap();
+        })
+        .unwrap();
         drop(tx);
         log.drain(rx).unwrap();
         let lines = read_lines(&dir, "r1");
@@ -448,7 +429,8 @@ mod tests {
             tool_use_id: "tu_1".into(),
             content: "ok".into(),
             is_error: false,
-        }).unwrap();
+        })
+        .unwrap();
         drop(tx);
         log.drain(rx).unwrap();
         let lines = read_lines(&dir, "r1");
@@ -461,25 +443,14 @@ mod tests {
         let dir = scratch();
         let log = RunLog::open(&dir, "r1").unwrap();
         let (tx, rx) = sync_channel(8);
-        tx.send(StreamEvent::TurnComplete {
-            turn: 2,
-            stop_reason: Some("end_turn".into()),
-        }).unwrap();
-        tx.send(StreamEvent::TurnComplete {
-            turn: 3,
-            stop_reason: None,
-        }).unwrap();
+        tx.send(StreamEvent::TurnComplete { turn: 2, stop_reason: Some("end_turn".into()) })
+            .unwrap();
+        tx.send(StreamEvent::TurnComplete { turn: 3, stop_reason: None }).unwrap();
         drop(tx);
         log.drain(rx).unwrap();
         let lines = read_lines(&dir, "r1");
-        assert_eq!(
-            data_part(&lines[1]),
-            r#"{"turn":2,"stop_reason":"end_turn"}"#
-        );
-        assert_eq!(
-            data_part(&lines[2]),
-            r#"{"turn":3,"stop_reason":null}"#
-        );
+        assert_eq!(data_part(&lines[1]), r#"{"turn":2,"stop_reason":"end_turn"}"#);
+        assert_eq!(data_part(&lines[2]), r#"{"turn":3,"stop_reason":null}"#);
         cleanup(&dir);
     }
 
@@ -542,7 +513,8 @@ mod tests {
             structured: None,
             completed: true,
             turns: 3,
-        })).unwrap();
+        }))
+        .unwrap();
         drop(tx);
         let summary = log.drain(rx).unwrap();
         assert_eq!(summary.final_event, Some("done"));
@@ -550,10 +522,7 @@ mod tests {
         assert!(summary.completed);
         let lines = read_lines(&dir, "r1");
         assert_eq!(kind_of(&lines[1]), "done");
-        assert_eq!(
-            data_part(&lines[1]),
-            r#"{"text":"final","turns":3,"completed":true}"#
-        );
+        assert_eq!(data_part(&lines[1]), r#"{"text":"final","turns":3,"completed":true}"#);
         cleanup(&dir);
     }
 
@@ -600,7 +569,8 @@ mod tests {
             structured: None,
             completed: true,
             turns: 1,
-        })).unwrap();
+        }))
+        .unwrap();
         drop(tx);
         let summary = handle.join().expect("thread").expect("ok");
         assert_eq!(summary.final_event, Some("done"));
@@ -719,10 +689,7 @@ mod tests {
             let run_pos = line.find(r#""run_id":"#).unwrap();
             let req_pos = line.find(r#""request_id":"#).unwrap();
             let kind_pos = line.find(r#""kind":"#).unwrap();
-            assert!(
-                run_pos < req_pos && req_pos < kind_pos,
-                "field order wrong: {line}"
-            );
+            assert!(run_pos < req_pos && req_pos < kind_pos, "field order wrong: {line}");
         }
         // Sanity: omitting request_id (plain `open`) still works and the
         // field is absent.

@@ -70,12 +70,7 @@ impl Server {
         version: impl Into<String>,
         instance: ActorRef<InstanceMsg>,
     ) -> Self {
-        Self {
-            tools: Vec::new(),
-            instance,
-            name: name.into(),
-            version: version.into(),
-        }
+        Self { tools: Vec::new(), instance, name: name.into(), version: version.into() }
     }
 
     pub fn register(&mut self, tool: Arc<dyn Tool>) {
@@ -373,8 +368,8 @@ mod tests {
             r#"{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}"#
         }
         fn call(&self, input: &str, _ctx: &ToolCtx) -> Result<String, ToolError> {
-            let v = parse_json(input.as_bytes())
-                .map_err(|e| ToolError(format!("bad json: {e}")))?;
+            let v =
+                parse_json(input.as_bytes()).map_err(|e| ToolError(format!("bad json: {e}")))?;
             let t = v
                 .get("text")
                 .and_then(Json::as_str)
@@ -428,9 +423,7 @@ mod tests {
     /// end, letting the test's `inst.join()` actually terminate.
     fn drive(server: Server, input: &str) -> String {
         let mut output = Vec::new();
-        server
-            .serve(Cursor::new(input.as_bytes().to_vec()), &mut output)
-            .unwrap();
+        server.serve(Cursor::new(input.as_bytes().to_vec()), &mut output).unwrap();
         String::from_utf8(output).unwrap()
     }
 
@@ -456,10 +449,7 @@ mod tests {
         let id = v.get("id").unwrap();
         assert!(matches!(id, Json::Num(n) if n == "1"));
         let result = v.get("result").unwrap();
-        assert_eq!(
-            result.get("protocolVersion").and_then(Json::as_str),
-            Some("2024-11-05")
-        );
+        assert_eq!(result.get("protocolVersion").and_then(Json::as_str), Some("2024-11-05"));
         assert!(result.get("capabilities").unwrap().get("tools").is_some());
         let info = result.get("serverInfo").unwrap();
         assert_eq!(info.get("name").and_then(Json::as_str), Some("test-srv"));
@@ -553,10 +543,7 @@ mod tests {
             Json::Arr(a) => a,
             _ => panic!(),
         };
-        assert_eq!(
-            content[0].get("text").and_then(Json::as_str),
-            Some("kaboom")
-        );
+        assert_eq!(content[0].get("text").and_then(Json::as_str), Some("kaboom"));
         inst.join().unwrap();
     }
 
@@ -594,10 +581,7 @@ mod tests {
         let parsed = parse_json(seen[0].as_bytes()).unwrap();
         assert!(matches!(parsed.get("a"), Some(Json::Num(n)) if n == "1"));
         assert!(matches!(parsed.get("b"), Some(Json::Arr(_))));
-        assert_eq!(
-            parsed.get("c").and_then(|v| v.get("k")).and_then(Json::as_str),
-            Some("v")
-        );
+        assert_eq!(parsed.get("c").and_then(|v| v.get("k")).and_then(Json::as_str), Some("v"));
         inst.join().unwrap();
     }
 
@@ -626,12 +610,7 @@ mod tests {
         let v = parse_json(out.trim().as_bytes()).unwrap();
         let err = v.get("error").unwrap();
         assert!(matches!(err.get("code"), Some(Json::Num(n)) if n == "-32601"));
-        assert!(
-            err.get("message")
-                .and_then(Json::as_str)
-                .unwrap()
-                .contains("weird/method")
-        );
+        assert!(err.get("message").and_then(Json::as_str).unwrap().contains("weird/method"));
         assert!(v.get("result").is_none());
         inst.join().unwrap();
     }
@@ -682,10 +661,14 @@ mod tests {
         let inst = make_instance();
         let server = Server::new("s", "1", inst.addr.clone()).with_tool(Arc::new(EchoTool));
         let req = concat!(
-            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#, "\n",
-            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#, "\n",
-            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#, "\n",
-            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"echo","arguments":{"text":"yo"}}}"#, "\n",
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"echo","arguments":{"text":"yo"}}}"#,
+            "\n",
         );
         let out = drive(server, req);
         let resps = split_responses(&out);
@@ -709,8 +692,10 @@ mod tests {
         let inst = make_instance();
         let server = Server::new("s", "1", inst.addr.clone());
         let req = concat!(
-            r#"{"jsonrpc":"2.0","id":42,"method":"tools/list","params":{}}"#, "\n",
-            r#"{"jsonrpc":"2.0","id":7,"method":"tools/list","params":{}}"#, "\n",
+            r#"{"jsonrpc":"2.0","id":42,"method":"tools/list","params":{}}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","id":7,"method":"tools/list","params":{}}"#,
+            "\n",
         );
         let out = drive(server, req);
         let resps = split_responses(&out);
@@ -723,7 +708,8 @@ mod tests {
     fn blank_lines_between_requests_are_skipped() {
         let inst = make_instance();
         let server = Server::new("s", "1", inst.addr.clone());
-        let req = "\n   \n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}\n\n";
+        let req =
+            "\n   \n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}\n\n";
         let out = drive(server, req);
         let resps = split_responses(&out);
         assert_eq!(resps.len(), 1);
@@ -765,7 +751,9 @@ mod tests {
 "#;
         let out = drive(server, req);
         let line = out.lines().next().unwrap();
-        assert!(line.starts_with(r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05""#));
+        assert!(
+            line.starts_with(r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05""#)
+        );
         assert!(line.contains(r#""capabilities":{"tools":{}}"#));
         assert!(line.contains(r#""serverInfo":{"name":"srv","version":"0.1"}"#));
         inst.join().unwrap();

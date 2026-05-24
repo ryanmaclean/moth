@@ -18,10 +18,7 @@ impl Instance {
 }
 
 pub enum InstanceMsg {
-    Shell {
-        cmd: String,
-        reply: SyncSender<Result<ShellResult, SandboxError>>,
-    },
+    Shell { cmd: String, reply: SyncSender<Result<ShellResult, SandboxError>> },
 }
 
 impl Actor for Instance {

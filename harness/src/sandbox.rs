@@ -26,10 +26,7 @@ pub struct MockSandbox {
 
 impl MockSandbox {
     pub fn new(responses: Vec<ShellResult>) -> Self {
-        Self {
-            recorded: Mutex::new(Vec::new()),
-            responses: Mutex::new(responses),
-        }
+        Self { recorded: Mutex::new(Vec::new()), responses: Mutex::new(responses) }
     }
 }
 

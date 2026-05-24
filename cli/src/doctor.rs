@@ -111,16 +111,8 @@ pub(crate) fn run_doctor<W: Write>(
     let _ = writeln!(out);
 
     let _ = writeln!(out, "provider config:");
-    let _ = writeln!(
-        out,
-        "  ANTHROPIC_API_KEY:  {}",
-        fmt_key_line(env.anthropic_key.as_deref())
-    );
-    let _ = writeln!(
-        out,
-        "  OPENAI_API_KEY:     {}",
-        fmt_key_line(env.openai_key.as_deref())
-    );
+    let _ = writeln!(out, "  ANTHROPIC_API_KEY:  {}", fmt_key_line(env.anthropic_key.as_deref()));
+    let _ = writeln!(out, "  OPENAI_API_KEY:     {}", fmt_key_line(env.openai_key.as_deref()));
     let _ = writeln!(
         out,
         "  OPENAI_BASE_URL:    {}",
@@ -142,10 +134,7 @@ pub(crate) fn run_doctor<W: Write>(
     let _ = writeln!(out, "paths:");
     let root = env.agents_root.as_deref().unwrap_or(".");
     let skill_count = count_skills(root);
-    let _ = writeln!(
-        out,
-        "  AGENTS_ROOT:        {root:<12} (.agents/skills found: {skill_count})"
-    );
+    let _ = writeln!(out, "  AGENTS_ROOT:        {root:<12} (.agents/skills found: {skill_count})");
     let _ = writeln!(out, "  SESSIONS_DIR:       {}", or_unset(env.sessions_dir.as_deref()));
     let _ = writeln!(out, "  RUNLOG_DIR:         {}", or_unset(env.runlog_dir.as_deref()));
     let _ = writeln!(out, "  DOGSTATSD_ADDR:     {}", or_unset(env.dogstatsd_addr.as_deref()));
@@ -184,14 +173,12 @@ pub(crate) fn run_doctor<W: Write>(
     let outcome = compute_outcome(env, any_probe_ok, any_probe_fail);
     let _ = match &outcome {
         DoctorOutcome::Ok => writeln!(out, "ok — agent is ready."),
-        DoctorOutcome::NoKey => writeln!(
-            out,
-            "error: no provider key set. Set ANTHROPIC_API_KEY or OPENAI_API_KEY."
-        ),
-        DoctorOutcome::ProbeFailed => writeln!(
-            out,
-            "error: provider host unreachable. Check DNS / proxy / firewall."
-        ),
+        DoctorOutcome::NoKey => {
+            writeln!(out, "error: no provider key set. Set ANTHROPIC_API_KEY or OPENAI_API_KEY.")
+        }
+        DoctorOutcome::ProbeFailed => {
+            writeln!(out, "error: provider host unreachable. Check DNS / proxy / firewall.")
+        }
     };
     outcome
 }
@@ -207,11 +194,8 @@ fn write_probe_line<W: Write>(
     match probe(host, port, Duration::from_secs(5)) {
         Ok(d) => {
             *any_ok = true;
-            let _ = writeln!(
-                out,
-                "  {host}:{port:<5}   reachable ({}ms)         [ok]",
-                d.as_millis()
-            );
+            let _ =
+                writeln!(out, "  {host}:{port:<5}   reachable ({}ms)         [ok]", d.as_millis());
         }
         Err(e) => {
             *any_fail = true;
@@ -383,13 +367,7 @@ mod tests {
             extract_host(Some("https://openrouter.ai/api/v1"), "api.openai.com"),
             "openrouter.ai"
         );
-        assert_eq!(
-            extract_host(Some("http://localhost:11434/v1"), "api.openai.com"),
-            "localhost"
-        );
-        assert_eq!(
-            extract_host(Some("api.openai.com"), "api.openai.com"),
-            "api.openai.com"
-        );
+        assert_eq!(extract_host(Some("http://localhost:11434/v1"), "api.openai.com"), "localhost");
+        assert_eq!(extract_host(Some("api.openai.com"), "api.openai.com"), "api.openai.com");
     }
 }

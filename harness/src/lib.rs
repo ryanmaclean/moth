@@ -20,13 +20,12 @@ mod session;
 mod tools;
 
 pub use adapters::{AnthropicModel, AuditedShell, OpenAiModel};
-pub use mock::MockModel;
-pub use persist::{SessionStore, StoreError};
 pub use instance::{Instance, InstanceMsg};
+pub use mock::MockModel;
 pub use model::{
-    ChatMessage, ContentBlock, Model, ModelError, ModelEvent, ModelRequest,
-    Role, ToolDef,
+    ChatMessage, ContentBlock, Model, ModelError, ModelEvent, ModelRequest, Role, ToolDef,
 };
+pub use persist::{SessionStore, StoreError};
 pub use sandbox::{MockSandbox, Sandbox, SandboxError, ShellResult};
 pub use session::{
     CompactFn, HarnessState, PromptResult, Session, SessionError, SessionMsg, StreamEvent,
