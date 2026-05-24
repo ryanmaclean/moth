@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.94.1
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
@@ -23,7 +23,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential pkg-config perl make
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.94.1
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
@@ -34,7 +34,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential pkg-config perl make
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.94.1
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --locked --frozen --offline
 
@@ -43,13 +43,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential pkg-config perl make gcc-aarch64-linux-gnu
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.94.1
         with:
           targets: aarch64-unknown-linux-gnu
       - uses: Swatinem/rust-cache@v2
-      - env:
+        with:
+          key: aarch64-cross
+      - name: Toolchain diagnostics
+        run: |
+          rustc -V
+          cargo -V
+          which aarch64-linux-gnu-gcc
+          aarch64-linux-gnu-gcc --version | head -1
+          which aarch64-linux-gnu-ar
+          cat .cargo/config.toml
+      - name: cargo check (aarch64)
+        env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-        run: cargo check --workspace --target aarch64-unknown-linux-gnu --locked --frozen --offline
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
+        run: cargo check -v --workspace --target aarch64-unknown-linux-gnu --locked --frozen --offline
 
   docker:
     runs-on: ubuntu-latest
