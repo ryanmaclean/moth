@@ -19,8 +19,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use actor::{Spawned, spawn};
 use harness::{
-    AuditedShell, ContentBlock, HarnessState, Instance, InstanceMsg, MockModel, Model, ModelEvent,
-    Sandbox, Session, SessionError, SessionMsg, SessionStore, Tool,
+    AuditedShell, ContentBlock, HarnessState, Instance, InstanceMsg, MAX_TURNS_PER_PROMPT,
+    MockModel, Model, ModelEvent, Sandbox, Session, SessionError, SessionMsg, SessionStore, Tool,
 };
 
 // -- per-test scratch directories ---------------------------------------------
@@ -414,9 +414,10 @@ fn tmpl_loads_and_renders_skill() {
 
 #[test]
 fn turn_limit_caps_infinite_tool_loop() {
-    // 66 scripts (well past the 64-turn cap). The harness must stop
-    // exactly at turn 64 and the sandbox must have seen exactly 64 calls.
-    const SCRIPTS: usize = 66;
+    // Script enough turns to overshoot the `MAX_TURNS_PER_PROMPT` cap. The
+    // harness must stop exactly at the cap and the sandbox must have seen
+    // exactly `MAX_TURNS_PER_PROMPT` calls.
+    const SCRIPTS: usize = MAX_TURNS_PER_PROMPT + 2;
     let scripts: Vec<Vec<ModelEvent>> = (0..SCRIPTS)
         .map(|_| {
             vec![
@@ -440,13 +441,15 @@ fn turn_limit_caps_infinite_tool_loop() {
         Ok(_) => panic!("expected TurnLimitExceeded"),
     }
 
-    // We invoked the bash tool on turns 1..=64; the 65th iteration trips
-    // the cap before executing tools. So the sandbox saw 64 calls.
+    // We invoked the bash tool on turns 1..=MAX_TURNS_PER_PROMPT; the next
+    // iteration trips the cap before executing tools. So the sandbox saw
+    // exactly `MAX_TURNS_PER_PROMPT` calls.
     let recorded = sandbox.recorded.lock().unwrap();
     assert_eq!(
         recorded.len(),
-        64,
-        "expected exactly 64 sandbox calls, got {}: {:?}",
+        MAX_TURNS_PER_PROMPT,
+        "expected exactly {} sandbox calls, got {}: {:?}",
+        MAX_TURNS_PER_PROMPT,
         recorded.len(),
         *recorded
     );

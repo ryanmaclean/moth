@@ -32,7 +32,7 @@ const DEFAULT_MAX_TOKENS: u32 = 4096;
 /// read → propose → patch → cargo build → patch again → cargo test ≈ 6
 /// turns; anything iterative blows past it). 64 gives breathing room for
 /// real work while still bounding the worst case.
-const MAX_TURNS_PER_PROMPT: usize = 64;
+pub const MAX_TURNS_PER_PROMPT: usize = 64;
 
 /// Callback that may shorten `messages` (typically by summarising older
 /// turns). Called by the iteration loop BEFORE each turn. Implementations
