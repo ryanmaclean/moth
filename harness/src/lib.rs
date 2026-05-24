@@ -28,7 +28,7 @@ pub use model::{
 pub use persist::{SessionStore, StoreError};
 pub use sandbox::{MockSandbox, Sandbox, SandboxError, ShellResult};
 pub use session::{
-    CompactFn, HarnessState, MAX_TURNS_PER_PROMPT, PromptResult, Session, SessionError,
-    SessionMsg, StreamEvent,
+    CompactFn, HarnessState, MAX_TURNS_PER_PROMPT, PromptResult, Session, SessionError, SessionMsg,
+    StreamEvent,
 };
 pub use tools::{BashTool, Tool, ToolCtx, ToolError, default_tools};
