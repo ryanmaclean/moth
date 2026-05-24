@@ -39,9 +39,16 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential pkg-config perl make
 
-      - name: Install aarch64 cross linker
+      - name: Install aarch64 cross linker + sysroot
         if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu
+        # See .github/workflows/rust.yml cross-check-aarch64 — the
+        # -cross sysroot packages provide glibc + kernel headers the
+        # vendored C builds (zlib, openssl, libcurl) need.
+        run: |
+          sudo apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu \
+            libc6-dev-arm64-cross \
+            linux-libc-dev-arm64-cross
 
       - uses: dtolnay/rust-toolchain@stable
         with:
