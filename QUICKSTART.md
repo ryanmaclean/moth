@@ -146,9 +146,9 @@ scrape into Prometheus. Quick local sink to eyeball the wire format:
 nc -u -l 8125          # or: socat -u UDP-RECV:8125 -
 ```
 
-Metric names below are the raw call-site names; the CLI prepends an
-`agent.` prefix and a `provider:anthropic|openai` constant tag to every
-line. Emitted from the Session iteration loop and per tool call:
+Metric names below are emitted as listed, with a
+`provider:anthropic|openai` constant tag on every line. Emitted from the
+Session iteration loop and per tool call:
 
 | Metric | Type | Tags |
 |---|---|---|
@@ -165,7 +165,7 @@ guard — success, model error, turn-limit, cancellation, even a panic
 
 Subagents spawned via the `task` tool inherit the parent's emitter, so
 their prompt/tool/audit metrics land in the same sink with the same
-prefix and tags. `agent doctor` prints the configured sink under
+metric names and provider tag. `agent doctor` prints the configured sink under
 `paths:` (the `DOGSTATSD_ADDR:` line) so you can confirm wiring before a
 run.
 
