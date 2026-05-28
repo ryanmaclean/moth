@@ -1,0 +1,25 @@
+# Build artefacts and editor cruft. KEEP rust/vendor/** — we build offline.
+target/
+!vendor/**/target/
+!vendor/**/target/**
+!vendor/**/target.rs
+
+.git/
+.github/
+.gitignore
+.dockerignore
+Dockerfile
+
+node_modules/
+
+# Docs we don't need in the build context (keep README.md so anyone who
+# `docker inspect`s a built layer can find their bearings).
+*.md
+!README.md
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store

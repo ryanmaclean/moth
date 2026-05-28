@@ -1,21 +1,46 @@
-Use `npm run typecheck` for type checking.
+# Agent harness — Rust workspace
 
-Check [./CONTEXT.md](./CONTEXT.md) for terminology questions.
+Cargo workspace, 19 crates, one direct external dep (`curl-sys`). All
+transitive deps live under `vendor/`. Every cargo invocation runs with
+`--locked --frozen --offline` — vendored sources are the only source
+of truth; network fetches are a build-failure signal, not a fallback.
 
-For user-facing changes, add a changeset to `.changeset`. Check all changesets there first to see if there are duplicates. We use `@changesets/cli`, but you can create/edit the file manually. Make all changesets `patch` (since we're pre-1.0). Use `package.json#name` for the name.
+## Daily commands
 
-When changing public-facing behavior, check `README.md` to see if the documentation needs updating.
+```bash
+cargo check   --workspace --locked --frozen --offline
+cargo clippy  --workspace --all-targets --locked --frozen --offline -- -D warnings
+cargo test    --workspace --locked --frozen --offline
+cargo fmt --all
+```
 
-## Agent skills
+Cross-target sanity check (must pass before any release tag):
 
-### Issue tracker
+```bash
+cargo check --workspace --target aarch64-unknown-linux-gnu --locked --frozen --offline
+```
 
-Issues live as GitHub issues in `mattpocock/sandcastle`. See `docs/agents/issue-tracker.md`.
+## Install
 
-### Triage labels
+```bash
+cargo install --locked --offline --frozen --path cli --root ~/.local
+# binary lands at ~/.local/bin/agent
+```
 
-Default canonical labels. Agent provider support is detailed here. See `docs/agents/triage.md`.
+The shipped binary is `agent`. Subcommands: `run`, `serve`, `mcp-serve`,
+`doctor`, `--version`.
 
-### Domain docs
+## Architecture decisions
 
-Single-context layout: `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
+ADRs live under `docs/adr/`. Read them before proposing structural
+changes. `0002-cut-list.md` codifies the round-7 **subtraction rule**:
+a crate stays only if (1) the CLI hits it on a hot path, (2) another
+qualifying crate depends on it, or (3) it's a bench/integration/test
+fixture. "Might be useful later" is not a reason — re-adding is one
+`git revert` away.
+
+## Changelog
+
+Root `CHANGELOG.md`, Keep-A-Changelog format, semver pre-1.0. Add
+user-visible changes under `## Unreleased` in `Added` / `Changed` /
+`Fixed` / `Removed`.

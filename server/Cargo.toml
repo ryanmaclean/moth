@@ -1,0 +1,9 @@
+[package]
+name = "server"
+version = "0.0.1"
+edition = "2024"
+publish = false
+description = "Minimal blocking HTTP/1.1 server exposing AgentHandler endpoints with SSE streaming. std only, zero dependencies."
+
+[lib]
+path = "src/lib.rs"

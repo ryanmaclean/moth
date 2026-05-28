@@ -1,0 +1,13 @@
+[package]
+name = "runlog"
+version = "0.0.1"
+edition = "2024"
+publish = false
+description = "File-backed structured event log. Subscribes to harness::StreamEvent and writes one JSONL record per event."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+anthropic = { path = "../anthropic" }
+harness = { path = "../harness" }

@@ -1,0 +1,100 @@
+name: rust
+
+# Every cargo job runs inside the `builder` stage of the project
+# Dockerfile, so CI uses the *same* environment as a developer
+# `docker build .`. There is no apt-get and no dtolnay/rust-toolchain
+# here — the toolchain pin lives in rust-toolchain.toml, and the
+# native + cross C deps live in the Dockerfile. Local and CI builds
+# cannot diverge on apt-deps or rust channel.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  builder-image:
+    # Build the builder image once and export it as a tar artifact so
+    # downstream jobs can `docker load` it instead of each rebuilding
+    # the same apt+rustup layers. Cuts ~2 minutes per dependent job.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build builder image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: builder
+          tags: agent-builder:ci
+          outputs: type=docker,dest=/tmp/agent-builder.tar
+          cache-from: type=gha,scope=builder
+          cache-to: type=gha,mode=max,scope=builder
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agent-builder-image
+          path: /tmp/agent-builder.tar
+          retention-days: 1
+
+  fmt:
+    needs: builder-image
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: agent-builder-image
+          path: /tmp
+      - name: Load builder image
+        run: docker load -i /tmp/agent-builder.tar && docker tag agent-builder:ci agent-builder
+      - name: cargo fmt --check
+        run: .github/scripts/cargo-annotate.sh fmt fmt --all -- --check
+
+  clippy:
+    needs: builder-image
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: agent-builder-image
+          path: /tmp
+      - name: Load builder image
+        run: docker load -i /tmp/agent-builder.tar && docker tag agent-builder:ci agent-builder
+      - name: cargo clippy
+        run: |
+          .github/scripts/cargo-annotate.sh clippy \
+            clippy --workspace --all-targets --locked --frozen --offline -- -D warnings
+
+  test:
+    needs: builder-image
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: agent-builder-image
+          path: /tmp
+      - name: Load builder image
+        run: docker load -i /tmp/agent-builder.tar && docker tag agent-builder:ci agent-builder
+      - name: cargo test
+        run: |
+          .github/scripts/cargo-annotate.sh test \
+            test --workspace --locked --frozen --offline
+
+  docker:
+    # Full-image smoke test. Independent of builder-image so a broken
+    # final stage surfaces even if the builder-only artifact succeeded.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: agent:ci
+          cache-from: type=gha,scope=builder

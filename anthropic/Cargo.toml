@@ -1,0 +1,13 @@
+[package]
+name = "anthropic"
+version = "0.0.1"
+edition = "2024"
+publish = false
+description = "Streaming client for the Anthropic Messages API. libcurl + OpenSSL via FFI, tiny hand-rolled JSON."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+curl-sys = { version = "0.4", features = ["static-curl", "static-ssl"] }
+wire = { path = "../wire" }

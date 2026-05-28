@@ -1,0 +1,12 @@
+[package]
+name = "vshell"
+version = "0.0.1"
+edition = "2024"
+publish = false
+description = "Tiny in-process POSIX shell subset. Parse + dispatch in-process; spawn children for external binaries. Only depends on libc for signal/waitpid plumbing."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+libc = "0.2"

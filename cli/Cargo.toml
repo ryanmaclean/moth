@@ -1,0 +1,27 @@
+[package]
+name = "cli"
+version = "0.0.1"
+edition = "2024"
+publish = false
+description = "One-shot agent runner. Wires anthropic + vshell + audit through the harness."
+
+[[bin]]
+name = "agent"
+path = "src/main.rs"
+
+[dependencies]
+actor = { path = "../actor" }
+anthropic = { path = "../anthropic" }
+compact = { path = "../compact" }
+fstools = { path = "../fstools" }
+git = { path = "../git" }
+harness = { path = "../harness" }
+mcp = { path = "../mcp" }
+metrics = { path = "../metrics" }
+persist = { path = "../persist" }
+runlog = { path = "../runlog" }
+server = { path = "../server" }
+subagent = { path = "../subagent" }
+tmpl = { path = "../tmpl" }
+vshell = { path = "../vshell" }
+libc = "0.2"

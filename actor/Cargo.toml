@@ -1,0 +1,9 @@
+[package]
+name = "actor"
+version = "0.0.1"
+edition = "2024"
+publish = false
+description = "Minimal actor primitive: OS threads, std::sync::mpsc, no dependencies."
+
+[lib]
+path = "src/lib.rs"

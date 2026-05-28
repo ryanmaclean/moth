@@ -1,0 +1,9 @@
+[package]
+name = "wire"
+version = "0.0.1"
+edition = "2024"
+publish = false
+description = "Byte-scan SIMD primitives. NEON on aarch64, AVX2 on x86_64, scalar fallback. Zero dependencies."
+
+[lib]
+path = "src/lib.rs"

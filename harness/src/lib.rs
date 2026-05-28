@@ -1,0 +1,34 @@
+//! Orchestration layer for the Rust agent harness.
+//!
+//! Two actors — `Instance` (owns the sandbox) and `Session` (owns message
+//! history + drives the iteration loop) — plus the `Model` and `Sandbox`
+//! traits they consume. `Harness` is a passive value (`HarnessState`) held
+//! by each `Session`: it's only model defaults + an `ActorRef` to the
+//! instance, so promoting it to its own actor would add hops without
+//! serialising any state.
+//!
+//! See Flue's instance/harness/session hierarchy for the conceptual model;
+//! the implementation collapses Harness into a value type.
+
+mod adapters;
+mod instance;
+pub mod mock;
+mod model;
+mod persist;
+mod sandbox;
+mod session;
+mod tools;
+
+pub use adapters::{AnthropicModel, AuditedShell, OpenAiModel};
+pub use instance::{Instance, InstanceMsg};
+pub use mock::MockModel;
+pub use model::{
+    ChatMessage, ContentBlock, Model, ModelError, ModelEvent, ModelRequest, Role, ToolDef,
+};
+pub use persist::{SessionStore, StoreError};
+pub use sandbox::{MockSandbox, Sandbox, SandboxError, ShellResult};
+pub use session::{
+    CompactFn, HarnessState, MAX_TURNS_PER_PROMPT, PromptResult, Session, SessionError, SessionMsg,
+    StreamEvent,
+};
+pub use tools::{BashTool, Tool, ToolCtx, ToolError, default_tools};

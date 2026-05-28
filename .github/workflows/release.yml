@@ -1,39 +1,176 @@
-name: Release
+name: release
 
 on:
   push:
-    branches:
-      - main
+    tags:
+      - 'v*'
 
-concurrency: ${{ github.workflow }}-${{ github.ref }}
+permissions:
+  contents: write
+  packages: write
+  id-token: write
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
-  release:
-    name: Release
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      pull-requests: write
-      id-token: write
+  build:
+    name: build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+            kind: linux
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04
+            kind: linux
+          - target: x86_64-apple-darwin
+            os: macos-14
+            kind: darwin
+          - target: aarch64-apple-darwin
+            os: macos-14
+            kind: darwin
+    runs-on: ${{ matrix.os }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      # --------------- Linux legs: docker builder image ----------------
+      # The builder stage bakes in build-essential, pkg-config, perl,
+      # make, gcc-aarch64-linux-gnu, libc6-dev-arm64-cross,
+      # linux-libc-dev-arm64-cross, the aarch64 rust target, and
+      # CARGO_TARGET_AARCH64_*/CC_*/AR_* env. No per-step apt-get.
+      - name: Set up buildx (linux)
+        if: matrix.kind == 'linux'
+        uses: docker/setup-buildx-action@v3
+      - name: Build builder image (linux)
+        if: matrix.kind == 'linux'
+        uses: docker/build-push-action@v6
         with:
-          node-version: 24
-          registry-url: 'https://registry.npmjs.org'
+          context: .
+          target: builder
+          tags: agent-builder
+          load: true
+          cache-from: type=gha,scope=builder
+          cache-to: type=gha,mode=max,scope=builder
+      - name: Build (linux)
+        if: matrix.kind == 'linux'
+        run: |
+          .github/scripts/cargo-annotate.sh build-${{ matrix.target }} \
+            build --release --locked --frozen --offline \
+            -p cli --target ${{ matrix.target }}
+      - name: Strip binary (linux)
+        if: matrix.kind == 'linux'
+        run: |
+          BIN=target/${{ matrix.target }}/release/agent
+          if [[ "${{ matrix.target }}" == aarch64-unknown-linux-gnu ]]; then
+            docker run --rm -v "$PWD:/work" -w /work agent-builder \
+              aarch64-linux-gnu-strip "$BIN"
+          else
+            docker run --rm -v "$PWD:/work" -w /work agent-builder \
+              strip "$BIN"
+          fi
 
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Build
-        run: npm run build
-
-      - name: Create Release Pull Request or Publish to npm
-        uses: changesets/action@v1
+      # --------------- Darwin legs: native macos-14 runner -------------
+      # No docker on GitHub-hosted macOS runners. The toolchain pin in
+      # rust-toolchain.toml is picked up automatically by cargo.
+      - name: Install rust toolchain (darwin)
+        if: matrix.kind == 'darwin'
+        uses: dtolnay/rust-toolchain@stable
         with:
-          publish: npx changeset publish
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        if: matrix.kind == 'darwin'
+        with:
+          key: ${{ matrix.target }}
+      - name: Build (darwin)
+        if: matrix.kind == 'darwin'
+        run: |
+          cargo build --release --locked --frozen --offline \
+            -p cli --target ${{ matrix.target }}
+      - name: Strip binary (darwin)
+        if: matrix.kind == 'darwin'
+        run: |
+          strip target/${{ matrix.target }}/release/agent
+
+      # --------------- Common: stage + checksum + upload ---------------
+      - name: Stage tarball
+        run: |
+          STAGE="agent-${{ github.ref_name }}-${{ matrix.target }}"
+          mkdir -p "dist/$STAGE"
+          cp target/${{ matrix.target }}/release/agent "dist/$STAGE/"
+          cp LICENSE README.md CHANGELOG.md "dist/$STAGE/"
+          tar -C dist -czf "dist/${STAGE}.tar.gz" "$STAGE"
+
+      - name: SHA-256
+        run: |
+          cd dist
+          F="agent-${{ github.ref_name }}-${{ matrix.target }}.tar.gz"
+          if command -v sha256sum >/dev/null; then
+            sha256sum "$F" > "$F.sha256"
+          else
+            shasum -a 256 "$F" > "$F.sha256"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agent-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: github release
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          body: |
+            See [`CHANGELOG.md`](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/CHANGELOG.md) for the changes in this release.
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
+          fail_on_unmatched_files: true
+
+  docker:
+    name: docker multi-arch
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Lowercase image name
+        id: img
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ steps.img.outputs.name }}:${{ github.ref_name }}
+            ${{ steps.img.outputs.name }}:latest
+          build-args: |
+            REPO_SOURCE=https://github.com/${{ github.repository }}
+          provenance: true
+          sbom: true
+          cache-from: type=gha,scope=builder
