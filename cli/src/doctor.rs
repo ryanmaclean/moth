@@ -268,6 +268,16 @@ fn target_triple() -> &'static str {
         "x86_64-apple-darwin"
     } else if cfg!(all(target_arch = "aarch64", target_os = "macos")) {
         "aarch64-apple-darwin"
+    } else if cfg!(all(target_arch = "x86_64", target_os = "freebsd")) {
+        "x86_64-unknown-freebsd"
+    } else if cfg!(all(target_arch = "aarch64", target_os = "freebsd")) {
+        "aarch64-unknown-freebsd"
+    } else if cfg!(target_os = "freebsd") {
+        "freebsd"
+    } else if cfg!(target_os = "netbsd") {
+        "netbsd"
+    } else if cfg!(target_os = "openbsd") {
+        "openbsd"
     } else {
         "unknown"
     }

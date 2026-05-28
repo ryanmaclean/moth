@@ -9,6 +9,8 @@ Get from `git clone` to a running agent in about five minutes.
   - **Debian / Ubuntu:** `sudo apt install build-essential pkg-config perl`
   - **macOS:** `xcode-select --install`
   - **Fedora / RHEL:** `sudo dnf install gcc gcc-c++ make perl pkgconfig`
+  - **FreeBSD:** `pkg install gmake perl5` (and `git` if you use the
+    branch-strategy tools). OpenSSL's build needs GNU make, hence `gmake`.
 - An API key for either Anthropic or any OpenAI-compatible provider.
 
 If you'd rather not install Rust, see the Docker path in the
