@@ -11,6 +11,7 @@ semver pre-1.0 (every release is `0.x.y`; minor bumps may break API).
 - ADR-0002 captures the subtraction-first scope policy.
 - ADR-0003 keeps the `metrics` crate (superseding ADR-0002's deferred-cut bullet) and wires it end-to-end.
 - `--metrics <HOST:PORT>` flag on `agent run` / `agent serve` (overrides `DOGSTATSD_ADDR`; flag > env > disabled).
+- FreeBSD support: builds + runs natively (the vendored OpenSSL/libcurl C sources need `gmake` + `perl5`); `agent doctor` reports FreeBSD/NetBSD/OpenBSD target triples; a `freebsd` CI job builds the binary and tests the platform-sensitive crates inside a native FreeBSD VM (the C deps don't cross-compile from Linux).
 
 ### Changed
 - Metrics now emitted across `agent run`, `agent serve`, and subagents (subagents inherit the parent's emitter); opt-in via `--metrics`/`DOGSTATSD_ADDR`, no-op when unset.

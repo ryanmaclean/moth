@@ -17,7 +17,8 @@ under [`examples/`](./examples/).
 ## Install
 
 **Cargo (from source).** Requires Rust ≥ 1.85 and a C toolchain
-(`build-essential` on Debian, `xcode-select --install` on macOS):
+(`build-essential` on Debian, `xcode-select --install` on macOS,
+`pkg install gmake perl5` on FreeBSD):
 
 ```bash
 cargo install --locked --offline --frozen --path cli --root ~/.local
@@ -42,6 +43,18 @@ docker run --rm -e ANTHROPIC_API_KEY \
 
 **Release tarballs.** Planned. None published yet — build from source
 for now.
+
+## Platforms
+
+Linux (x86_64, aarch64) and macOS (x86_64, aarch64) are the primary
+targets and run in CI. **FreeBSD** (x86_64) builds and runs natively —
+install `gmake` + `perl5` for the vendored OpenSSL/libcurl C build, then
+the usual `cargo install`. A `freebsd` CI job builds + tests the binary
+inside a native FreeBSD VM (the vendored OpenSSL C sources don't
+cross-compile from Linux, so BSD is built natively rather than
+cross-targeted). NetBSD / OpenBSD aren't tested but the code is
+`std`-and-`libc`-only with no Linux-specific syscalls, so they're
+expected to work with the same build prerequisites.
 
 ## Status
 

@@ -1,0 +1,66 @@
+name: freebsd
+
+# Native FreeBSD build + test. GitHub-hosted runners have no BSD image,
+# and the vendored OpenSSL/libcurl C sources do NOT cross-compile from
+# Linux to FreeBSD (they reach for FreeBSD-only kernel headers like
+# crypto/cryptodev.h that aren't in a Linux cross sysroot). So we build
+# natively inside a FreeBSD VM via vmactions.
+#
+# The VM is emulated, so this is slow (~15-25 min incl. the one-time
+# OpenSSL + libcurl C build). It is therefore NOT on every PR push by
+# default — run it on PRs that touch platform-sensitive code, on demand
+# via the Actions UI, or as the post-merge guard on main.
+
+on:
+  pull_request:
+    paths:
+      - '**/*.rs'
+      - '**/Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/freebsd.yml'
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  freebsd:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build + test in a FreeBSD VM
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: "14.2"
+          usesh: true
+          # Native toolchain for the vendored C deps:
+          #   gmake  — OpenSSL's generated Makefile needs GNU make.
+          #   perl5  — OpenSSL's Configure is perl.
+          #   git    — the `git` crate's tests shell out to git(1).
+          #   curl + ca_root_nss — fetch rustup over TLS.
+          prepare: |
+            pkg install -y curl ca_root_nss gmake perl5 git
+          # rustup honours rust-toolchain.toml (channel 1.94.1), so the
+          # FreeBSD build uses the exact toolchain Linux CI does. cargo
+          # stays --offline against vendor/; only rustup hits the network.
+          run: |
+            set -e
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --default-toolchain none --profile minimal
+            . "$HOME/.cargo/env"
+            echo "::group::toolchain"
+            rustc -V
+            cargo -V
+            echo "::endgroup::"
+            # Build the binary — this is the real "does it build on BSD"
+            # test: it compiles + links the vendored OpenSSL and libcurl
+            # natively.
+            cargo build --locked --frozen --offline -p cli
+            ./target/debug/agent --version
+            ./target/debug/agent run --mock "hello from freebsd"
+            # Platform-sensitive crates: fstools (O_NOFOLLOW atomic write,
+            # hard-link detection), git (shells out to git(1)), vshell
+            # (process exec), wire (SIMD vs scalar dispatch). Full-workspace
+            # test is skipped here — too slow under VM emulation.
+            cargo test --locked --frozen --offline -p fstools -p git -p vshell -p wire
