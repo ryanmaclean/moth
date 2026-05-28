@@ -3,7 +3,7 @@
 //! `find_tag(haystack, "output")` returns the bytes between the first
 //! `<output>` and the next `</output>`. Case-sensitive. No nesting
 //! support — the first `</tag>` after the matching open wins. Designed
-//! for Sandcastle-style completion signals (`<promise>COMPLETE</promise>`)
+//! for promise-tag completion signals (`<promise>COMPLETE</promise>`)
 //! and structured-output extraction.
 
 use crate::scan::scan_for_byte;

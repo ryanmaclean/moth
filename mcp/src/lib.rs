@@ -177,7 +177,7 @@ impl McpClient {
         let init_params = concat!(
             r#"{"protocolVersion":"2024-11-05","#,
             r#""capabilities":{},"#,
-            r#""clientInfo":{"name":"sandcastle-mcp","version":"0.0.1"}}"#
+            r#""clientInfo":{"name":"scry-mcp","version":"0.0.1"}}"#
         );
         let init_envelope = inner.request("initialize", Some(init_params))?;
         let init_resp = init_envelope

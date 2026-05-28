@@ -1,10 +1,11 @@
-# agent
+# scry
 
 Experimental Rust core for a minimal agent harness. Distils ideas from
-Sandcastle (sandbox provider × branch strategy, two-phase prompt,
-completion signal, structured output) and Flue (instance/harness/session
-hierarchy, virtual sandbox default, skills + roles, declarative triggers)
-into a build with a small dependency footprint.
+the upstream TypeScript library it descended from (sandbox provider ×
+branch strategy, two-phase prompt, completion signal, structured
+output) and from Flue (instance/harness/session hierarchy, virtual
+sandbox default, skills + roles, declarative triggers) into a build
+with a small dependency footprint.
 
 ## Quickstart
 
