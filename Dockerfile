@@ -58,7 +58,7 @@ FROM gcr.io/distroless/cc-debian12 AS runtime
 
 # Parameterized so the label tracks whatever owner/repo the image was
 # built in. Release CI passes --build-arg REPO_SOURCE=https://github.com/${{ github.repository }}.
-ARG REPO_SOURCE="https://github.com/ryanmaclean/scry"
+ARG REPO_SOURCE="https://github.com/ryanmaclean/moth"
 LABEL org.opencontainers.image.source="${REPO_SOURCE}"
 LABEL org.opencontainers.image.description="Minimal Rust agent harness; vendored deps, libcurl + OpenSSL via curl-sys."
 LABEL org.opencontainers.image.licenses="MIT"

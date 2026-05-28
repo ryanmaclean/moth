@@ -1234,7 +1234,7 @@ fn mcp_serve_cmd(mut args: Vec<String>) -> ExitCode {
     let sandbox: Box<dyn Sandbox> = Box::new(AuditedShell::new(vshell::VShell::new()));
     let inst = spawn(Instance::new("mcp-serve", sandbox));
 
-    let mut srv = mcp::server::Server::new("scry", env!("CARGO_PKG_VERSION"), inst.addr.clone());
+    let mut srv = mcp::server::Server::new("moth", env!("CARGO_PKG_VERSION"), inst.addr.clone());
     for t in tools {
         srv.register(t);
     }

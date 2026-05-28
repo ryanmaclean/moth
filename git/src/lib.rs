@@ -10,7 +10,7 @@
 //!
 //! Shells out to `git(1)`. No `libgit2`. No async. No external deps.
 //!
-//! Worktrees live at `<repo_root>/.scry/worktrees/<name>`.
+//! Worktrees live at `<repo_root>/.moth/worktrees/<name>`.
 
 use std::ffi::OsStr;
 use std::fmt;
@@ -138,7 +138,7 @@ fn branch_exists(repo_root: &Path, name: &str) -> Result<bool, GitError> {
 }
 
 fn worktree_root(repo_root: &Path) -> PathBuf {
-    repo_root.join(".scry").join("worktrees")
+    repo_root.join(".moth").join("worktrees")
 }
 
 /// `agent-YYYYMMDD-HHMMSS-XXXX` where XXXX is 4 lowercase hex chars derived
@@ -390,7 +390,7 @@ mod tests {
             let n = COUNTER.fetch_add(1, Ordering::Relaxed);
             let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
             let path = std::env::temp_dir().join(format!(
-                "scry-git-test-{}-{}-{}",
+                "moth-git-test-{}-{}-{}",
                 std::process::id(),
                 nanos,
                 n
@@ -466,7 +466,7 @@ mod tests {
         let r = TempRepo::new();
         let ws = MergeToHeadStrategy.prepare(&r.path).unwrap();
         assert_eq!(ws.target_branch.as_deref(), Some("main"));
-        assert!(ws.path.starts_with(r.path.join(".scry/worktrees")));
+        assert!(ws.path.starts_with(r.path.join(".moth/worktrees")));
         assert!(ws.path.exists());
 
         commit_file(&ws.path, "agent.txt", "hi", "agent work");
@@ -522,7 +522,7 @@ mod tests {
         let r = TempRepo::new();
         let ws = MergeToHeadStrategy.prepare(&r.path).unwrap();
         let parent = ws.path.parent().unwrap();
-        assert!(parent.ends_with(".scry/worktrees"));
+        assert!(parent.ends_with(".moth/worktrees"));
         assert!(ws.source_branch.starts_with("agent-"));
         MergeToHeadStrategy.finish(ws, AgentStatus::Success).unwrap();
     }
@@ -590,7 +590,7 @@ mod tests {
 
     #[test]
     fn not_a_repo_errors() {
-        let dir = std::env::temp_dir().join(format!("scry-not-a-repo-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("moth-not-a-repo-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let err = HeadStrategy.prepare(&dir).unwrap_err();

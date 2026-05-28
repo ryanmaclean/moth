@@ -1,4 +1,4 @@
-# scry
+# moth
 
 Experimental Rust core for a minimal agent harness. Distils ideas from
 the upstream TypeScript library it descended from (sandbox provider ×
