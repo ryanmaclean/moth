@@ -118,6 +118,57 @@ frame. `GET /healthz` and `/readyz` return 200 once the server is
 draining-ready. Send SIGTERM to drain in-flight requests with a 30 s
 deadline.
 
+## Metrics & observability
+
+The agent emits [DogStatsD](https://docs.datadoghq.com/developers/dogstatsd/)
+over UDP — fire-and-forget, errors swallowed, never on the critical path.
+It's opt-in and a no-op until you point it at a sink:
+
+```bash
+# Flag (highest priority) — applies to run and serve:
+agent run  --metrics 127.0.0.1:8125 "do something"
+agent serve --metrics 127.0.0.1:8125 --addr 127.0.0.1:3583
+
+# Or via env var (used when --metrics is absent):
+export DOGSTATSD_ADDR=127.0.0.1:8125
+agent run "do something"
+```
+
+**Resolution order:** `--metrics <HOST:PORT>` > `DOGSTATSD_ADDR` >
+disabled. When neither is set the emitter is a no-op (no socket bound,
+every emit returns immediately), so leaving metrics off costs nothing.
+
+Any DogStatsD-speaking receiver works: a Datadog Agent, or
+[`statsd_exporter`](https://github.com/prometheus/statsd_exporter) to
+scrape into Prometheus. Quick local sink to eyeball the wire format:
+
+```bash
+nc -u -l 8125          # or: socat -u UDP-RECV:8125 -
+```
+
+Metric names below are the raw call-site names; the CLI prepends an
+`agent.` prefix and a `provider:anthropic|openai` constant tag to every
+line. Emitted from the Session iteration loop and per tool call:
+
+| Metric | Type | Tags |
+|---|---|---|
+| `agent.prompt.started` | counter | — |
+| `agent.prompt.turns` | histogram | — |
+| `agent.prompt.duration_ms` | timer | `outcome` (`ok` / `model_error` / `turn_limit` / `cancelled` / `dropped`) |
+| `agent.tool.calls` | counter | `name`, `outcome` (`ok` / `error` / `unknown`) |
+| `agent.tool.duration_ms` | timer | `name`, `outcome` |
+| `agent.audit.blocked` | counter | `name` |
+
+`agent.prompt.duration_ms` is emitted on every exit path via an RAII
+guard — success, model error, turn-limit, cancellation, even a panic
+(tagged `dropped`) — so no prompt goes unmeasured.
+
+Subagents spawned via the `task` tool inherit the parent's emitter, so
+their prompt/tool/audit metrics land in the same sink with the same
+prefix and tags. `agent doctor` prints the configured sink under
+`paths:` (the `DOGSTATSD_ADDR:` line) so you can confirm wiring before a
+run.
+
 ## Exposing your tools to other agents
 
 `agent mcp-serve` makes the agent itself an MCP server over stdio.

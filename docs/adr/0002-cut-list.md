@@ -59,10 +59,11 @@ cut without an explicit call.
   failures → fail-fast for K seconds" guard. We don't have enough
   per-host traffic for half-open probing to matter.
 
-- **`metrics` crate.** 497 LOC of DogStatsD UDP emission. We have call
-  sites in Session, but the deployment isn't wired to a DogStatsD agent
-  yet. Could shrink to a 30-LOC trait stub with a real impl bolted on
-  when there's a sink to hit.
+- **`metrics` crate.** _Superseded by ADR-0003 — kept and wired._ 497
+  LOC of DogStatsD UDP emission. We have call sites in Session, but the
+  deployment isn't wired to a DogStatsD agent yet. Could shrink to a
+  30-LOC trait stub with a real impl bolted on when there's a sink to
+  hit.
 
 - **`subagent` + `compact` inline into `harness`.** Both are <800 LOC
   features of the Session loop. Folding them in would reduce the

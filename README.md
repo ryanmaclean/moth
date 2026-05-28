@@ -73,6 +73,7 @@ suite with measured numbers; cross-crate integration suite (16 default
 | `integration/` | Cross-crate scenario tests. 12 whole-stack tests covering tool routing, audit blocking, fstools sandboxing, session persistence, MCP wiring, completion signal, turn cap, structured output extraction. | every crate it tests |
 | `benches/` | Microbenchmarks for the SIMD/parsing hot paths. `std::time::Instant`-based, no criterion. `cargo test -p benches --release -- --nocapture`. | `wire`, `audit`, `anthropic`, `vshell` |
 | `runlog/` | File-backed JSONL audit trail. Subscribes to `harness::StreamEvent` and writes one record per event. Atomic appends, mutex-guarded; ms-precision UNIX timestamps. | `harness`, `anthropic` |
+| `metrics/` | DogStatsD-over-UDP emitter. Load-bearing observability: counters/gauges/histograms/timers for prompt outcome, tool calls, and audit blocks, wired through `HarnessState` across `run`/`serve` and inherited by subagents. Opt-in via `--metrics`/`DOGSTATSD_ADDR`; a zero-cost no-op when disabled. | — |
 | `compact/` | Message-history compaction. Pure layer (`estimate_chars`, `split_for_compaction`) + model-driven `Compactor` that replaces older turns with a single synthetic summary message. Wires into `HarnessState::with_compactor`. | `harness` |
 | `subagent/` | Flue-style `session.task()`: spawn a focused child agent that shares the parent's sandbox + tools but starts with empty history. Optional role overlay. Streaming variant available. | `harness`, `actor` |
 | `persist/` | File-backed `SessionStore`. Atomic writes via tmp + rename. Version-tagged JSON; key validation rejects path-traversal. | `harness`, `anthropic` |
@@ -118,6 +119,10 @@ cargo run --bin agent -- run --mcp 'npx -y @modelcontextprotocol/server-filesyst
 
 # Tee every StreamEvent to a JSONL log for audit / debugging
 cargo run --bin agent -- run --runlog ./.runs "do something"
+
+# Emit DogStatsD metrics over UDP (run + serve); also via DOGSTATSD_ADDR.
+# Opt-in, no-op when unset. See QUICKSTART.md "Metrics & observability".
+cargo run --bin agent -- run --metrics 127.0.0.1:8125 "do something"
 
 # Let the LLM spawn subagents via a 'task' tool
 cargo run --bin agent -- run --task-tool "research three approaches and summarise"

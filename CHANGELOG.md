@@ -9,6 +9,11 @@ semver pre-1.0 (every release is `0.x.y`; minor bumps may break API).
 - `agent --version` / `-V` prints `agent <cargo-pkg-version>`.
 - `docs/adr/` directory with the first architecture decision records.
 - ADR-0002 captures the subtraction-first scope policy.
+- ADR-0003 keeps the `metrics` crate (superseding ADR-0002's deferred-cut bullet) and wires it end-to-end.
+- `--metrics <HOST:PORT>` flag on `agent run` / `agent serve` (overrides `DOGSTATSD_ADDR`; flag > env > disabled).
+
+### Changed
+- Metrics now emitted across `agent run`, `agent serve`, and subagents (subagents inherit the parent's emitter); opt-in via `--metrics`/`DOGSTATSD_ADDR`, no-op when unset.
 
 ### Removed (round 7 — staff-eng cut pass)
 - `cluster` crate: distributed actor refs with no callers.
