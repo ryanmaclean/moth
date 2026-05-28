@@ -695,6 +695,110 @@ mod tests {
     }
 
     #[test]
+    fn child_state_inherits_parent_metrics_arc() {
+        // Focused unit test: the subagent's HarnessState must carry the
+        // *same* Arc<metrics::Client> as the parent — not a fresh disabled
+        // one. Pointer equality proves the emitter (and therefore the UDP
+        // sink) is shared, so subagent turns land in the parent's dashboard.
+        let (instance, state_no_sys, _m, _sb) = parent_rig(vec![], vec![]);
+        // Build a parent whose metrics Arc we control, so we can compare it.
+        let live = Arc::new(metrics::Client::disabled());
+        let parent = Arc::new(HarnessState {
+            name: state_no_sys.name.clone(),
+            model: state_no_sys.model.clone(),
+            default_system: None,
+            default_max_tokens: state_no_sys.default_max_tokens,
+            instance: state_no_sys.instance.clone(),
+            tools: state_no_sys.tools.clone(),
+            compactor: None,
+            metrics: live.clone(),
+        });
+
+        let child = child_state(&parent, None);
+        assert!(
+            Arc::ptr_eq(&child.metrics, &parent.metrics),
+            "subagent did not inherit the parent's metrics Arc"
+        );
+        assert!(Arc::ptr_eq(&child.metrics, &live), "child metrics points at a different sink");
+
+        drop(child);
+        drop(parent);
+        drop(state_no_sys);
+        instance.join().unwrap();
+    }
+
+    #[test]
+    fn parent_and_subagent_emit_to_same_udp_sink() {
+        use std::net::UdpSocket;
+
+        // End-to-end: bind ONE loopback receiver, point the parent's
+        // metrics::Client at it, run a parent prompt that spawns a subagent
+        // via spawn_task, then assert datagrams from BOTH the parent session
+        // and the child session arrive at that single sink.
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver.set_read_timeout(Some(std::time::Duration::from_millis(300))).unwrap();
+        let addr = receiver.local_addr().unwrap().to_string();
+        // Parent and child emit the same fully-qualified names, so we tell
+        // their emissions apart only by count: both emit `agent.prompt.started`.
+        let client = Arc::new(metrics::Client::new(addr).unwrap());
+
+        let sandbox = Arc::new(MockSandbox::new(vec![]));
+        let instance =
+            spawn(Instance::new("inst-parent", Box::new(SandboxRef(sandbox)) as Box<dyn Sandbox>));
+        // Parent runs one turn, then a subagent runs one turn. Distinct
+        // MockModels would serialise oddly; a single shared script source is
+        // fine here since each Session consumes its own scripted turn.
+        let model = Arc::new(MockModel::new(vec![
+            vec![
+                ModelEvent::TextDelta("parent done".into()),
+                ModelEvent::Stop { reason: Some("end_turn".into()) },
+            ],
+            vec![
+                ModelEvent::TextDelta("child done".into()),
+                ModelEvent::Stop { reason: Some("end_turn".into()) },
+            ],
+        ]));
+        let state = Arc::new(
+            HarnessState::new("parent", model.clone() as Arc<dyn Model>, instance.addr.clone())
+                .with_metrics(client),
+        );
+
+        // Parent prompt (turn 1 of the script).
+        let parent_session = spawn(Session::new("parent-sess", state.clone()));
+        let _ = parent_session
+            .addr
+            .ask(|reply| SessionMsg::Prompt {
+                text: "first".into(),
+                structured_output_tag: None,
+                reply,
+            })
+            .unwrap()
+            .unwrap();
+
+        // Subagent prompt (turn 2 of the script). spawn_task clones the
+        // parent state — and therefore the same metrics Arc/UDP sink.
+        let task = spawn_task(state.clone(), "child prompt".into(), None);
+        let _ = task.join().unwrap();
+
+        // Drain everything that arrived. We expect TWO `agent.prompt.started`
+        // datagrams (one parent, one child) on the single shared receiver.
+        let mut got: Vec<String> = Vec::new();
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = receiver.recv(&mut buf) {
+            got.push(String::from_utf8_lossy(&buf[..n]).into_owned());
+        }
+        let started = got.iter().filter(|l| l.contains("agent.prompt.started:1|c")).count();
+        assert!(
+            started >= 2,
+            "expected >=2 prompt.started datagrams (parent + child) on one sink, got {started}: {got:?}"
+        );
+
+        parent_session.join().unwrap();
+        drop(state);
+        instance.join().unwrap();
+    }
+
+    #[test]
     fn subagent_empty_history_at_start() {
         // First (and only) request the model sees from a fresh subagent
         // contains exactly one message: the prompt.

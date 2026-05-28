@@ -24,6 +24,9 @@ pub(crate) struct DoctorEnv {
     pub sessions_dir: Option<String>,
     pub runlog_dir: Option<String>,
     pub dogstatsd_addr: Option<String>,
+    /// Explicit sink from `--metrics HOST:PORT`, if passed to `agent doctor`.
+    /// Overrides `dogstatsd_addr` when reporting the resolved sink.
+    pub metrics_flag: Option<String>,
 }
 
 impl DoctorEnv {
@@ -38,6 +41,7 @@ impl DoctorEnv {
             sessions_dir: g("SESSIONS_DIR"),
             runlog_dir: g("RUNLOG_DIR"),
             dogstatsd_addr: g("DOGSTATSD_ADDR"),
+            metrics_flag: None,
         }
     }
 }
@@ -66,21 +70,26 @@ pub fn doctor_cmd(args: Vec<String>) -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    // Parse `--mcp 'CMD ARGS'` (repeatable). Anything else is ignored
-    // for now — keep the surface small.
+    // Parse `--mcp 'CMD ARGS'` (repeatable) and `--metrics HOST:PORT`.
+    // Anything else is ignored for now — keep the surface small.
     let mut mcp_specs: Vec<String> = Vec::new();
+    let mut metrics_flag: Option<String> = None;
     let mut i = 0;
     let mut args = args;
     while i < args.len() {
         if args[i] == "--mcp" && i + 1 < args.len() {
             args.remove(i);
             mcp_specs.push(args.remove(i));
+        } else if args[i] == "--metrics" && i + 1 < args.len() {
+            args.remove(i);
+            metrics_flag = Some(args.remove(i));
         } else {
             i += 1;
         }
     }
 
-    let env = DoctorEnv::from_env();
+    let mut env = DoctorEnv::from_env();
+    env.metrics_flag = metrics_flag;
     let outcome = run_doctor(&env, &mcp_specs, &mut std::io::stdout(), probe_host);
     outcome.exit_code()
 }
@@ -138,6 +147,18 @@ pub(crate) fn run_doctor<W: Write>(
     let _ = writeln!(out, "  SESSIONS_DIR:       {}", or_unset(env.sessions_dir.as_deref()));
     let _ = writeln!(out, "  RUNLOG_DIR:         {}", or_unset(env.runlog_dir.as_deref()));
     let _ = writeln!(out, "  DOGSTATSD_ADDR:     {}", or_unset(env.dogstatsd_addr.as_deref()));
+    // Report the *resolved* sink: `--metrics` flag wins over the env var.
+    // We bind a real client so "active" reflects what a run would actually do.
+    let resolved = metrics::Client::resolve(env.metrics_flag.as_deref());
+    let _ = writeln!(
+        out,
+        "  metrics sink:       {}",
+        if resolved.is_enabled() {
+            format!("active ({})", resolved.addr())
+        } else {
+            "disabled (set --metrics or DOGSTATSD_ADDR)".to_string()
+        }
+    );
     let _ = writeln!(out);
 
     let _ = writeln!(out, "network:");
@@ -313,6 +334,7 @@ mod tests {
             sessions_dir: None,
             runlog_dir: None,
             dogstatsd_addr: None,
+            metrics_flag: None,
         };
         fn never(_: &str, _: u16, _: Duration) -> Result<Duration, String> {
             unreachable!("probe should not be called when no key set")
@@ -333,6 +355,7 @@ mod tests {
             sessions_dir: None,
             runlog_dir: None,
             dogstatsd_addr: None,
+            metrics_flag: None,
         };
         fn ok(_: &str, _: u16, _: Duration) -> Result<Duration, String> {
             Ok(Duration::from_millis(42))
@@ -352,6 +375,7 @@ mod tests {
             sessions_dir: None,
             runlog_dir: None,
             dogstatsd_addr: None,
+            metrics_flag: None,
         };
         fn err(_: &str, _: u16, _: Duration) -> Result<Duration, String> {
             Err("connect: timed out".to_string())

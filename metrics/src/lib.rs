@@ -4,9 +4,14 @@
 //! DogStatsD wire format. Errors are swallowed: a metric call must
 //! never break a hot path.
 //!
+//! Metric names are fully qualified at the call site (e.g.
+//! `agent.prompt.started`); callers do not layer a separate prefix.
+//! `with_prefix` exists for embedders who want one, but the harness's
+//! own emissions are already namespaced.
+//!
 //! ```no_run
-//! let m = metrics::Client::from_env().with_prefix("agent");
-//! m.count("requests", 1, &[("route", "/healthz")]);
+//! let m = metrics::Client::from_env();
+//! m.count("agent.requests", 1, &[("route", "/healthz")]);
 //! ```
 
 use std::cell::RefCell;
@@ -90,6 +95,27 @@ impl Client {
             Ok(addr) if !addr.is_empty() => Self::new(addr).unwrap_or_else(|_| Self::disabled()),
             _ => Self::disabled(),
         }
+    }
+
+    /// Resolve a sink with explicit precedence: an explicit `flag` address
+    /// (e.g. from a `--metrics HOST:PORT` CLI flag) wins, then the
+    /// `DOGSTATSD_ADDR` env var, then disabled. An empty `flag` string is
+    /// treated as unset. A bind/resolve failure falls back to disabled so a
+    /// misconfigured address never aborts the process.
+    #[must_use]
+    pub fn resolve(flag: Option<&str>) -> Self {
+        match flag {
+            Some(addr) if !addr.is_empty() => Self::new(addr).unwrap_or_else(|_| Self::disabled()),
+            _ => Self::from_env(),
+        }
+    }
+
+    /// Whether this client has a live UDP sink. `false` for disabled
+    /// clients. Lets callers (e.g. `agent doctor`) report the effective
+    /// state after applying `--metrics`/`DOGSTATSD_ADDR` resolution.
+    #[must_use]
+    pub fn is_enabled(&self) -> bool {
+        self.sock.is_some()
     }
 
     /// Prepend `prefix` and a `.` to every metric name.
@@ -453,6 +479,30 @@ mod tests {
         unsafe { std::env::remove_var("DOGSTATSD_ADDR") };
         let c = Client::from_env();
         assert!(c.sock.is_none());
+        if let Some(v) = prev {
+            // SAFETY: ditto.
+            unsafe { std::env::set_var("DOGSTATSD_ADDR", v) };
+        }
+    }
+
+    #[test]
+    fn resolve_prefers_flag_then_env_then_disabled() {
+        // Flag wins: a valid loopback address yields an enabled client even
+        // if DOGSTATSD_ADDR is unset.
+        let recv = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = recv.local_addr().unwrap().to_string();
+        let c = Client::resolve(Some(&addr));
+        assert!(c.is_enabled());
+        assert_eq!(c.addr(), addr);
+
+        // Empty flag is treated as unset; with no env var we get disabled.
+        let prev = std::env::var("DOGSTATSD_ADDR").ok();
+        // SAFETY: single-threaded inside this test, no other readers; restored below.
+        unsafe { std::env::remove_var("DOGSTATSD_ADDR") };
+        let c = Client::resolve(Some(""));
+        assert!(!c.is_enabled());
+        let c = Client::resolve(None);
+        assert!(!c.is_enabled());
         if let Some(v) = prev {
             // SAFETY: ditto.
             unsafe { std::env::set_var("DOGSTATSD_ADDR", v) };

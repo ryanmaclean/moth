@@ -121,6 +121,7 @@ fn usage_and_exit(code: u8) -> ExitCode {
         --mcp 'CMD ARGS'             spawn MCP server, register its tools (repeatable)\n  \
         --runlog DIR                 tee every StreamEvent to <DIR>/<run_id>.jsonl (or RUNLOG_DIR env)\n  \
         --task-tool                  expose a 'task' tool to the LLM (Flue-style session.task)\n  \
+        --metrics HOST:PORT          send DogStatsD metrics here (overrides DOGSTATSD_ADDR)\n  \
         --branch-strategy STRATEGY   [run] head | merge-to-head | branch:NAME\n  \
         --mock                       [run] stub model with a canned response; no API key required\n  \
         --mock-script PATH           [run] load scripted turns from a JSON file (implies --mock)\n  \
@@ -148,6 +149,7 @@ fn print_run_help() {
         --runlog DIR                 tee every StreamEvent to <DIR>/<run_id>.jsonl\n  \
         --task-tool                  expose a 'task' tool so the LLM can spawn subagents\n  \
         --compact-budget N           auto-compact history when over N tokens\n  \
+        --metrics HOST:PORT          send DogStatsD metrics here (overrides DOGSTATSD_ADDR)\n  \
         --branch-strategy STRATEGY   head | merge-to-head | branch:NAME\n  \
         --mock                       stub the model with a canned response; no API key\n                               \
                               required. Useful for CI, demos, and verifying the\n                               \
@@ -168,7 +170,8 @@ fn print_run_help() {
         MODEL                        model id (lower priority than --model)\n  \
         AGENTS_ROOT                  dir holding .agents/skills/<name>.md (default: cwd)\n  \
         SESSIONS_DIR                 same as --sessions\n  \
-        RUNLOG_DIR                   same as --runlog";
+        RUNLOG_DIR                   same as --runlog\n  \
+        DOGSTATSD_ADDR               DogStatsD sink HOST:PORT (lower priority than --metrics)";
     eprintln!("{m}");
 }
 
@@ -185,18 +188,21 @@ fn print_serve_help() {
         --model NAME                 model id\n  \
         --sessions DIR               persist message history to DIR\n  \
         --mcp 'CMD ARGS'             spawn MCP server, register its tools (repeatable)\n  \
-        --runlog DIR                 tee every StreamEvent to <DIR>/<request_id>.jsonl\n\n\
+        --runlog DIR                 tee every StreamEvent to <DIR>/<request_id>.jsonl\n  \
+        --metrics HOST:PORT          send DogStatsD metrics here (overrides DOGSTATSD_ADDR)\n\n\
         examples:\n  \
         agent serve\n  \
         agent serve --addr 127.0.0.1:8080\n  \
-        agent serve --openai --model gpt-4o-mini --runlog ./logs\n\n\
+        agent serve --openai --model gpt-4o-mini --runlog ./logs\n  \
+        agent serve --metrics 127.0.0.1:8125\n\n\
         env:\n  \
         ANTHROPIC_API_KEY            required for the default Anthropic provider\n  \
         OPENAI_API_KEY               required with --openai\n  \
         OPENAI_BASE_URL              override OpenAI base URL\n  \
         MODEL                        model id (lower priority than --model)\n  \
         SESSIONS_DIR                 same as --sessions\n  \
-        RUNLOG_DIR                   same as --runlog";
+        RUNLOG_DIR                   same as --runlog\n  \
+        DOGSTATSD_ADDR               DogStatsD sink HOST:PORT (lower priority than --metrics)";
     eprintln!("{m}");
 }
 
@@ -256,6 +262,9 @@ struct CommonOpts {
     runlog_dir: Option<PathBuf>,
     enable_task_tool: bool,
     compact_budget: Option<usize>,
+    /// Explicit DogStatsD sink address from `--metrics HOST:PORT`. Overrides
+    /// the `DOGSTATSD_ADDR` env var; `None` falls back to env then disabled.
+    metrics_addr: Option<String>,
 }
 
 fn parse_common(args: &mut Vec<String>) -> CommonOpts {
@@ -305,6 +314,12 @@ fn parse_common(args: &mut Vec<String>) -> CommonOpts {
                 args.remove(i);
                 if i < args.len() {
                     opts.compact_budget = args.remove(i).parse().ok();
+                }
+            }
+            "--metrics" => {
+                args.remove(i);
+                if i < args.len() {
+                    opts.metrics_addr = Some(args.remove(i));
                 }
             }
             _ => i += 1,
@@ -766,8 +781,7 @@ fn run_cmd(mut args: Vec<String>) -> ExitCode {
     let sandbox: Box<dyn Sandbox> = Box::new(AuditedShell::new(vshell::VShell::new()));
     let inst = spawn(Instance::new("cli", sandbox));
     let metrics_client = Arc::new(
-        metrics::Client::from_env()
-            .with_prefix("agent")
+        metrics::Client::resolve(common.metrics_addr.as_deref())
             .with_tag("provider", if common.openai { "openai" } else { "anthropic" }),
     );
     let mut state_build = HarnessState::new("default", model.clone(), inst.addr.clone())
@@ -990,6 +1004,14 @@ fn serve_cmd(mut args: Vec<String>) -> ExitCode {
     let mut tools = default_tools(None);
     tools.extend(mcp_tools);
 
+    // One shared metrics sink for the whole server: every per-request
+    // ChatHandler Session clones this Arc (matching `agent run`'s prefix +
+    // provider tag) so served sessions emit to the same place.
+    let metrics_client = Arc::new(
+        metrics::Client::resolve(common.metrics_addr.as_deref())
+            .with_tag("provider", if common.openai { "openai" } else { "anthropic" }),
+    );
+
     let mut srv = Server::new();
     srv.register(
         "chat",
@@ -998,6 +1020,7 @@ fn serve_cmd(mut args: Vec<String>) -> ExitCode {
             tools: Arc::new(tools),
             store,
             runlog_dir: common.runlog_dir.clone(),
+            metrics: metrics_client,
         }),
     );
 
@@ -1048,6 +1071,9 @@ struct ChatHandler {
     store: Option<Arc<dyn SessionStore>>,
     /// Where per-request RunLog jsonl files land. `None` disables runlog.
     runlog_dir: Option<PathBuf>,
+    /// Shared metrics sink. Each per-request Session clones this Arc so all
+    /// served sessions (and their subagents) emit to the same place.
+    metrics: Arc<metrics::Client>,
 }
 
 impl AgentHandler for ChatHandler {
@@ -1064,7 +1090,8 @@ impl AgentHandler for ChatHandler {
         let sandbox: Box<dyn Sandbox> = Box::new(AuditedShell::new(vshell::VShell::new()));
         let inst = spawn(Instance::new(id, sandbox));
         let state = HarnessState::new("chat", self.model.clone(), inst.addr.clone())
-            .with_tools((*self.tools).clone());
+            .with_tools((*self.tools).clone())
+            .with_metrics(self.metrics.clone());
         let mut sess_build = Session::new(id, Arc::new(state));
         if let Some(s) = &self.store {
             sess_build = sess_build.with_store(s.clone());
