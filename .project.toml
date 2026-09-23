@@ -1,0 +1,12 @@
+schema = "ryanlab.project.v1"
+name = "moth"
+status = "active"
+role = "Tiny reusable agent execution harness"
+
+canonical_for = ["agent-execution", "actors", "subagents", "session-tools", "minimal-runlog"]
+integrates_with = ["bop", "smolfire", "genoa"]
+do_not_implement = ["work-scheduler-db", "os-image-builder", "canonical-lineage"]
+
+registry = "ryanmaclean/skills:docs/PROJECTS.md"
+glossary = "ryanmaclean/skills:docs/GLOSSARY.md"
+benchmark_schema = "ryanmaclean/skills:schemas/bench.v1.schema.json"
