@@ -2,30 +2,50 @@
 //!
 //! Subscribes to `harness::StreamEvent` over a `mpsc::Receiver` and writes
 //! one JSONL record per event to `<dir>/<run_id>.jsonl`. Production audit
-//! trail: every iteration, tool call, model delta gets a durable record.
+//! trail: every iteration, tool call, model delta gets a record.
 //!
 //! Record shape (one per line):
 //! ```text
-//! {"ts_ms": <epoch-millis>, "run_id": "<id>", "kind": "<kind>", "data": {...}}
+//! {"seq": <u64>, "ts_ms": <epoch-millis>, "run_id": "<id>", "kind": "<kind>", "data": {...}}
 //! ```
 //!
 //! When the log was opened via `open_with_request_id`, every record also
 //! carries the inbound HTTP correlation id between `run_id` and `kind`:
 //! ```text
-//! {"ts_ms": ..., "run_id": "...", "request_id": "...", "kind": "...", "data": ...}
+//! {"seq": ..., "ts_ms": ..., "run_id": "...", "request_id": "...", "kind": "...", "data": ...}
 //! ```
 //!
-//! `ts_ms` is plain epoch milliseconds — no calendar math, no leap years,
-//! consumers can format if they care.
+//! ## Identity, order, durability
+//!
+//! - **Identity.** `run_id` is supplied by the caller. Moth does not own
+//!   run identity (BOP does); `agent run` accepts it via `--run-id` /
+//!   `AGENT_RUN_ID` / `BOP_RUN_ID` and only mints a local id as a
+//!   fallback. Because the id becomes a filename it must pass
+//!   [`validate_run_id`]; [`RunLog::open`] refuses anything else rather
+//!   than silently substituting a different identity.
+//! - **Order.** `seq` is the single ordering source for records within a
+//!   run: it is assigned under the same lock as the file write, so `seq`
+//!   order == file order, starting at 0 and strictly increasing by one.
+//!   Re-opening an existing run file (a retry of the same logical run)
+//!   continues from the last committed `seq` instead of restarting.
+//!   `ts_ms` is human/observation metadata only — never sort on it.
+//! - **Durability.** Writes are visible on return but not durable. The
+//!   drain calls `sync_data` after a terminal record (`done` /
+//!   `cancelled` / `error`); a returned [`TerminalSummary`] with
+//!   `final_event: Some(_)` therefore means the terminal record reached
+//!   stable storage. [`RunLog::sync`] is exposed for callers' own markers.
+//! - **Crash tail.** A crash mid-write can leave a torn final line with no
+//!   trailing `\n`. On re-open the torn fragment is terminated with a
+//!   newline so the next record starts on its own line; readers skip
+//!   lines that fail to parse. The torn fragment never carries a
+//!   committed `seq`, so it is not counted when resuming.
 //!
 //! Atomic writes: each record is built up in a `String`, then written via a
-//! single `write_all` of `record + "\n"`. JSONL records are short and fit in
-//! one POSIX write, so each line is atomic. The `Mutex` only protects the
-//! file handle from concurrent writers (the `drain` itself is
-//! single-threaded, but `write_record` may be called from elsewhere).
+//! single `write_all` of `record + "\n"`. The `Mutex` serialises writers
+//! and the `seq` counter together.
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
@@ -35,8 +55,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anthropic::json::escape_into;
 use harness::{PromptResult, SessionError, StreamEvent};
 
+/// Maximum accepted `run_id` length in bytes.
+pub const MAX_RUN_ID_LEN: usize = 128;
+
+struct Inner {
+    file: File,
+    /// `seq` the next record will carry.
+    next_seq: u64,
+}
+
 pub struct RunLog {
-    file: Mutex<File>,
+    inner: Mutex<Inner>,
     run_id: String,
     /// Optional HTTP correlation id. When `Some`, every emitted record
     /// gains a `"request_id":"..."` field after `run_id`.
@@ -49,17 +78,22 @@ pub struct TerminalSummary {
     pub final_event: Option<&'static str>,
     pub turns: usize,
     pub completed: bool,
+    /// `seq` of the last record this drain wrote, if any.
+    pub last_seq: Option<u64>,
 }
 
 #[derive(Debug)]
 pub enum RunLogError {
     Io(io::Error),
+    /// The run id is not usable as a single filename component.
+    InvalidRunId(String),
 }
 
 impl std::fmt::Display for RunLogError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             RunLogError::Io(e) => write!(f, "io: {e}"),
+            RunLogError::InvalidRunId(why) => write!(f, "invalid run id: {why}"),
         }
     }
 }
@@ -72,9 +106,43 @@ impl From<io::Error> for RunLogError {
     }
 }
 
+/// Check that `run_id` is safe to use as the `<run_id>.jsonl` filename:
+/// 1..=[`MAX_RUN_ID_LEN`] bytes of `[A-Za-z0-9._:-]`, not starting with
+/// `.`, and not containing `..`. Rejects path separators, whitespace and
+/// control bytes, so an externally supplied id (CLI flag, env var,
+/// `X-Request-ID` header) can never escape the runlog directory.
+pub fn validate_run_id(run_id: &str) -> Result<(), RunLogError> {
+    let bad = |why: String| Err(RunLogError::InvalidRunId(why));
+    if run_id.is_empty() {
+        return bad("empty".into());
+    }
+    if run_id.len() > MAX_RUN_ID_LEN {
+        return bad(format!("{} bytes > {MAX_RUN_ID_LEN}", run_id.len()));
+    }
+    if run_id.starts_with('.') {
+        return bad(format!("may not start with '.': {run_id:?}"));
+    }
+    if run_id.contains("..") {
+        return bad(format!("may not contain '..': {run_id:?}"));
+    }
+    if let Some(c) =
+        run_id.chars().find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':')))
+    {
+        return bad(format!("disallowed character {c:?} in {run_id:?}"));
+    }
+    Ok(())
+}
+
+/// `true` when [`validate_run_id`] accepts `run_id`.
+pub fn is_valid_run_id(run_id: &str) -> bool {
+    validate_run_id(run_id).is_ok()
+}
+
 impl RunLog {
     /// Open `<dir>/<run_id>.jsonl` for append. Creates parent dirs. Writes
     /// an opening `start` record so every file is non-empty and timestamped.
+    /// Fails with [`RunLogError::InvalidRunId`] if `run_id` is not a safe
+    /// filename component.
     pub fn open(dir: impl AsRef<Path>, run_id: impl Into<String>) -> Result<Self, RunLogError> {
         Self::open_inner(dir.as_ref(), run_id.into(), None)
     }
@@ -95,11 +163,14 @@ impl RunLog {
         run_id: String,
         request_id: Option<String>,
     ) -> Result<Self, RunLogError> {
+        validate_run_id(&run_id)?;
         std::fs::create_dir_all(dir)?;
         let path = dir.join(format!("{run_id}.jsonl"));
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let mut file = OpenOptions::new().create(true).read(true).append(true).open(&path)?;
+        let next_seq = recover_tail(&mut file)?;
         let started_at = SystemTime::now();
-        let log = Self { file: Mutex::new(file), run_id, request_id, started_at };
+        let log =
+            Self { inner: Mutex::new(Inner { file, next_seq }), run_id, request_id, started_at };
         let started_ms = unix_ms(started_at);
         let mut payload = String::new();
         payload.push_str(r#"{"started_at_unix_ms":"#);
@@ -121,23 +192,38 @@ impl RunLog {
         self.started_at
     }
 
+    /// `seq` the next record will carry.
+    pub fn next_seq(&self) -> u64 {
+        self.inner.lock().expect("runlog mutex poisoned").next_seq
+    }
+
+    /// Flush written records to stable storage (`fdatasync`).
+    pub fn sync(&self) -> Result<(), RunLogError> {
+        let g = self.inner.lock().expect("runlog mutex poisoned");
+        g.file.sync_data()?;
+        Ok(())
+    }
+
     /// One-shot blocking drain: receives `StreamEvent`s until the sender
     /// closes, writes one JSONL record per event. Returns the run summary;
     /// `final_event` is the variant name of the last terminal event seen
     /// (`done` / `cancelled` / `error`) or `None` if the sender dropped
-    /// before emitting one.
+    /// before emitting one. Each terminal record is `sync_data`'d before
+    /// the drain continues, so `final_event: Some(_)` implies durability.
     pub fn drain(&self, rx: Receiver<StreamEvent>) -> Result<TerminalSummary, RunLogError> {
         let mut final_event: Option<&'static str> = None;
         let mut turns: usize = 0;
         let mut completed = false;
+        let mut last_seq: Option<u64> = None;
         while let Ok(ev) = rx.recv() {
             let (kind, payload) = render_event(&ev);
-            self.write_record(kind, &payload)?;
-            match ev {
+            last_seq = Some(self.write_record_seq(kind, &payload)?);
+            let terminal = match ev {
                 StreamEvent::TurnComplete { turn, .. } => {
                     if turn > turns {
                         turns = turn;
                     }
+                    false
                 }
                 StreamEvent::Done(pr) => {
                     final_event = Some("done");
@@ -145,17 +231,23 @@ impl RunLog {
                         turns = pr.turns;
                     }
                     completed = pr.completed;
+                    true
                 }
                 StreamEvent::Cancelled => {
                     final_event = Some("cancelled");
+                    true
                 }
                 StreamEvent::Error(_) => {
                     final_event = Some("error");
+                    true
                 }
-                _ => {}
+                _ => false,
+            };
+            if terminal {
+                self.sync()?;
             }
         }
-        Ok(TerminalSummary { final_event, turns, completed })
+        Ok(TerminalSummary { final_event, turns, completed, last_seq })
     }
 
     /// Spawn the drain on its own thread. The caller waits on the
@@ -170,9 +262,19 @@ impl RunLog {
     /// Manually write a record. Used internally for `start`; exposed so
     /// callers can emit their own markers around a streaming prompt.
     pub fn write_record(&self, kind: &str, payload: &str) -> Result<(), RunLogError> {
+        self.write_record_seq(kind, payload).map(|_| ())
+    }
+
+    /// Like [`write_record`] but returns the `seq` assigned to the record.
+    /// The counter only advances when the write succeeds.
+    pub fn write_record_seq(&self, kind: &str, payload: &str) -> Result<u64, RunLogError> {
+        let mut g = self.inner.lock().expect("runlog mutex poisoned");
+        let seq = g.next_seq;
         let ts = unix_ms(SystemTime::now());
-        let mut line = String::with_capacity(payload.len() + 64);
-        line.push_str(r#"{"ts_ms":"#);
+        let mut line = String::with_capacity(payload.len() + 80);
+        line.push_str(r#"{"seq":"#);
+        push_u128(&mut line, u128::from(seq));
+        line.push_str(r#","ts_ms":"#);
         push_u128(&mut line, ts);
         line.push_str(r#","run_id":""#);
         escape_into(&mut line, &self.run_id);
@@ -187,10 +289,66 @@ impl RunLog {
         line.push_str(r#"","data":"#);
         line.push_str(payload);
         line.push_str("}\n");
-        let mut f = self.file.lock().expect("runlog mutex poisoned");
-        f.write_all(line.as_bytes())?;
-        Ok(())
+        g.file.write_all(line.as_bytes())?;
+        g.next_seq = seq + 1;
+        Ok(seq)
     }
+}
+
+/// Prepare an existing run file for appending and return the next `seq`.
+///
+/// Terminates a torn (newline-less) final line so the next record starts
+/// cleanly, then scans complete lines for the highest committed `seq`.
+/// Lines without a leading `{"seq":N,` or a closing `}` (legacy pre-seq
+/// records, torn fragments) are ignored. A torn record's seq can never
+/// exceed the true next seq anyway: the counter only advances after a
+/// successful write, so the crashed write's seq is reissued on resume.
+fn recover_tail(file: &mut File) -> Result<u64, RunLogError> {
+    let len = file.metadata()?.len();
+    if len == 0 {
+        return Ok(0);
+    }
+    file.seek(SeekFrom::Start(len - 1))?;
+    let mut last = [0u8; 1];
+    file.read_exact(&mut last)?;
+    if last[0] != b'\n' {
+        // O_APPEND: lands at EOF regardless of the read cursor.
+        file.write_all(b"\n")?;
+    }
+    file.seek(SeekFrom::Start(0))?;
+    let mut next: u64 = 0;
+    let mut reader = BufReader::new(&*file);
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        let n = reader.read_until(b'\n', &mut buf)?;
+        if n == 0 {
+            break;
+        }
+        // Only complete, well-formed records count. A torn fragment that an
+        // earlier re-open newline-terminated still lacks its closing `}`.
+        if buf.last() != Some(&b'\n') {
+            break;
+        }
+        let rec = &buf[..buf.len() - 1];
+        if rec.last() != Some(&b'}') {
+            continue;
+        }
+        if let Some(seq) = parse_seq_prefix(rec) {
+            next = next.max(seq.saturating_add(1));
+        }
+    }
+    Ok(next)
+}
+
+/// Parse `N` out of a line beginning `{"seq":N,`.
+fn parse_seq_prefix(line: &[u8]) -> Option<u64> {
+    let rest = line.strip_prefix(br#"{"seq":"#)?;
+    let end = rest.iter().position(|b| !b.is_ascii_digit())?;
+    if end == 0 || rest[end] != b',' {
+        return None;
+    }
+    std::str::from_utf8(&rest[..end]).ok()?.parse().ok()
 }
 
 fn unix_ms(t: SystemTime) -> u128 {
@@ -584,11 +742,11 @@ mod tests {
         let log = Arc::new(RunLog::open(&dir, "r1").unwrap());
         // Build a payload that makes the full JSONL line exactly 100 bytes,
         // including the trailing '\n'. The overhead is:
-        //   {"ts_ms":<MS>,"run_id":"r1","kind":"big","data":"<PAYLOAD>"}\n
+        //   {"seq":<N>,"ts_ms":<MS>,"run_id":"r1","kind":"big","data":"<PAYLOAD>"}\n
         // where data is treated as a raw string in the payload (we feed it
         // as a verbatim JSON value via write_record).
         // To keep things simple, we just check each line ends with '\n' and
-        // begins with `{"ts_ms":` and that we get the expected line count.
+        // begins with `{"seq":` and that we get the expected line count.
         let mut handles = Vec::new();
         let payload = "x".repeat(40);
         for _ in 0..4 {
@@ -607,9 +765,11 @@ mod tests {
         let lines = read_lines(&dir, "r1");
         // start + 4*25 records
         assert_eq!(lines.len(), 1 + 100);
-        for l in &lines {
-            assert!(l.starts_with(r#"{"ts_ms":"#), "bad start: {l}");
+        for (i, l) in lines.iter().enumerate() {
+            assert!(l.starts_with(r#"{"seq":"#), "bad start: {l}");
             assert!(l.ends_with('}'), "bad end: {l}");
+            // seq is assigned under the write lock: file order == seq order.
+            assert_eq!(parse_seq_prefix(l.as_bytes()), Some(i as u64), "line {i}: {l}");
         }
         // Count exactly 100 "big" lines.
         let big = lines.iter().filter(|l| kind_of(l) == "big").count();
@@ -685,7 +845,7 @@ mod tests {
                 line.contains(r#""request_id":"req-abc-12345678""#),
                 "missing request_id on line: {line}"
             );
-            // Field order: ts_ms, run_id, request_id, kind, data
+            // Field order: seq, ts_ms, run_id, request_id, kind, data
             let run_pos = line.find(r#""run_id":"#).unwrap();
             let req_pos = line.find(r#""request_id":"#).unwrap();
             let kind_pos = line.find(r#""kind":"#).unwrap();
@@ -700,5 +860,160 @@ mod tests {
         assert!(!lines2[0].contains("request_id"), "unexpected: {}", lines2[0]);
         cleanup(&dir);
         cleanup(&dir2);
+    }
+
+    fn seqs(dir: &Path, run_id: &str) -> Vec<Option<u64>> {
+        read_lines(dir, run_id).iter().map(|l| parse_seq_prefix(l.as_bytes())).collect()
+    }
+
+    #[test]
+    fn seq_starts_at_zero_and_is_contiguous() {
+        let dir = scratch();
+        let log = RunLog::open(&dir, "r1").unwrap();
+        assert_eq!(log.next_seq(), 1, "start record took seq 0");
+        let (tx, rx) = sync_channel(8);
+        tx.send(StreamEvent::TextDelta("a".into())).unwrap();
+        tx.send(StreamEvent::TurnComplete { turn: 1, stop_reason: None }).unwrap();
+        tx.send(StreamEvent::Done(PromptResult {
+            text: "x".into(),
+            structured: None,
+            completed: true,
+            turns: 1,
+        }))
+        .unwrap();
+        drop(tx);
+        let summary = log.drain(rx).unwrap();
+        assert_eq!(summary.last_seq, Some(3));
+        assert_eq!(seqs(&dir, "r1"), vec![Some(0), Some(1), Some(2), Some(3)]);
+        assert!(read_lines(&dir, "r1")[0].starts_with(r#"{"seq":0,"ts_ms":"#));
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn drain_with_no_events_reports_no_last_seq() {
+        let dir = scratch();
+        let log = RunLog::open(&dir, "r1").unwrap();
+        let (tx, rx) = sync_channel::<StreamEvent>(1);
+        drop(tx);
+        let summary = log.drain(rx).unwrap();
+        assert_eq!(summary.last_seq, None);
+        cleanup(&dir);
+    }
+
+    /// Re-opening the same run (a retry reusing the logical run id)
+    /// continues the sequence instead of restarting at 0.
+    #[test]
+    fn reopen_continues_seq() {
+        let dir = scratch();
+        {
+            let log = RunLog::open(&dir, "r1").unwrap();
+            log.write_record("a", "{}").unwrap();
+        }
+        let log = RunLog::open(&dir, "r1").unwrap();
+        assert_eq!(log.next_seq(), 3);
+        assert_eq!(log.write_record_seq("b", "{}").unwrap(), 3);
+        assert_eq!(seqs(&dir, "r1"), vec![Some(0), Some(1), Some(2), Some(3)]);
+        cleanup(&dir);
+    }
+
+    /// A crash mid-write leaves a torn final line. Re-open terminates it so
+    /// new records stay on their own lines, and the fragment's (uncommitted)
+    /// seq is not counted.
+    #[test]
+    fn torn_tail_is_isolated_on_reopen() {
+        let dir = scratch();
+        {
+            let log = RunLog::open(&dir, "r1").unwrap();
+            log.write_record("a", "{}").unwrap();
+        }
+        let path = dir.join("r1.jsonl");
+        {
+            let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(br#"{"seq":99,"ts_ms":1,"run_id":"r1","ki"#).unwrap();
+        }
+        let log = RunLog::open(&dir, "r1").unwrap();
+        // committed: 0 (start), 1 (a); torn 99 ignored; reopen start = 2
+        assert_eq!(log.next_seq(), 3);
+        let lines = read_lines(&dir, "r1");
+        assert_eq!(lines.len(), 4);
+        assert!(lines[2].ends_with(r#""ki"#), "torn fragment kept on its own line");
+        assert_eq!(kind_of(&lines[3]), "start");
+        assert_eq!(parse_seq_prefix(lines[3].as_bytes()), Some(2));
+        drop(log);
+        // A later re-open must still not count the (now newline-terminated)
+        // fragment.
+        let log = RunLog::open(&dir, "r1").unwrap();
+        assert_eq!(log.next_seq(), 4);
+        cleanup(&dir);
+    }
+
+    /// Files written before `seq` existed are appended to cleanly; their
+    /// records carry no seq, so numbering starts at 0.
+    #[test]
+    fn legacy_file_without_seq_starts_at_zero() {
+        let dir = scratch();
+        let path = dir.join("old.jsonl");
+        std::fs::write(&path, "{\"ts_ms\":1,\"run_id\":\"old\",\"kind\":\"start\",\"data\":{}}\n")
+            .unwrap();
+        let log = RunLog::open(&dir, "old").unwrap();
+        assert_eq!(log.next_seq(), 1);
+        assert_eq!(seqs(&dir, "old"), vec![None, Some(0)]);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn parse_seq_prefix_cases() {
+        assert_eq!(parse_seq_prefix(br#"{"seq":0,"ts_ms":1}"#), Some(0));
+        assert_eq!(parse_seq_prefix(br#"{"seq":42,"x":1}"#), Some(42));
+        assert_eq!(parse_seq_prefix(br#"{"seq":,"x":1}"#), None);
+        assert_eq!(parse_seq_prefix(br#"{"seq":12"#), None);
+        assert_eq!(parse_seq_prefix(br#"{"seq":1x,"#), None);
+        assert_eq!(parse_seq_prefix(br#"{"ts_ms":1,"seq":3,"#), None);
+    }
+
+    #[test]
+    fn validate_run_id_accepts_external_ids() {
+        for ok in
+            ["r1", "run-1726000000000", "bop:3fa2b9c1", "card.a_b-c", "A".repeat(128).as_str()]
+        {
+            assert!(validate_run_id(ok).is_ok(), "should accept {ok:?}");
+        }
+    }
+
+    #[test]
+    fn validate_run_id_rejects_unsafe_ids() {
+        let long = "a".repeat(MAX_RUN_ID_LEN + 1);
+        for bad in [
+            "",
+            "../escape",
+            "a/b",
+            "a\\b",
+            ".hidden",
+            "a..b",
+            "has space",
+            "tab\there",
+            "nul\0",
+            "caf\u{e9}",
+            long.as_str(),
+        ] {
+            assert!(
+                matches!(validate_run_id(bad), Err(RunLogError::InvalidRunId(_))),
+                "should reject {bad:?}"
+            );
+            assert!(!is_valid_run_id(bad));
+        }
+    }
+
+    /// An `X-Request-ID`-style traversal attempt must not create a file
+    /// outside the runlog directory.
+    #[test]
+    fn open_rejects_traversal_without_touching_fs() {
+        let dir = scratch();
+        let inner = dir.join("logs");
+        let err = RunLog::open_with_request_id(&inner, "../pwned", "../pwned").err().unwrap();
+        assert!(matches!(err, RunLogError::InvalidRunId(_)), "{err}");
+        assert!(!dir.join("pwned.jsonl").exists());
+        assert!(!inner.exists(), "invalid id must fail before create_dir_all");
+        cleanup(&dir);
     }
 }
