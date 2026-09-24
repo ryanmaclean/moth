@@ -120,6 +120,7 @@ fn usage_and_exit(code: u8) -> ExitCode {
         --sessions DIR               persist message history to DIR (or SESSIONS_DIR env)\n  \
         --mcp 'CMD ARGS'             spawn MCP server, register its tools (repeatable)\n  \
         --runlog DIR                 tee every StreamEvent to <DIR>/<run_id>.jsonl (or RUNLOG_DIR env)\n  \
+        --run-id ID                  [run] external run identity (or AGENT_RUN_ID / BOP_RUN_ID env)\n  \
         --task-tool                  expose a 'task' tool to the LLM (Flue-style session.task)\n  \
         --metrics HOST:PORT          send DogStatsD metrics here (overrides DOGSTATSD_ADDR)\n  \
         --branch-strategy STRATEGY   [run] head | merge-to-head | branch:NAME\n  \
@@ -147,6 +148,9 @@ fn print_run_help() {
         --sessions DIR               persist message history to DIR\n  \
         --mcp 'CMD ARGS'             spawn MCP server, register its tools (repeatable)\n  \
         --runlog DIR                 tee every StreamEvent to <DIR>/<run_id>.jsonl\n  \
+        --run-id ID                  run identity owned by the caller (e.g. BOP); names the\n                               \
+                              runlog file. [A-Za-z0-9._:-], <=128 bytes. Default:\n                               \
+                              run-<unix-ms>.\n  \
         --task-tool                  expose a 'task' tool so the LLM can spawn subagents\n  \
         --compact-budget N           auto-compact history when over N tokens\n  \
         --metrics HOST:PORT          send DogStatsD metrics here (overrides DOGSTATSD_ADDR)\n  \
@@ -171,6 +175,8 @@ fn print_run_help() {
         AGENTS_ROOT                  dir holding .agents/skills/<name>.md (default: cwd)\n  \
         SESSIONS_DIR                 same as --sessions\n  \
         RUNLOG_DIR                   same as --runlog\n  \
+        AGENT_RUN_ID                 same as --run-id\n  \
+        BOP_RUN_ID                   run id exported by a BOP dispatcher (below AGENT_RUN_ID)\n  \
         DOGSTATSD_ADDR               DogStatsD sink HOST:PORT (lower priority than --metrics)";
     eprintln!("{m}");
 }
@@ -599,6 +605,45 @@ impl Tool for TaskTool {
     }
 }
 
+/// Resolve the run identity for `agent run`.
+///
+/// Precedence: `--run-id` > `AGENT_RUN_ID` > `BOP_RUN_ID` > minted
+/// `run-<unix-ms>`. Empty env values are treated as unset. An explicit id
+/// that fails [`runlog::validate_run_id`] is an error — never silently
+/// replaced, since the caller owns the identity.
+fn resolve_run_id(
+    flag: Option<String>,
+    agent_env: Option<String>,
+    bop_env: Option<String>,
+    now_ms: u128,
+) -> Result<String, String> {
+    let nonempty = |v: Option<String>| v.filter(|s| !s.is_empty());
+    let (source, id) = if let Some(id) = flag {
+        ("--run-id", id)
+    } else if let Some(id) = nonempty(agent_env) {
+        ("AGENT_RUN_ID", id)
+    } else if let Some(id) = nonempty(bop_env) {
+        ("BOP_RUN_ID", id)
+    } else {
+        return Ok(format!("run-{now_ms}"));
+    };
+    runlog::validate_run_id(&id).map_err(|e| format!("{source}: {e}"))?;
+    Ok(id)
+}
+
+/// Runlog file id for a server request: the `X-Request-ID` when it is a
+/// safe filename component, otherwise a server-minted `req-<unix-ms>-<n>`.
+/// The original request id is still stamped on every record.
+fn server_runlog_id(request_id: &str, now_ms: u128) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    if runlog::is_valid_run_id(request_id) {
+        request_id.to_string()
+    } else {
+        format!("req-{now_ms}-{}", N.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
 /// Spawn a `RunLog` drainer if `--runlog DIR` was given, returning a
 /// channel-tee handle that mirrors every StreamEvent into the log file
 /// AND forwards to the caller's downstream receiver.
@@ -628,6 +673,7 @@ fn run_cmd(mut args: Vec<String>) -> ExitCode {
     // disk in place of the canned echo response.
     let mut mock: bool = false;
     let mut mock_script_path: Option<PathBuf> = None;
+    let mut run_id_flag: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -655,6 +701,15 @@ fn run_cmd(mut args: Vec<String>) -> ExitCode {
                     strategy_spec = Some(args.remove(i));
                 }
             }
+            "--run-id" => {
+                args.remove(i);
+                if i < args.len() {
+                    run_id_flag = Some(args.remove(i));
+                } else {
+                    eprintln!("--run-id requires an ID argument");
+                    return ExitCode::from(2);
+                }
+            }
             "--mock" => {
                 mock = true;
                 args.remove(i);
@@ -672,6 +727,22 @@ fn run_cmd(mut args: Vec<String>) -> ExitCode {
             _ => i += 1,
         }
     }
+
+    // Run identity belongs to the caller (BOP). Resolve it before any side
+    // effects and refuse an unusable one rather than minting a substitute:
+    // a retry must keep the same logical identity.
+    let run_id = match resolve_run_id(
+        run_id_flag,
+        std::env::var("AGENT_RUN_ID").ok(),
+        std::env::var("BOP_RUN_ID").ok(),
+        unix_ms_now(),
+    ) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(2);
+        }
+    };
 
     let strategy = match parse_strategy(strategy_spec.as_deref()) {
         Ok(s) => s,
@@ -804,7 +875,6 @@ fn run_cmd(mut args: Vec<String>) -> ExitCode {
     let sess = spawn(sess_build);
 
     // Optional run log: tee every StreamEvent into <dir>/<run_id>.jsonl.
-    let run_id = format!("run-{}", unix_ms_now());
     let runlog_handle = open_runlog(common.runlog_dir.as_ref(), &run_id);
     let (log_tx, log_rx) = std::sync::mpsc::sync_channel::<harness::StreamEvent>(1024);
     let log_thread = runlog_handle.as_ref().map(|r| {
@@ -1100,10 +1170,13 @@ impl AgentHandler for ChatHandler {
 
         // Optional RunLog: use the per-request correlation key as the
         // `run_id` so the jsonl filename matches the `X-Request-ID`
-        // surfaced on the response. Every emitted record carries the
+        // surfaced on the response (unless the client-supplied id is not a
+        // safe filename, e.g. contains `/` — then a minted id names the
+        // file and `request_id` is still recorded). Every emitted record carries the
         // same id in a dedicated field for log/metric joins.
         let runlog = self.runlog_dir.as_ref().and_then(|dir| {
-            match runlog::RunLog::open_with_request_id(dir, request_id, request_id) {
+            let file_id = server_runlog_id(request_id, unix_ms_now());
+            match runlog::RunLog::open_with_request_id(dir, file_id, request_id) {
                 Ok(r) => Some(Arc::new(r)),
                 Err(e) => {
                     eprintln!("runlog: open {dir:?} failed: {e:?}; continuing without log");
@@ -1249,5 +1322,47 @@ fn mcp_serve_cmd(mut args: Vec<String>) -> ExitCode {
             eprintln!("mcp serve: {e:?}");
             ExitCode::from(1)
         }
+    }
+}
+
+#[cfg(test)]
+mod run_id_tests {
+    use super::{resolve_run_id, server_runlog_id};
+
+    fn some(s: &str) -> Option<String> {
+        Some(s.to_string())
+    }
+
+    #[test]
+    fn precedence_flag_then_agent_env_then_bop_env_then_minted() {
+        assert_eq!(resolve_run_id(some("f"), some("a"), some("b"), 7).unwrap(), "f");
+        assert_eq!(resolve_run_id(None, some("a"), some("b"), 7).unwrap(), "a");
+        assert_eq!(resolve_run_id(None, None, some("b"), 7).unwrap(), "b");
+        assert_eq!(resolve_run_id(None, None, None, 7).unwrap(), "run-7");
+    }
+
+    #[test]
+    fn empty_env_is_unset_but_empty_flag_is_an_error() {
+        assert_eq!(resolve_run_id(None, some(""), some("b"), 7).unwrap(), "b");
+        assert_eq!(resolve_run_id(None, some(""), some(""), 7).unwrap(), "run-7");
+        let e = resolve_run_id(some(""), None, None, 7).unwrap_err();
+        assert!(e.starts_with("--run-id:"), "{e}");
+    }
+
+    #[test]
+    fn invalid_explicit_id_names_its_source() {
+        let e = resolve_run_id(None, None, some("../x"), 7).unwrap_err();
+        assert!(e.starts_with("BOP_RUN_ID:"), "{e}");
+        let e = resolve_run_id(None, some("a b"), None, 7).unwrap_err();
+        assert!(e.starts_with("AGENT_RUN_ID:"), "{e}");
+    }
+
+    #[test]
+    fn server_uses_safe_request_id_else_mints() {
+        assert_eq!(server_runlog_id("my-trace-123", 5), "my-trace-123");
+        let a = server_runlog_id("../../etc/passwd", 5);
+        let b = server_runlog_id("../../etc/passwd", 5);
+        assert!(a.starts_with("req-5-") && runlog::is_valid_run_id(&a), "{a}");
+        assert_ne!(a, b, "minted ids are unique per request");
     }
 }
