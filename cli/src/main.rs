@@ -932,12 +932,10 @@ fn run_cmd(mut args: Vec<String>) -> ExitCode {
         };
         // Commit each event before presenting it. An audit write failure
         // cancels further processing instead of silently dropping records.
-        if let Some(log) = &runlog_handle {
-            if let Err(e) = log.record_event(&ev) {
-                eprintln!("runlog: record failed: {e}");
-                drop(rx);
-                break (ExitCode::from(1), AgentStatus::Failure(format!("runlog: {e}")));
-            }
+        if let Some(log) = &runlog_handle && let Err(e) = log.record_event(&ev) {
+            eprintln!("runlog: record failed: {e}");
+            drop(rx);
+            break (ExitCode::from(1), AgentStatus::Failure(format!("runlog: {e}")));
         }
         match ev {
             harness::StreamEvent::TextDelta(s) => {
@@ -1215,11 +1213,9 @@ impl ChatHandler {
 
         let mut final_err: Option<HandlerError> = None;
         for ev in rx.iter() {
-            if let Some(log) = &runlog {
-                if let Err(e) = log.record_event(&ev) {
-                    final_err = Some(HandlerError(format!("runlog: {e}")));
-                    break;
-                }
+            if let Some(log) = &runlog && let Err(e) = log.record_event(&ev) {
+                final_err = Some(HandlerError(format!("runlog: {e}")));
+                break;
             }
             let write_result = match &ev {
                 harness::StreamEvent::TextDelta(s) => sink.emit(Some("text_delta"), s),
