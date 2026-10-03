@@ -1616,16 +1616,12 @@ mod run_id_tests {
         let path = dir.join(format!("{}.jsonl", log.run_id()));
         let counter = Arc::new(AtomicUsize::new(0));
         let handler = tool_turn_handler(counter.clone());
-        let mut writer = BrokenFlushAtTurnComplete {
-            frame: Vec::new(),
-            failed_at_turn: false,
-        };
+        let mut writer = BrokenFlushAtTurnComplete { frame: Vec::new(), failed_at_turn: false };
         let mut sink = EventSink::new(&mut writer);
         let err = handler
             .handle_prepared("agent", "prompt".into(), Some(log.clone()), &mut sink)
             .unwrap_err();
         assert!(err.0.contains("SSE sink"), "{err}");
-        drop(sink);
         assert!(writer.failed_at_turn, "fault did not fire at turn_complete flush");
         assert_eq!(counter.load(Ordering::SeqCst), 0, "tool ran after local SSE flush failure");
         let text = std::fs::read_to_string(&path).unwrap();
