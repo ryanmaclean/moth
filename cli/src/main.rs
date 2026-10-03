@@ -651,7 +651,12 @@ fn write_newline(out: &mut dyn std::io::Write) -> std::io::Result<()> {
     out.flush()
 }
 
-fn run_cmd(mut args: Vec<String>) -> ExitCode {
+fn run_cmd(args: Vec<String>) -> ExitCode {
+    let mut stdout = std::io::stdout();
+    run_cmd_with_output(args, &mut stdout)
+}
+
+fn run_cmd_with_output(mut args: Vec<String>, out: &mut dyn std::io::Write) -> ExitCode {
     if wants_help(&args) {
         print_run_help();
         return ExitCode::SUCCESS;
@@ -942,8 +947,7 @@ fn run_cmd(mut args: Vec<String>) -> ExitCode {
         match ev {
             harness::StreamEvent::TextDelta(s) => {
                 last_was_newline = s.ends_with('\n');
-                let mut stdout = std::io::stdout();
-                if let Err(e) = stdout.write_all(s.as_bytes()).and_then(|_| stdout.flush()) {
+                if let Err(e) = out.write_all(s.as_bytes()).and_then(|_| out.flush()) {
                     eprintln!("stdout: {e}");
                     drop(rx);
                     break (ExitCode::from(1), AgentStatus::Failure(format!("stdout: {e}")));
@@ -951,8 +955,7 @@ fn run_cmd(mut args: Vec<String>) -> ExitCode {
             }
             harness::StreamEvent::ToolUseStart { name, .. } => {
                 if !last_was_newline {
-                    let mut stdout = std::io::stdout();
-                    if let Err(e) = write_newline(&mut stdout) {
+                    if let Err(e) = write_newline(out) {
                         eprintln!("stdout: {e}");
                         drop(rx);
                         break (ExitCode::from(1), AgentStatus::Failure(format!("stdout: {e}")));
@@ -971,8 +974,7 @@ fn run_cmd(mut args: Vec<String>) -> ExitCode {
             }
             harness::StreamEvent::Done(pr) => {
                 if !last_was_newline {
-                    let mut stdout = std::io::stdout();
-                    if let Err(e) = write_newline(&mut stdout) {
+                    if let Err(e) = write_newline(out) {
                         eprintln!("stdout: {e}");
                         drop(rx);
                         break (ExitCode::from(1), AgentStatus::Failure(format!("stdout: {e}")));
@@ -1373,7 +1375,7 @@ fn mcp_serve_cmd(mut args: Vec<String>) -> ExitCode {
 mod run_id_tests {
     use super::{
         ChatHandler, MockModel, Model, anchor_runlog_dir, build_mock_canned, resolve_run_id,
-        write_newline,
+        run_cmd_with_output, write_newline,
     };
     use harness::{ModelEvent, Tool, ToolCtx, ToolError};
     use server::AgentHandler;
@@ -1489,6 +1491,76 @@ mod run_id_tests {
         let mut out = BrokenFlush(Vec::new());
         assert_eq!(write_newline(&mut out).unwrap_err().kind(), io::ErrorKind::BrokenPipe);
         assert_eq!(out.0.as_slice(), b"\n");
+    }
+
+    #[test]
+    fn cli_broken_stdout_withholds_audit_ack_before_tool_dispatch() {
+        struct BrokenOutput {
+            writes: usize,
+        }
+        impl Write for BrokenOutput {
+            fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+                self.writes += 1;
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed CLI stdout"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "moth-cli-no-ack-{}-{}",
+            std::process::id(),
+            super::unix_ms_now(),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("tool-must-not-run");
+        let script_path = dir.join("script.json");
+        let mut escaped_path = String::new();
+        anthropic::json::escape_into(&mut escaped_path, marker.to_string_lossy().as_ref());
+        let tool_input = format!(r#"{{"path":"{escaped_path}","content":"ran"}}"#);
+        let mut escaped_input = String::new();
+        anthropic::json::escape_into(&mut escaped_input, &tool_input);
+        let script = [
+            r#"{"turns":[[{"type":"text_delta","delta":"first"},"#,
+            r#"{"type":"tool_use_start","id":"t1","name":"write_file"},"#,
+            r#"{"type":"tool_use_input_delta","delta":""#,
+            escaped_input.as_str(),
+            r#""},{"type":"block_stop"},{"type":"stop","reason":"tool_use"}],[{"type":"text_delta","delta":"done"},{"type":"stop","reason":"end_turn"}]]}"#,
+        ]
+        .concat();
+        std::fs::write(&script_path, script).unwrap();
+
+        let args = |run_id: &str| {
+            vec![
+                "--mock-script".into(),
+                script_path.to_string_lossy().into_owned(),
+                "--runlog".into(),
+                dir.to_string_lossy().into_owned(),
+                "--run-id".into(),
+                run_id.into(),
+                "prompt".into(),
+            ]
+        };
+        let mut control_output = Vec::new();
+        assert_eq!(
+            run_cmd_with_output(args("control"), &mut control_output),
+            std::process::ExitCode::SUCCESS,
+        );
+        assert!(marker.exists(), "positive control did not dispatch write_file");
+        std::fs::remove_file(&marker).unwrap();
+
+        let mut output = BrokenOutput { writes: 0 };
+        let exit = run_cmd_with_output(args("no-ack"), &mut output);
+        assert_eq!(exit, std::process::ExitCode::from(1));
+        assert_eq!(output.writes, 1, "fault must fire on the first text delta");
+        let log = std::fs::read_to_string(dir.join("no-ack.jsonl")).unwrap();
+        let lines: Vec<_> = log.lines().collect();
+        assert_eq!(lines.len(), 2, "{log}");
+        assert!(lines[0].contains(r#""kind":"start""#), "{log}");
+        assert!(lines[1].contains(r#""kind":"text_delta""#), "{log}");
+        assert!(!marker.exists(), "tool ran after the failed output write");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
