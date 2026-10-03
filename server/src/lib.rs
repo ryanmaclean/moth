@@ -56,6 +56,20 @@ impl Default for ServerConfig {
 }
 
 pub trait AgentHandler: Send + Sync + 'static {
+    /// Reserve required resources before the HTTP 200/SSE commitment. The
+    /// default preserves simple handlers' existing behavior.
+    fn prepare<'a>(
+        &'a self,
+        id: &str,
+        request_id: &str,
+        body: &[u8],
+    ) -> Result<Box<dyn FnOnce(&mut EventSink) -> Result<(), HandlerError> + 'a>, PrepareError> {
+        let id = id.to_owned();
+        let request_id = request_id.to_owned();
+        let body = body.to_vec();
+        Ok(Box::new(move |sink| self.handle(&id, &request_id, &body, sink)))
+    }
+
     fn handle(
         &self,
         id: &str,
@@ -105,6 +119,20 @@ impl std::fmt::Display for HandlerError {
 }
 
 impl std::error::Error for HandlerError {}
+
+#[derive(Debug)]
+pub enum PrepareError {
+    Client(HandlerError),
+    Service(HandlerError),
+}
+
+impl std::fmt::Display for PrepareError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Client(e) | Self::Service(e) => write!(f, "{e}"),
+        }
+    }
+}
 
 pub struct Server {
     handlers: HashMap<String, Box<dyn AgentHandler>>,
@@ -300,6 +328,21 @@ impl Server {
             );
         };
 
+        let prepared = match handler.prepare(id, &request_id, &req.body) {
+            Ok(prepared) => prepared,
+            Err(e) => {
+                eprintln!("agent handler preflight failed: {e}");
+                let (status, reason) = match e {
+                    PrepareError::Client(_) => (400, "Bad Request"),
+                    PrepareError::Service(_) => (503, "Service Unavailable"),
+                };
+                return (
+                    ResponseKind::Buffered,
+                    write_simple(stream, status, reason, Some(&request_id)),
+                );
+            }
+        };
+
         // Commit SSE headers up front. Once they're on the wire any handler
         // error has to be surfaced inside the stream as an `error` event;
         // we can't retroactively change the status. The `X-Request-ID` echo
@@ -321,7 +364,7 @@ impl Server {
         }
 
         let mut sink = EventSink::new(stream);
-        if let Err(e) = handler.handle(id, &request_id, &req.body, &mut sink) {
+        if let Err(e) = prepared(&mut sink) {
             let _ = sink.emit(Some("error"), &e.0);
         }
         (ResponseKind::Sse, Ok(()))
@@ -611,6 +654,50 @@ mod tests {
         }
     }
 
+    struct PreflightRejectAgent;
+    impl AgentHandler for PreflightRejectAgent {
+        fn prepare<'a>(
+            &'a self,
+            _id: &str,
+            _request_id: &str,
+            _body: &[u8],
+        ) -> Result<Box<dyn FnOnce(&mut EventSink) -> Result<(), HandlerError> + 'a>, PrepareError> {
+            Err(PrepareError::Service(HandlerError("required audit log unavailable".into())))
+        }
+
+        fn handle(
+            &self,
+            _id: &str,
+            _request_id: &str,
+            _body: &[u8],
+            _sink: &mut EventSink,
+        ) -> Result<(), HandlerError> {
+            panic!("handler must not run after failed preflight")
+        }
+    }
+
+    struct PreflightClientRejectAgent;
+    impl AgentHandler for PreflightClientRejectAgent {
+        fn prepare<'a>(
+            &'a self,
+            _id: &str,
+            _request_id: &str,
+            _body: &[u8],
+        ) -> Result<Box<dyn FnOnce(&mut EventSink) -> Result<(), HandlerError> + 'a>, PrepareError> {
+            Err(PrepareError::Client(HandlerError("invalid prompt".into())))
+        }
+
+        fn handle(
+            &self,
+            _id: &str,
+            _request_id: &str,
+            _body: &[u8],
+            _sink: &mut EventSink,
+        ) -> Result<(), HandlerError> {
+            panic!("handler must not run after invalid prompt")
+        }
+    }
+
     struct LenAgent;
     impl AgentHandler for LenAgent {
         fn handle(
@@ -655,6 +742,8 @@ mod tests {
         server.register("err", Box::new(ErrAgent));
         server.register("len", Box::new(LenAgent));
         server.register("reqid", Box::new(EchoReqIdAgent));
+        server.register("preflight", Box::new(PreflightRejectAgent));
+        server.register("badprompt", Box::new(PreflightClientRejectAgent));
         let handle = thread::spawn(move || {
             let _ = server.serve_listener_with(listener, cfg);
         });
@@ -804,6 +893,30 @@ mod tests {
         assert!(head.starts_with("HTTP/1.1 200 OK"));
         let body = String::from_utf8(body).unwrap();
         assert!(body.contains("event: error\ndata: boom\n\n"), "body: {body:?}");
+    }
+
+    #[test]
+    fn failed_required_preflight_returns_503_before_sse_or_handler_work() {
+        let (addr, _h) = spawn_server();
+        let req = b"POST /agents/preflight/x HTTP/1.1\r\nX-Request-ID: trace-1\r\nContent-Length: 0\r\n\r\n";
+        let resp = send(addr, req);
+        let (head, body) = split_headers_body(&resp);
+        assert!(head.starts_with("HTTP/1.1 503"), "{head}");
+        assert!(head.contains("X-Request-ID: trace-1"));
+        assert!(!head.contains("text/event-stream"));
+        assert_eq!(body, b"Service Unavailable");
+    }
+
+    #[test]
+    fn client_preflight_error_returns_400_before_sse() {
+        let (addr, _h) = spawn_server();
+        let req = b"POST /agents/badprompt/x HTTP/1.1\r\nX-Request-ID: trace-1\r\nContent-Length: 0\r\n\r\n";
+        let resp = send(addr, req);
+        let (head, body) = split_headers_body(&resp);
+        assert!(head.starts_with("HTTP/1.1 400"), "{head}");
+        assert!(head.contains("X-Request-ID: trace-1"));
+        assert!(!head.contains("text/event-stream"));
+        assert_eq!(body, b"Bad Request");
     }
 
     #[test]
