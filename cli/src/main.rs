@@ -27,7 +27,7 @@
 mod doctor;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -66,7 +66,7 @@ use harness::{
     AnthropicModel, AuditedShell, BashTool, HarnessState, Instance, MockModel, Model, ModelEvent,
     OpenAiModel, Sandbox, Session, SessionMsg, SessionStore, Tool,
 };
-use server::{AgentHandler, EventSink, HandlerError, Server, ServerConfig};
+use server::{AgentHandler, EventSink, HandlerError, PrepareError, Server, ServerConfig};
 
 const DEFAULT_ANTHROPIC_MODEL: &str = "claude-haiku-4-5";
 const DEFAULT_OPENAI_MODEL: &str = "gpt-4o-mini";
@@ -147,7 +147,8 @@ fn print_run_help() {
         --arg KEY=VAL                substitute {{KEY}} in the skill (repeatable)\n  \
         --sessions DIR               persist message history to DIR\n  \
         --mcp 'CMD ARGS'             spawn MCP server, register its tools (repeatable)\n  \
-        --runlog DIR                 tee every StreamEvent to <DIR>/<run_id>.jsonl\n  \
+        --runlog DIR                 audit to <DIR>/<run_id>.jsonl; relative DIR uses the\n                               \
+                              caller's cwd before branch-strategy preparation\n  \
         --run-id ID                  run identity owned by the caller (e.g. BOP); names the\n                               \
                               runlog file. [A-Za-z0-9._:-], <=128 bytes. Default:\n                               \
                               run-<unix-ms>.\n  \
@@ -194,7 +195,7 @@ fn print_serve_help() {
         --model NAME                 model id\n  \
         --sessions DIR               persist message history to DIR\n  \
         --mcp 'CMD ARGS'             spawn MCP server, register its tools (repeatable)\n  \
-        --runlog DIR                 tee every StreamEvent to <DIR>/<request_id>.jsonl\n  \
+        --runlog DIR                 audit each HTTP execution in a distinct <DIR>/http-*.jsonl\n  \
         --metrics HOST:PORT          send DogStatsD metrics here (overrides DOGSTATSD_ADDR)\n\n\
         examples:\n  \
         agent serve\n  \
@@ -631,31 +632,19 @@ fn resolve_run_id(
     Ok(id)
 }
 
-/// Runlog file id for a server request: the `X-Request-ID` when it is a
-/// safe filename component, otherwise a server-minted `req-<unix-ms>-<n>`.
-/// The original request id is still stamped on every record.
-fn server_runlog_id(request_id: &str, now_ms: u128) -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static N: AtomicU64 = AtomicU64::new(0);
-    if runlog::is_valid_run_id(request_id) {
-        request_id.to_string()
-    } else {
-        format!("req-{now_ms}-{}", N.fetch_add(1, Ordering::Relaxed))
-    }
+/// An explicitly requested audit log must open before model/tool work starts.
+fn open_runlog(dir: Option<&PathBuf>, run_id: &str) -> Result<Option<Arc<runlog::RunLog>>, String> {
+    dir.map(|dir| runlog::RunLog::open(dir, run_id).map(Arc::new)
+        .map_err(|e| format!("runlog: open {dir:?} failed: {e}"))).transpose()
 }
 
-/// Spawn a `RunLog` drainer if `--runlog DIR` was given, returning a
-/// channel-tee handle that mirrors every StreamEvent into the log file
-/// AND forwards to the caller's downstream receiver.
-fn open_runlog(dir: Option<&PathBuf>, run_id: &str) -> Option<Arc<runlog::RunLog>> {
-    let dir = dir?;
-    match runlog::RunLog::open(dir, run_id) {
-        Ok(r) => Some(Arc::new(r)),
-        Err(e) => {
-            eprintln!("runlog: open {dir:?} failed: {e:?}; continuing without log");
-            None
-        }
-    }
+fn anchor_runlog_dir(caller_cwd: &Path, requested: &Path) -> PathBuf {
+    if requested.is_absolute() { requested.to_path_buf() } else { caller_cwd.join(requested) }
+}
+
+fn write_newline(out: &mut dyn std::io::Write) -> std::io::Result<()> {
+    out.write_all(b"\n")?;
+    out.flush()
 }
 
 fn run_cmd(mut args: Vec<String>) -> ExitCode {
@@ -763,6 +752,26 @@ fn run_cmd(mut args: Vec<String>) -> ExitCode {
         (None, p) if !p.is_empty() => p,
         (None, _) => {
             return usage_and_exit(2);
+        }
+    };
+
+    // Resolve the audit path against the caller's cwd and open it before
+    // model, MCP, store, or branch-strategy side effects.
+    let anchored_runlog_dir = match common.runlog_dir.as_ref() {
+        Some(dir) => match std::env::current_dir() {
+            Ok(cwd) => Some(anchor_runlog_dir(&cwd, dir)),
+            Err(e) => {
+                eprintln!("runlog: cannot determine caller cwd: {e}");
+                return ExitCode::from(1);
+            }
+        },
+        None => None,
+    };
+    let runlog_handle = match open_runlog(anchored_runlog_dir.as_ref(), &run_id) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
         }
     };
 
@@ -874,23 +883,17 @@ fn run_cmd(mut args: Vec<String>) -> ExitCode {
     }
     let sess = spawn(sess_build);
 
-    // Optional run log: tee every StreamEvent into <dir>/<run_id>.jsonl.
-    let runlog_handle = open_runlog(common.runlog_dir.as_ref(), &run_id);
-    let (log_tx, log_rx) = std::sync::mpsc::sync_channel::<harness::StreamEvent>(1024);
-    let log_thread = runlog_handle.as_ref().map(|r| {
-        let r = r.clone();
-        std::thread::spawn(move || {
-            let _ = r.drain(log_rx);
-        })
-    });
-
     // Use streaming so text deltas print to stdout as the model generates them.
     let (tx, rx) = std::sync::mpsc::sync_channel::<harness::StreamEvent>(256);
-    if let Err(e) = sess.addr.send(SessionMsg::PromptStream {
-        text: prompt,
-        structured_output_tag: None,
-        events: tx,
-    }) {
+    let (audit_ack_tx, audit_ack_rx) = std::sync::mpsc::channel::<()>();
+    let stream_msg = if runlog_handle.is_some() {
+        SessionMsg::PromptStreamAudited {
+            text: prompt, structured_output_tag: None, events: tx, ack: audit_ack_rx,
+        }
+    } else {
+        SessionMsg::PromptStream { text: prompt, structured_output_tag: None, events: tx }
+    };
+    if let Err(e) = sess.addr.send(stream_msg) {
         eprintln!("send failed: {e}");
         drop(mcp_clients);
         if let (Some(s), Some(ws)) = (strategy, workspace) {
@@ -920,18 +923,33 @@ fn run_cmd(mut args: Vec<String>) -> ExitCode {
                 );
             }
         };
-        // Mirror to the run log first; channel-closed there is a warning,
-        // not fatal — the run keeps going.
-        let _ = log_tx.send(ev.clone());
+        // Commit each event before presenting it. An audit write failure
+        // cancels further processing instead of silently dropping records.
+        if let Some(log) = &runlog_handle {
+            if let Err(e) = log.record_event(&ev) {
+                eprintln!("runlog: record failed: {e}");
+                drop(rx);
+                break (ExitCode::from(1), AgentStatus::Failure(format!("runlog: {e}")));
+            }
+        }
         match ev {
             harness::StreamEvent::TextDelta(s) => {
                 last_was_newline = s.ends_with('\n');
-                print!("{s}");
-                let _ = std::io::stdout().flush();
+                let mut stdout = std::io::stdout();
+                if let Err(e) = stdout.write_all(s.as_bytes()).and_then(|_| stdout.flush()) {
+                    eprintln!("stdout: {e}");
+                    drop(rx);
+                    break (ExitCode::from(1), AgentStatus::Failure(format!("stdout: {e}")));
+                }
             }
             harness::StreamEvent::ToolUseStart { name, .. } => {
                 if !last_was_newline {
-                    println!();
+                    let mut stdout = std::io::stdout();
+                    if let Err(e) = write_newline(&mut stdout) {
+                        eprintln!("stdout: {e}");
+                        drop(rx);
+                        break (ExitCode::from(1), AgentStatus::Failure(format!("stdout: {e}")));
+                    }
                 }
                 eprintln!("[tool: {name}]");
                 last_was_newline = true;
@@ -946,7 +964,12 @@ fn run_cmd(mut args: Vec<String>) -> ExitCode {
             }
             harness::StreamEvent::Done(pr) => {
                 if !last_was_newline {
-                    println!();
+                    let mut stdout = std::io::stdout();
+                    if let Err(e) = write_newline(&mut stdout) {
+                        eprintln!("stdout: {e}");
+                        drop(rx);
+                        break (ExitCode::from(1), AgentStatus::Failure(format!("stdout: {e}")));
+                    }
                 }
                 completed = pr.completed;
                 turns = pr.turns;
@@ -962,6 +985,9 @@ fn run_cmd(mut args: Vec<String>) -> ExitCode {
             }
             _ => {}
         }
+        if runlog_handle.is_some() {
+            let _ = audit_ack_tx.send(());
+        }
     };
     if completed {
         eprintln!("[completion signal fired after {turns} turn(s)]");
@@ -969,6 +995,7 @@ fn run_cmd(mut args: Vec<String>) -> ExitCode {
         eprintln!("[{turns} turn(s)]");
     }
 
+    drop(audit_ack_tx); // unblock an audited producer after cancellation
     let _ = sess.join();
     // `state` (and the optional `task_tool`, which retains a parent-state
     // clone) hold extra `ActorRef<InstanceMsg>` clones via
@@ -982,11 +1009,6 @@ fn run_cmd(mut args: Vec<String>) -> ExitCode {
     drop(task_tool);
     drop(state);
     let _ = inst.join();
-    // Close the runlog channel so the drainer thread exits.
-    drop(log_tx);
-    if let Some(t) = log_thread {
-        let _ = t.join();
-    }
     drop(mcp_clients);
     if let (Some(s), Some(ws)) = (strategy, workspace)
         && let Err(e) = s.finish(ws, agent_status)
@@ -1146,16 +1168,16 @@ struct ChatHandler {
     metrics: Arc<metrics::Client>,
 }
 
-impl AgentHandler for ChatHandler {
-    fn handle(
+impl ChatHandler {
+    fn handle_prepared(
         &self,
         id: &str,
-        request_id: &str,
-        body: &[u8],
+        prompt: String,
+        runlog: Option<Arc<runlog::RunLog>>,
         sink: &mut EventSink,
     ) -> Result<(), HandlerError> {
-        let prompt = parse_prompt(body).map_err(HandlerError)?;
-        let _ = sink.emit(Some("start"), id);
+        sink.emit(Some("start"), id)
+            .map_err(|e| HandlerError(format!("SSE start: {e}")))?;
 
         let sandbox: Box<dyn Sandbox> = Box::new(AuditedShell::new(vshell::VShell::new()));
         let inst = spawn(Instance::new(id, sandbox));
@@ -1168,47 +1190,30 @@ impl AgentHandler for ChatHandler {
         }
         let sess = spawn(sess_build);
 
-        // Optional RunLog: use the per-request correlation key as the
-        // `run_id` so the jsonl filename matches the `X-Request-ID`
-        // surfaced on the response (unless the client-supplied id is not a
-        // safe filename, e.g. contains `/` — then a minted id names the
-        // file and `request_id` is still recorded). Every emitted record carries the
-        // same id in a dedicated field for log/metric joins.
-        let runlog = self.runlog_dir.as_ref().and_then(|dir| {
-            let file_id = server_runlog_id(request_id, unix_ms_now());
-            match runlog::RunLog::open_with_request_id(dir, file_id, request_id) {
-                Ok(r) => Some(Arc::new(r)),
-                Err(e) => {
-                    eprintln!("runlog: open {dir:?} failed: {e:?}; continuing without log");
-                    None
-                }
-            }
-        });
-        let (log_tx, log_rx) = std::sync::mpsc::sync_channel::<harness::StreamEvent>(1024);
-        let log_thread = runlog.as_ref().map(|r| {
-            let r = r.clone();
-            std::thread::spawn(move || {
-                let _ = r.drain(log_rx);
-            })
-        });
-
         // Streaming: forward each Session StreamEvent to the SSE client as
         // it arrives. Client-disconnect (sink.emit fails) propagates to the
         // session as a closed receiver, which triggers in-loop cancellation.
         let (tx, rx) = std::sync::mpsc::sync_channel::<harness::StreamEvent>(256);
+        let (audit_ack_tx, audit_ack_rx) = std::sync::mpsc::channel::<()>();
+        let stream_msg = if runlog.is_some() {
+            SessionMsg::PromptStreamAudited {
+                text: prompt, structured_output_tag: None, events: tx, ack: audit_ack_rx,
+            }
+        } else {
+            SessionMsg::PromptStream { text: prompt, structured_output_tag: None, events: tx }
+        };
         sess.addr
-            .send(SessionMsg::PromptStream {
-                text: prompt,
-                structured_output_tag: None,
-                events: tx,
-            })
+            .send(stream_msg)
             .map_err(|e| HandlerError(format!("session send: {e}")))?;
 
         let mut final_err: Option<HandlerError> = None;
         for ev in rx.iter() {
-            // Tee to the runlog drainer first. A closed/full channel is a
-            // warning only; the request continues.
-            let _ = log_tx.send(ev.clone());
+            if let Some(log) = &runlog {
+                if let Err(e) = log.record_event(&ev) {
+                    final_err = Some(HandlerError(format!("runlog: {e}")));
+                    break;
+                }
+            }
             let write_result = match &ev {
                 harness::StreamEvent::TextDelta(s) => sink.emit(Some("text_delta"), s),
                 harness::StreamEvent::ToolUseStart { id: tid, name } => {
@@ -1233,10 +1238,14 @@ impl AgentHandler for ChatHandler {
                     Ok(())
                 }
             };
-            if write_result.is_err() {
-                // Client disconnected; dropping rx will cancel the in-flight
-                // turn on the next event boundary.
+            if let Err(e) = write_result {
+                // No ACK after a failed local SSE write. Dropping the ACK
+                // sender below cancels before the next tool dispatch.
+                final_err = Some(HandlerError(format!("SSE sink: {e}")));
                 break;
+            }
+            if runlog.is_some() {
+                let _ = audit_ack_tx.send(());
             }
             if matches!(&ev, harness::StreamEvent::Done(_) | harness::StreamEvent::Cancelled) {
                 break;
@@ -1244,17 +1253,42 @@ impl AgentHandler for ChatHandler {
         }
 
         drop(rx); // signal cancellation to the still-running session if any
+        drop(audit_ack_tx); // release a producer awaiting failed audit write
         let _ = sess.join();
         let _ = inst.join();
-        drop(log_tx);
-        if let Some(t) = log_thread {
-            let _ = t.join();
-        }
-
         match final_err {
             Some(e) => Err(e),
             None => Ok(()),
         }
+    }
+}
+
+impl AgentHandler for ChatHandler {
+    fn prepare<'a>(
+        &'a self,
+        id: &str,
+        request_id: &str,
+        body: &[u8],
+    ) -> Result<Box<dyn FnOnce(&mut EventSink) -> Result<(), HandlerError> + 'a>, PrepareError> {
+        let prompt = parse_prompt(body).map_err(|e| PrepareError::Client(HandlerError(e)))?;
+        let runlog = self.runlog_dir.as_ref().map(|dir| {
+            runlog::RunLog::create_http(dir, request_id)
+                .map(Arc::new)
+                .map_err(|e| PrepareError::Service(HandlerError(format!("runlog: {e}"))))
+        }).transpose()?;
+        let id = id.to_owned();
+        Ok(Box::new(move |sink| self.handle_prepared(&id, prompt, runlog, sink)))
+    }
+
+    fn handle(
+        &self,
+        id: &str,
+        request_id: &str,
+        body: &[u8],
+        sink: &mut EventSink,
+    ) -> Result<(), HandlerError> {
+        self.prepare(id, request_id, body)
+            .map_err(|e| HandlerError(e.to_string()))?(sink)
     }
 }
 
@@ -1327,7 +1361,44 @@ fn mcp_serve_cmd(mut args: Vec<String>) -> ExitCode {
 
 #[cfg(test)]
 mod run_id_tests {
-    use super::{resolve_run_id, server_runlog_id};
+    use super::{anchor_runlog_dir, build_mock_canned, resolve_run_id, write_newline, ChatHandler, Model, MockModel};
+    use server::AgentHandler;
+    use server::EventSink;
+    use std::io::{self, Write};
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+    use harness::{ModelEvent, Tool, ToolCtx, ToolError};
+
+    struct CountingTool(Arc<AtomicUsize>);
+    impl Tool for CountingTool {
+        fn name(&self) -> &str { "probe" }
+        fn description(&self) -> &str { "Count tool dispatches" }
+        fn input_schema(&self) -> &str { r#"{"type":"object"}"# }
+        fn call(&self, _input: &str, _ctx: &ToolCtx) -> Result<String, ToolError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok("called".into())
+        }
+    }
+
+    fn tool_turn_handler(counter: Arc<AtomicUsize>) -> ChatHandler {
+        let model: Arc<dyn Model> = Arc::new(MockModel::new(vec![
+            vec![
+                ModelEvent::ToolUseStart { id: "t1".into(), name: "probe".into() },
+                ModelEvent::ToolUseInputDelta("{}".into()),
+                ModelEvent::BlockStop,
+                ModelEvent::Stop { reason: Some("tool_use".into()) },
+            ],
+            vec![ModelEvent::TextDelta("done".into()),
+                ModelEvent::Stop { reason: Some("end_turn".into()) }],
+        ]));
+        ChatHandler {
+            model,
+            tools: Arc::new(vec![Arc::new(CountingTool(counter)) as Arc<dyn Tool>]),
+            store: None,
+            runlog_dir: None,
+            metrics: Arc::new(metrics::Client::disabled()),
+        }
+    }
 
     fn some(s: &str) -> Option<String> {
         Some(s.to_string())
@@ -1358,11 +1429,188 @@ mod run_id_tests {
     }
 
     #[test]
-    fn server_uses_safe_request_id_else_mints() {
-        assert_eq!(server_runlog_id("my-trace-123", 5), "my-trace-123");
-        let a = server_runlog_id("../../etc/passwd", 5);
-        let b = server_runlog_id("../../etc/passwd", 5);
-        assert!(a.starts_with("req-5-") && runlog::is_valid_run_id(&a), "{a}");
-        assert_ne!(a, b, "minted ids are unique per request");
+    fn relative_runlog_directory_is_anchored_before_workspace_change() {
+        assert_eq!(
+            anchor_runlog_dir(Path::new("/caller"), Path::new("logs")),
+            PathBuf::from("/caller/logs"),
+        );
+        assert_eq!(
+            anchor_runlog_dir(Path::new("/caller"), Path::new("/audit/logs")),
+            PathBuf::from("/audit/logs"),
+        );
     }
+
+    #[test]
+    fn checked_newline_propagates_write_and_flush_failures() {
+        struct BrokenWrite;
+        impl Write for BrokenWrite {
+            fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "stdout closed"))
+            }
+            fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        }
+        struct BrokenFlush(Vec<u8>);
+        impl Write for BrokenFlush {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "stdout flush failed"))
+            }
+        }
+        assert_eq!(write_newline(&mut BrokenWrite).unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+        let mut out = BrokenFlush(Vec::new());
+        assert_eq!(write_newline(&mut out).unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(out.0.as_slice(), b"\n");
+    }
+
+    #[test]
+    fn two_http_preflights_with_same_client_id_reserve_separate_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "moth-http-runlog-{}-{}", std::process::id(), super::unix_ms_now(),
+        ));
+        let model: Arc<dyn Model> = Arc::new(build_mock_canned("test"));
+        let handler = ChatHandler {
+            model,
+            tools: Arc::new(Vec::new()),
+            store: None,
+            runlog_dir: Some(dir.clone()),
+            metrics: Arc::new(metrics::Client::resolve(None)),
+        };
+        let a = handler.prepare("agent", "repeated-id", b"one").unwrap();
+        let b = handler.prepare("agent", "repeated-id", b"two").unwrap();
+        let files: Vec<_> = std::fs::read_dir(&dir).unwrap()
+            .map(|e| e.unwrap().path()).collect();
+        assert_eq!(files.len(), 2);
+        assert_ne!(files[0], files[1]);
+        for path in &files {
+            let text = std::fs::read_to_string(path).unwrap();
+            assert!(text.contains(r#""request_id":"repeated-id""#), "{text}");
+            assert!(text.starts_with(r#"{"seq":0,"ts_ms":"#), "{text}");
+        }
+        drop((a, b));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_initial_sse_start_does_not_run_model() {
+        struct BrokenSink;
+        impl Write for BrokenSink {
+            fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "client disconnected"))
+            }
+            fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        }
+        let model = Arc::new(MockModel::single(vec![]));
+        let handler = ChatHandler {
+            model: model.clone() as Arc<dyn Model>,
+            tools: Arc::new(Vec::new()),
+            store: None,
+            runlog_dir: None,
+            metrics: Arc::new(metrics::Client::disabled()),
+        };
+        let mut writer = BrokenSink;
+        let mut sink = EventSink::new(&mut writer);
+        assert!(handler.handle_prepared("agent", "prompt".into(), None, &mut sink).is_err());
+        assert!(model.seen.lock().unwrap().is_empty(), "model ran after SSE start failure");
+    }
+
+    #[test]
+    fn real_handler_failed_turn_complete_sink_never_dispatches_tool() {
+        struct BrokenAtTurnComplete;
+        impl Write for BrokenAtTurnComplete {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                if buf == b"turn_complete" {
+                    return Err(io::Error::new(io::ErrorKind::BrokenPipe, "lost SSE client"));
+                }
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "moth-turn-sink-{}-{}", std::process::id(), super::unix_ms_now(),
+        ));
+        let log = Arc::new(runlog::RunLog::create_http(&dir, "client-id").unwrap());
+        let path = dir.join(format!("{}.jsonl", log.run_id()));
+        let counter = Arc::new(AtomicUsize::new(0));
+        let handler = tool_turn_handler(counter.clone());
+        let mut writer = BrokenAtTurnComplete;
+        let mut sink = EventSink::new(&mut writer);
+        let err = handler.handle_prepared("agent", "prompt".into(), Some(log.clone()), &mut sink)
+            .unwrap_err();
+        assert!(err.0.contains("SSE sink"), "{err}");
+        assert_eq!(counter.load(Ordering::SeqCst), 0, "tool ran after local SSE failure");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(r#""kind":"turn_complete""#), "{text}");
+        assert!(!text.contains(r#""kind":"tool_result""#), "{text}");
+        drop(log);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    // RLIMIT_FSIZE is process-wide, so this real RunLog write-failure test
+    // confines the limit and ignored SIGXFSZ to an exact-name child test.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[test]
+    fn real_handler_audit_failure_at_turn_boundary_never_dispatches_tool() {
+        const CHILD: &str = "MOTH_RUNLOG_AUDIT_FAILURE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "run_id_tests::real_handler_audit_failure_at_turn_boundary_never_dispatches_tool", "--nocapture"])
+                .env(CHILD, "1")
+                .output().unwrap();
+            assert!(output.status.success(), "child failed: {} {}",
+                String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "exact child test did not run: {}", String::from_utf8_lossy(&output.stdout));
+            return;
+        }
+
+        struct LimitOnBlockStop { frame: Vec<u8>, path: PathBuf }
+        impl Write for LimitOnBlockStop {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.frame.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                if self.frame.windows(b"event: block_stop\n".len())
+                    .any(|w| w == b"event: block_stop\n") {
+                    let len = std::fs::metadata(&self.path)?.len();
+                    let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+                    unsafe {
+                        if libc::getrlimit(libc::RLIMIT_FSIZE, &mut limit) != 0 {
+                            return Err(io::Error::last_os_error());
+                        }
+                        limit.rlim_cur = len as libc::rlim_t;
+                        if libc::setrlimit(libc::RLIMIT_FSIZE, &limit) != 0 {
+                            return Err(io::Error::last_os_error());
+                        }
+                    }
+                }
+                self.frame.clear();
+                Ok(())
+            }
+        }
+
+        unsafe { libc::signal(libc::SIGXFSZ, libc::SIG_IGN); }
+        let dir = std::env::temp_dir().join(format!(
+            "moth-turn-audit-{}-{}", std::process::id(), super::unix_ms_now(),
+        ));
+        let log = Arc::new(runlog::RunLog::create_http(&dir, "client-id").unwrap());
+        let path = dir.join(format!("{}.jsonl", log.run_id()));
+        let counter = Arc::new(AtomicUsize::new(0));
+        let handler = tool_turn_handler(counter.clone());
+        let mut writer = LimitOnBlockStop { frame: Vec::new(), path: path.clone() };
+        let mut sink = EventSink::new(&mut writer);
+        let err = handler.handle_prepared("agent", "prompt".into(), Some(log.clone()), &mut sink)
+            .unwrap_err();
+        assert!(err.0.contains("runlog"), "{err}");
+        assert_eq!(counter.load(Ordering::SeqCst), 0, "tool ran after audit write failed");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains(r#""kind":"turn_complete""#), "{text}");
+        assert!(!text.contains(r#""kind":"tool_result""#), "{text}");
+        drop(log);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
 }
