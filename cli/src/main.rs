@@ -1582,6 +1582,59 @@ mod run_id_tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    #[test]
+    fn real_handler_failed_sse_flush_at_turn_boundary_never_dispatches_tool() {
+        struct BrokenFlushAtTurnComplete {
+            frame: Vec<u8>,
+            failed_at_turn: bool,
+        }
+        impl Write for BrokenFlushAtTurnComplete {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.frame.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                if self
+                    .frame
+                    .windows(b"event: turn_complete\n".len())
+                    .any(|w| w == b"event: turn_complete\n")
+                {
+                    self.failed_at_turn = true;
+                    return Err(io::Error::new(io::ErrorKind::BrokenPipe, "lost SSE flush"));
+                }
+                self.frame.clear();
+                Ok(())
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "moth-turn-flush-{}-{}",
+            std::process::id(),
+            super::unix_ms_now(),
+        ));
+        let log = Arc::new(runlog::RunLog::create_http(&dir, "client-id").unwrap());
+        let path = dir.join(format!("{}.jsonl", log.run_id()));
+        let counter = Arc::new(AtomicUsize::new(0));
+        let handler = tool_turn_handler(counter.clone());
+        let mut writer = BrokenFlushAtTurnComplete {
+            frame: Vec::new(),
+            failed_at_turn: false,
+        };
+        let mut sink = EventSink::new(&mut writer);
+        let err = handler
+            .handle_prepared("agent", "prompt".into(), Some(log.clone()), &mut sink)
+            .unwrap_err();
+        assert!(err.0.contains("SSE sink"), "{err}");
+        drop(sink);
+        assert!(writer.failed_at_turn, "fault did not fire at turn_complete flush");
+        assert_eq!(counter.load(Ordering::SeqCst), 0, "tool ran after local SSE flush failure");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(r#""kind":"turn_complete""#), "{text}");
+        assert!(!text.contains(r#""kind":"tool_result""#), "{text}");
+        drop(log);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     // RLIMIT_FSIZE is process-wide, so this real RunLog write-failure test
     // confines the limit and ignored SIGXFSZ to an exact-name child test.
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
