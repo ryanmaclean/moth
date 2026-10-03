@@ -232,7 +232,8 @@ impl Actor for Session {
                 let _ = reply.send(self.run_prompt(text, structured_output_tag));
             }
             SessionMsg::PromptStream { text, structured_output_tag, events } => {
-                let result = self.run_prompt_inner(text, structured_output_tag, Some(&events), None);
+                let result =
+                    self.run_prompt_inner(text, structured_output_tag, Some(&events), None);
                 // Best-effort terminal event. Cancellation already emitted
                 // its own terminal so we skip emitting Done after Cancelled.
                 if result.is_err() {
@@ -244,7 +245,8 @@ impl Actor for Session {
                 // was already sent (or attempted). Nothing to do.
             }
             SessionMsg::PromptStreamAudited { text, structured_output_tag, events, ack } => {
-                let result = self.run_prompt_inner(text, structured_output_tag, Some(&events), Some(&ack));
+                let result =
+                    self.run_prompt_inner(text, structured_output_tag, Some(&events), Some(&ack));
                 // Terminal events have no following model/tool work. The
                 // consumer still records and syncs them before reporting
                 // request success, but no further acknowledgement is needed.
@@ -1135,15 +1137,24 @@ mod tests {
                     ModelEvent::BlockStop,
                     ModelEvent::Stop { reason: Some("tool_use".into()) },
                 ],
-                vec![ModelEvent::TextDelta("done".into()), ModelEvent::Stop { reason: Some("end_turn".into()) }],
+                vec![
+                    ModelEvent::TextDelta("done".into()),
+                    ModelEvent::Stop { reason: Some("end_turn".into()) },
+                ],
             ],
             vec![ShellResult { exit_code: 0, stdout: b"hi\n".to_vec(), stderr: Vec::new() }],
         );
         let (events_tx, events_rx) = sync_channel(0);
         let (ack_tx, ack_rx) = channel();
-        session.addr.send(SessionMsg::PromptStreamAudited {
-            text: "run".into(), structured_output_tag: None, events: events_tx, ack: ack_rx,
-        }).unwrap();
+        session
+            .addr
+            .send(SessionMsg::PromptStreamAudited {
+                text: "run".into(),
+                structured_output_tag: None,
+                events: events_tx,
+                ack: ack_rx,
+            })
+            .unwrap();
         loop {
             let ev = events_rx.recv().unwrap();
             if matches!(ev, StreamEvent::TurnComplete { .. }) {
@@ -1154,7 +1165,9 @@ mod tests {
             ack_tx.send(()).unwrap();
         }
         for ev in events_rx.iter() {
-            if matches!(ev, StreamEvent::Done(_)) { break; }
+            if matches!(ev, StreamEvent::Done(_)) {
+                break;
+            }
             ack_tx.send(()).unwrap();
         }
         assert_eq!(sandbox.recorded.lock().unwrap().len(), 1);
@@ -1177,9 +1190,15 @@ mod tests {
         );
         let (events_tx, events_rx) = sync_channel(0);
         let (ack_tx, ack_rx) = channel();
-        session.addr.send(SessionMsg::PromptStreamAudited {
-            text: "run".into(), structured_output_tag: None, events: events_tx, ack: ack_rx,
-        }).unwrap();
+        session
+            .addr
+            .send(SessionMsg::PromptStreamAudited {
+                text: "run".into(),
+                structured_output_tag: None,
+                events: events_tx,
+                ack: ack_rx,
+            })
+            .unwrap();
         loop {
             let ev = events_rx.recv().unwrap();
             if matches!(ev, StreamEvent::TurnComplete { .. }) {
@@ -1208,7 +1227,9 @@ mod tests {
                     Ok(buf.len())
                 }
             }
-            fn flush(&mut self) -> io::Result<()> { Ok(()) }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
         }
 
         let (instance, session, _model, sandbox) = rig(
@@ -1222,9 +1243,15 @@ mod tests {
         );
         let (events_tx, events_rx) = sync_channel(0);
         let (ack_tx, ack_rx) = channel();
-        session.addr.send(SessionMsg::PromptStreamAudited {
-            text: "run".into(), structured_output_tag: None, events: events_tx, ack: ack_rx,
-        }).unwrap();
+        session
+            .addr
+            .send(SessionMsg::PromptStreamAudited {
+                text: "run".into(),
+                structured_output_tag: None,
+                events: events_tx,
+                ack: ack_rx,
+            })
+            .unwrap();
         let mut sink = FailAtTurn;
         loop {
             let ev = events_rx.recv().unwrap();

@@ -55,6 +55,9 @@ impl Default for ServerConfig {
     }
 }
 
+/// Prepared SSE response, executed only after required resources are reserved.
+pub type PreparedResponse<'a> = Box<dyn FnOnce(&mut EventSink) -> Result<(), HandlerError> + 'a>;
+
 pub trait AgentHandler: Send + Sync + 'static {
     /// Reserve required resources before the HTTP 200/SSE commitment. The
     /// default preserves simple handlers' existing behavior.
@@ -63,7 +66,7 @@ pub trait AgentHandler: Send + Sync + 'static {
         id: &str,
         request_id: &str,
         body: &[u8],
-    ) -> Result<Box<dyn FnOnce(&mut EventSink) -> Result<(), HandlerError> + 'a>, PrepareError> {
+    ) -> Result<PreparedResponse<'a>, PrepareError> {
         let id = id.to_owned();
         let request_id = request_id.to_owned();
         let body = body.to_vec();
@@ -661,7 +664,7 @@ mod tests {
             _id: &str,
             _request_id: &str,
             _body: &[u8],
-        ) -> Result<Box<dyn FnOnce(&mut EventSink) -> Result<(), HandlerError> + 'a>, PrepareError> {
+        ) -> Result<PreparedResponse<'a>, PrepareError> {
             Err(PrepareError::Service(HandlerError("required audit log unavailable".into())))
         }
 
@@ -683,7 +686,7 @@ mod tests {
             _id: &str,
             _request_id: &str,
             _body: &[u8],
-        ) -> Result<Box<dyn FnOnce(&mut EventSink) -> Result<(), HandlerError> + 'a>, PrepareError> {
+        ) -> Result<PreparedResponse<'a>, PrepareError> {
             Err(PrepareError::Client(HandlerError("invalid prompt".into())))
         }
 

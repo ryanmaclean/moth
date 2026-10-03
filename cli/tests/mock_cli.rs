@@ -295,7 +295,13 @@ fn requested_runlog_open_failure_prevents_model_execution() {
     let blocked = dir.join("not-a-directory");
     std::fs::write(&blocked, b"sentinel").unwrap();
     let (code, stdout, stderr) = run_agent(&[
-        "run", "--mock", "--runlog", blocked.to_str().unwrap(), "--run-id", "r1", "prompt",
+        "run",
+        "--mock",
+        "--runlog",
+        blocked.to_str().unwrap(),
+        "--run-id",
+        "r1",
+        "prompt",
     ]);
     assert_eq!(code, Some(1), "stdout={stdout:?} stderr={stderr:?}");
     assert!(stderr.contains("runlog: open"), "{stderr}");

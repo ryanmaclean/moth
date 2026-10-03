@@ -55,8 +55,8 @@
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::sync::mpsc::Receiver;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -106,7 +106,9 @@ impl std::fmt::Display for RunLogError {
         match self {
             RunLogError::Io(e) => write!(f, "io: {e}"),
             RunLogError::BusyRun => write!(f, "run file already has a writer"),
-            RunLogError::ReservationExhausted => write!(f, "could not reserve a unique HTTP run file"),
+            RunLogError::ReservationExhausted => {
+                write!(f, "could not reserve a unique HTTP run file")
+            }
             RunLogError::InvalidRunId(why) => write!(f, "invalid run id: {why}"),
         }
     }
@@ -183,7 +185,12 @@ impl RunLog {
         let request_id = request_id.into();
         let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
         let candidates = (0..32).map(|_| {
-            format!("http-{:x}-{:x}-{:x}", std::process::id(), stamp, N.fetch_add(1, Ordering::Relaxed))
+            format!(
+                "http-{:x}-{:x}-{:x}",
+                std::process::id(),
+                stamp,
+                N.fetch_add(1, Ordering::Relaxed)
+            )
         });
         Self::create_http_with_candidates(dir.as_ref(), request_id, candidates)
     }
@@ -218,7 +225,12 @@ impl RunLog {
         Self::open_locked_file(file, dir, run_id, request_id)
     }
 
-    fn open_locked_file(mut file: File, dir: &Path, run_id: String, request_id: Option<String>) -> Result<Self, RunLogError> {
+    fn open_locked_file(
+        mut file: File,
+        dir: &Path,
+        run_id: String,
+        request_id: Option<String>,
+    ) -> Result<Self, RunLogError> {
         match file.try_lock() {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) => return Err(RunLogError::BusyRun),
@@ -226,8 +238,12 @@ impl RunLog {
         }
         let next_seq = recover_tail(&mut file)?;
         let started_at = SystemTime::now();
-        let log =
-            Self { inner: Mutex::new(Inner { file, next_seq, failed: false }), run_id, request_id, started_at };
+        let log = Self {
+            inner: Mutex::new(Inner { file, next_seq, failed: false }),
+            run_id,
+            request_id,
+            started_at,
+        };
         let started_ms = unix_ms(started_at);
         let mut payload = String::new();
         payload.push_str(r#"{"started_at_unix_ms":"#);
@@ -262,7 +278,10 @@ impl RunLog {
     pub fn sync(&self) -> Result<(), RunLogError> {
         let mut g = self.inner.lock().expect("runlog mutex poisoned");
         if g.failed {
-            return Err(io::Error::other("runlog writer failed; reopen under the OS lock to recover").into());
+            return Err(io::Error::other(
+                "runlog writer failed; reopen under the OS lock to recover",
+            )
+            .into());
         }
         if let Err(e) = g.file.sync_all() {
             g.failed = true;
@@ -338,10 +357,14 @@ impl RunLog {
     pub fn write_record_seq(&self, kind: &str, payload: &str) -> Result<u64, RunLogError> {
         let mut g = self.inner.lock().expect("runlog mutex poisoned");
         if g.failed {
-            return Err(io::Error::other("runlog writer failed; reopen under the OS lock to recover").into());
+            return Err(io::Error::other(
+                "runlog writer failed; reopen under the OS lock to recover",
+            )
+            .into());
         }
         let seq = g.next_seq;
-        let next = seq.checked_add(1).ok_or_else(|| io::Error::other("runlog sequence exhausted"))?;
+        let next =
+            seq.checked_add(1).ok_or_else(|| io::Error::other("runlog sequence exhausted"))?;
         let ts = unix_ms(SystemTime::now());
         let mut line = String::with_capacity(payload.len() + 80);
         line.push_str(r#"{"seq":"#);
@@ -374,7 +397,13 @@ impl RunLog {
     pub fn record_event(&self, ev: &StreamEvent) -> Result<u64, RunLogError> {
         let (kind, payload) = render_event(ev);
         let seq = self.write_record_seq(kind, &payload)?;
-        if matches!(ev, StreamEvent::TurnComplete { .. } | StreamEvent::Done(_) | StreamEvent::Cancelled | StreamEvent::Error(_)) {
+        if matches!(
+            ev,
+            StreamEvent::TurnComplete { .. }
+                | StreamEvent::Done(_)
+                | StreamEvent::Cancelled
+                | StreamEvent::Error(_)
+        ) {
             self.sync()?;
         }
         Ok(seq)
@@ -452,10 +481,15 @@ fn recover_tail(file: &mut File) -> Result<u64, RunLogError> {
         if rec.starts_with(b"{") && rec.last() != Some(&b'}') {
             continue;
         }
-        let parsed = anthropic::json::parse(rec)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "malformed committed runlog record"))?;
+        let parsed = anthropic::json::parse(rec).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "malformed committed runlog record")
+        })?;
         let anthropic::json::Json::Obj(fields) = &parsed else {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "runlog record is not a JSON object").into());
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "runlog record is not a JSON object",
+            )
+            .into());
         };
         let seq_fields = fields.iter().filter(|(key, _)| key == "seq").count();
         if seq_fields > 1 {
@@ -463,18 +497,30 @@ fn recover_tail(file: &mut File) -> Result<u64, RunLogError> {
         }
         if seq_fields == 1 {
             let Some(seq) = parse_seq_prefix(rec) else {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "noncanonical seq field").into());
+                return Err(
+                    io::Error::new(io::ErrorKind::InvalidData, "noncanonical seq field").into()
+                );
             };
-            if !matches!(parsed.get("seq"), Some(anthropic::json::Json::Num(n)) if n == &seq.to_string()) {
+            if !matches!(parsed.get("seq"), Some(anthropic::json::Json::Num(n)) if n == &seq.to_string())
+            {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "mistyped seq field").into());
             }
             if seq != next {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, format!("runlog sequence gap: expected {next}, found {seq}")).into());
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("runlog sequence gap: expected {next}, found {seq}"),
+                )
+                .into());
             }
-            next = next.checked_add(1).ok_or_else(|| io::Error::other("runlog sequence exhausted"))?;
+            next =
+                next.checked_add(1).ok_or_else(|| io::Error::other("runlog sequence exhausted"))?;
             sequenced = true;
         } else if sequenced {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "unsequenced record after sequenced runlog data").into());
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsequenced record after sequenced runlog data",
+            )
+            .into());
         }
     }
     Ok(next)
@@ -666,11 +712,15 @@ mod tests {
         let err = sync_directory_chain_with(&nested, |ancestor| {
             visited.push(ancestor.to_path_buf());
             if ancestor == parent.as_path() {
-                Err(io::Error::new(io::ErrorKind::PermissionDenied, "simulated directory fsync denial"))
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "simulated directory fsync denial",
+                ))
             } else {
                 Ok(())
             }
-        }).unwrap_err();
+        })
+        .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
         assert_eq!(visited, vec![leaf, parent], "sync must fail leaf-to-root");
         cleanup(&dir);
@@ -1102,8 +1152,12 @@ mod tests {
         if std::env::var_os("MOTH_RUNLOG_LOCK_TEST_TORN").is_some() {
             // Simulate a process dying after a partial append, while it owns
             // the cooperative lock. Recovery must discard this suffix.
-            OpenOptions::new().append(true).open(dir.join("r1.jsonl")).unwrap()
-                .write_all(br#"{"seq":99,"kind":"torn","data":{}}"#).unwrap();
+            OpenOptions::new()
+                .append(true)
+                .open(dir.join("r1.jsonl"))
+                .unwrap()
+                .write_all(br#"{"seq":99,"kind":"torn","data":{}}"#)
+                .unwrap();
         }
         std::fs::write(dir.join("child-ready"), b"ready").unwrap();
         let mut release = [0u8; 1];
@@ -1116,10 +1170,16 @@ mod tests {
         for torn in [false, true] {
             let dir = scratch();
             let mut command = Command::new(std::env::current_exe().unwrap());
-            command.arg("--exact").arg("tests::child_lock_helper")
+            command
+                .arg("--exact")
+                .arg("tests::child_lock_helper")
                 .env("MOTH_RUNLOG_LOCK_TEST_DIR", &dir)
-                .stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped());
-            if torn { command.env("MOTH_RUNLOG_LOCK_TEST_TORN", "1"); }
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped());
+            if torn {
+                command.env("MOTH_RUNLOG_LOCK_TEST_TORN", "1");
+            }
             let mut child = command.spawn().unwrap();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             while !dir.join("child-ready").exists() {
@@ -1168,14 +1228,17 @@ mod tests {
             &dir,
             "trace".into(),
             ["http-collision".into(), "http-next".into()],
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(log.run_id(), "http-next");
         assert_eq!(std::fs::read(&old).unwrap(), b"existing\n");
         let err = RunLog::create_http_with_candidates(
             &dir,
             "trace".into(),
             ["http-collision".into(), "http-next".into()],
-        ).err().unwrap();
+        )
+        .err()
+        .unwrap();
         assert!(matches!(err, RunLogError::ReservationExhausted));
         assert_eq!(std::fs::read(&old).unwrap(), b"existing\n");
         drop(log);
@@ -1215,8 +1278,12 @@ mod tests {
         let log = RunLog::open(&dir, "r1").unwrap();
         drop(log);
         let path = dir.join("r1.jsonl");
-        OpenOptions::new().append(true).open(&path).unwrap()
-            .write_all(br#"{"seq":99,"ts_ms":1,"run_id":"r1","kind":"x","data":{}}"#).unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(br#"{"seq":99,"ts_ms":1,"run_id":"r1","kind":"x","data":{}}"#)
+            .unwrap();
         let retry = RunLog::open(&dir, "r1").unwrap();
         assert_eq!(retry.next_seq(), 2);
         assert_eq!(seqs(&dir, "r1"), vec![Some(0), Some(1)]);
@@ -1230,9 +1297,15 @@ mod tests {
         let log = RunLog::open(&dir, "r1").unwrap();
         drop(log);
         let path = dir.join("r1.jsonl");
-        OpenOptions::new().append(true).open(&path).unwrap()
-            .write_all(br#"{"seq":99,"ts_ms":1,"run_id":"r1","kind":"x","data":{}}
-"#).unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(
+                br#"{"seq":99,"ts_ms":1,"run_id":"r1","kind":"x","data":{}}
+"#,
+            )
+            .unwrap();
         let before = std::fs::read(&path).unwrap();
         assert!(matches!(RunLog::open(&dir, "r1"), Err(RunLogError::Io(_))));
         assert_eq!(std::fs::read(&path).unwrap(), before);
@@ -1245,8 +1318,12 @@ mod tests {
         let log = RunLog::open(&dir, "r1").unwrap();
         drop(log);
         let path = dir.join("r1.jsonl");
-        OpenOptions::new().append(true).open(&path).unwrap()
-            .write_all(b"{\"seq\":99,\"kind\":\"torn\"\n").unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"seq\":99,\"kind\":\"torn\"\n")
+            .unwrap();
         let retry = RunLog::open(&dir, "r1").unwrap();
         assert_eq!(retry.next_seq(), 2);
         let lines = read_lines(&dir, "r1");
@@ -1257,10 +1334,7 @@ mod tests {
 
     #[test]
     fn present_but_misplaced_or_mistyped_seq_is_not_legacy() {
-        for bad in [
-            br#"{"ts_ms":1,"seq":7}"#.as_slice(),
-            br#"{"seq":"7","ts_ms":1}"#.as_slice(),
-        ] {
+        for bad in [br#"{"ts_ms":1,"seq":7}"#.as_slice(), br#"{"seq":"7","ts_ms":1}"#.as_slice()] {
             let dir = scratch();
             let path = dir.join("old.jsonl");
             let mut bytes = bad.to_vec();

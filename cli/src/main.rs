@@ -634,8 +634,12 @@ fn resolve_run_id(
 
 /// An explicitly requested audit log must open before model/tool work starts.
 fn open_runlog(dir: Option<&PathBuf>, run_id: &str) -> Result<Option<Arc<runlog::RunLog>>, String> {
-    dir.map(|dir| runlog::RunLog::open(dir, run_id).map(Arc::new)
-        .map_err(|e| format!("runlog: open {dir:?} failed: {e}"))).transpose()
+    dir.map(|dir| {
+        runlog::RunLog::open(dir, run_id)
+            .map(Arc::new)
+            .map_err(|e| format!("runlog: open {dir:?} failed: {e}"))
+    })
+    .transpose()
 }
 
 fn anchor_runlog_dir(caller_cwd: &Path, requested: &Path) -> PathBuf {
@@ -888,7 +892,10 @@ fn run_cmd(mut args: Vec<String>) -> ExitCode {
     let (audit_ack_tx, audit_ack_rx) = std::sync::mpsc::channel::<()>();
     let stream_msg = if runlog_handle.is_some() {
         SessionMsg::PromptStreamAudited {
-            text: prompt, structured_output_tag: None, events: tx, ack: audit_ack_rx,
+            text: prompt,
+            structured_output_tag: None,
+            events: tx,
+            ack: audit_ack_rx,
         }
     } else {
         SessionMsg::PromptStream { text: prompt, structured_output_tag: None, events: tx }
@@ -1176,8 +1183,7 @@ impl ChatHandler {
         runlog: Option<Arc<runlog::RunLog>>,
         sink: &mut EventSink,
     ) -> Result<(), HandlerError> {
-        sink.emit(Some("start"), id)
-            .map_err(|e| HandlerError(format!("SSE start: {e}")))?;
+        sink.emit(Some("start"), id).map_err(|e| HandlerError(format!("SSE start: {e}")))?;
 
         let sandbox: Box<dyn Sandbox> = Box::new(AuditedShell::new(vshell::VShell::new()));
         let inst = spawn(Instance::new(id, sandbox));
@@ -1197,14 +1203,15 @@ impl ChatHandler {
         let (audit_ack_tx, audit_ack_rx) = std::sync::mpsc::channel::<()>();
         let stream_msg = if runlog.is_some() {
             SessionMsg::PromptStreamAudited {
-                text: prompt, structured_output_tag: None, events: tx, ack: audit_ack_rx,
+                text: prompt,
+                structured_output_tag: None,
+                events: tx,
+                ack: audit_ack_rx,
             }
         } else {
             SessionMsg::PromptStream { text: prompt, structured_output_tag: None, events: tx }
         };
-        sess.addr
-            .send(stream_msg)
-            .map_err(|e| HandlerError(format!("session send: {e}")))?;
+        sess.addr.send(stream_msg).map_err(|e| HandlerError(format!("session send: {e}")))?;
 
         let mut final_err: Option<HandlerError> = None;
         for ev in rx.iter() {
@@ -1269,13 +1276,17 @@ impl AgentHandler for ChatHandler {
         id: &str,
         request_id: &str,
         body: &[u8],
-    ) -> Result<Box<dyn FnOnce(&mut EventSink) -> Result<(), HandlerError> + 'a>, PrepareError> {
+    ) -> Result<server::PreparedResponse<'a>, PrepareError> {
         let prompt = parse_prompt(body).map_err(|e| PrepareError::Client(HandlerError(e)))?;
-        let runlog = self.runlog_dir.as_ref().map(|dir| {
-            runlog::RunLog::create_http(dir, request_id)
-                .map(Arc::new)
-                .map_err(|e| PrepareError::Service(HandlerError(format!("runlog: {e}"))))
-        }).transpose()?;
+        let runlog = self
+            .runlog_dir
+            .as_ref()
+            .map(|dir| {
+                runlog::RunLog::create_http(dir, request_id)
+                    .map(Arc::new)
+                    .map_err(|e| PrepareError::Service(HandlerError(format!("runlog: {e}"))))
+            })
+            .transpose()?;
         let id = id.to_owned();
         Ok(Box::new(move |sink| self.handle_prepared(&id, prompt, runlog, sink)))
     }
@@ -1287,8 +1298,7 @@ impl AgentHandler for ChatHandler {
         body: &[u8],
         sink: &mut EventSink,
     ) -> Result<(), HandlerError> {
-        self.prepare(id, request_id, body)
-            .map_err(|e| HandlerError(e.to_string()))?(sink)
+        self.prepare(id, request_id, body).map_err(|e| HandlerError(e.to_string()))?(sink)
     }
 }
 
@@ -1361,19 +1371,31 @@ fn mcp_serve_cmd(mut args: Vec<String>) -> ExitCode {
 
 #[cfg(test)]
 mod run_id_tests {
-    use super::{anchor_runlog_dir, build_mock_canned, resolve_run_id, write_newline, ChatHandler, Model, MockModel};
+    use super::{
+        ChatHandler, MockModel, Model, anchor_runlog_dir, build_mock_canned, resolve_run_id,
+        write_newline,
+    };
+    use harness::{ModelEvent, Tool, ToolCtx, ToolError};
     use server::AgentHandler;
     use server::EventSink;
     use std::io::{self, Write};
     use std::path::{Path, PathBuf};
-    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
-    use harness::{ModelEvent, Tool, ToolCtx, ToolError};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     struct CountingTool(Arc<AtomicUsize>);
     impl Tool for CountingTool {
-        fn name(&self) -> &str { "probe" }
-        fn description(&self) -> &str { "Count tool dispatches" }
-        fn input_schema(&self) -> &str { r#"{"type":"object"}"# }
+        fn name(&self) -> &str {
+            "probe"
+        }
+        fn description(&self) -> &str {
+            "Count tool dispatches"
+        }
+        fn input_schema(&self) -> &str {
+            r#"{"type":"object"}"#
+        }
         fn call(&self, _input: &str, _ctx: &ToolCtx) -> Result<String, ToolError> {
             self.0.fetch_add(1, Ordering::SeqCst);
             Ok("called".into())
@@ -1388,8 +1410,10 @@ mod run_id_tests {
                 ModelEvent::BlockStop,
                 ModelEvent::Stop { reason: Some("tool_use".into()) },
             ],
-            vec![ModelEvent::TextDelta("done".into()),
-                ModelEvent::Stop { reason: Some("end_turn".into()) }],
+            vec![
+                ModelEvent::TextDelta("done".into()),
+                ModelEvent::Stop { reason: Some("end_turn".into()) },
+            ],
         ]));
         ChatHandler {
             model,
@@ -1447,7 +1471,9 @@ mod run_id_tests {
             fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
                 Err(io::Error::new(io::ErrorKind::BrokenPipe, "stdout closed"))
             }
-            fn flush(&mut self) -> io::Result<()> { Ok(()) }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
         }
         struct BrokenFlush(Vec<u8>);
         impl Write for BrokenFlush {
@@ -1468,7 +1494,9 @@ mod run_id_tests {
     #[test]
     fn two_http_preflights_with_same_client_id_reserve_separate_files() {
         let dir = std::env::temp_dir().join(format!(
-            "moth-http-runlog-{}-{}", std::process::id(), super::unix_ms_now(),
+            "moth-http-runlog-{}-{}",
+            std::process::id(),
+            super::unix_ms_now(),
         ));
         let model: Arc<dyn Model> = Arc::new(build_mock_canned("test"));
         let handler = ChatHandler {
@@ -1480,8 +1508,7 @@ mod run_id_tests {
         };
         let a = handler.prepare("agent", "repeated-id", b"one").unwrap();
         let b = handler.prepare("agent", "repeated-id", b"two").unwrap();
-        let files: Vec<_> = std::fs::read_dir(&dir).unwrap()
-            .map(|e| e.unwrap().path()).collect();
+        let files: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).collect();
         assert_eq!(files.len(), 2);
         assert_ne!(files[0], files[1]);
         for path in &files {
@@ -1500,7 +1527,9 @@ mod run_id_tests {
             fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
                 Err(io::Error::new(io::ErrorKind::BrokenPipe, "client disconnected"))
             }
-            fn flush(&mut self) -> io::Result<()> { Ok(()) }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
         }
         let model = Arc::new(MockModel::single(vec![]));
         let handler = ChatHandler {
@@ -1526,10 +1555,14 @@ mod run_id_tests {
                 }
                 Ok(buf.len())
             }
-            fn flush(&mut self) -> io::Result<()> { Ok(()) }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
         }
         let dir = std::env::temp_dir().join(format!(
-            "moth-turn-sink-{}-{}", std::process::id(), super::unix_ms_now(),
+            "moth-turn-sink-{}-{}",
+            std::process::id(),
+            super::unix_ms_now(),
         ));
         let log = Arc::new(runlog::RunLog::create_http(&dir, "client-id").unwrap());
         let path = dir.join(format!("{}.jsonl", log.run_id()));
@@ -1537,7 +1570,8 @@ mod run_id_tests {
         let handler = tool_turn_handler(counter.clone());
         let mut writer = BrokenAtTurnComplete;
         let mut sink = EventSink::new(&mut writer);
-        let err = handler.handle_prepared("agent", "prompt".into(), Some(log.clone()), &mut sink)
+        let err = handler
+            .handle_prepared("agent", "prompt".into(), Some(log.clone()), &mut sink)
             .unwrap_err();
         assert!(err.0.contains("SSE sink"), "{err}");
         assert_eq!(counter.load(Ordering::SeqCst), 0, "tool ran after local SSE failure");
@@ -1559,22 +1593,35 @@ mod run_id_tests {
                 .args(["--exact", "run_id_tests::real_handler_audit_failure_at_turn_boundary_never_dispatches_tool", "--nocapture"])
                 .env(CHILD, "1")
                 .output().unwrap();
-            assert!(output.status.success(), "child failed: {} {}",
-                String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
-            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"),
-                "exact child test did not run: {}", String::from_utf8_lossy(&output.stdout));
+            assert!(
+                output.status.success(),
+                "child failed: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "exact child test did not run: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
             return;
         }
 
-        struct LimitOnBlockStop { frame: Vec<u8>, path: PathBuf }
+        struct LimitOnBlockStop {
+            frame: Vec<u8>,
+            path: PathBuf,
+        }
         impl Write for LimitOnBlockStop {
             fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
                 self.frame.extend_from_slice(buf);
                 Ok(buf.len())
             }
             fn flush(&mut self) -> io::Result<()> {
-                if self.frame.windows(b"event: block_stop\n".len())
-                    .any(|w| w == b"event: block_stop\n") {
+                if self
+                    .frame
+                    .windows(b"event: block_stop\n".len())
+                    .any(|w| w == b"event: block_stop\n")
+                {
                     let len = std::fs::metadata(&self.path)?.len();
                     let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
                     unsafe {
@@ -1592,9 +1639,13 @@ mod run_id_tests {
             }
         }
 
-        unsafe { libc::signal(libc::SIGXFSZ, libc::SIG_IGN); }
+        unsafe {
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+        }
         let dir = std::env::temp_dir().join(format!(
-            "moth-turn-audit-{}-{}", std::process::id(), super::unix_ms_now(),
+            "moth-turn-audit-{}-{}",
+            std::process::id(),
+            super::unix_ms_now(),
         ));
         let log = Arc::new(runlog::RunLog::create_http(&dir, "client-id").unwrap());
         let path = dir.join(format!("{}.jsonl", log.run_id()));
@@ -1602,7 +1653,8 @@ mod run_id_tests {
         let handler = tool_turn_handler(counter.clone());
         let mut writer = LimitOnBlockStop { frame: Vec::new(), path: path.clone() };
         let mut sink = EventSink::new(&mut writer);
-        let err = handler.handle_prepared("agent", "prompt".into(), Some(log.clone()), &mut sink)
+        let err = handler
+            .handle_prepared("agent", "prompt".into(), Some(log.clone()), &mut sink)
             .unwrap_err();
         assert!(err.0.contains("runlog"), "{err}");
         assert_eq!(counter.load(Ordering::SeqCst), 0, "tool ran after audit write failed");
@@ -1612,5 +1664,4 @@ mod run_id_tests {
         drop(log);
         std::fs::remove_dir_all(dir).unwrap();
     }
-
 }
