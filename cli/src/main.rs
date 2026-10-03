@@ -176,8 +176,8 @@ fn print_run_help() {
         AGENTS_ROOT                  dir holding .agents/skills/<name>.md (default: cwd)\n  \
         SESSIONS_DIR                 same as --sessions\n  \
         RUNLOG_DIR                   same as --runlog\n  \
-        AGENT_RUN_ID                 same as --run-id\n  \
-        BOP_RUN_ID                   run id exported by a BOP dispatcher (below AGENT_RUN_ID)\n  \
+        AGENT_RUN_ID                 run id when BOP_RUN_ID is unset\n  \
+        BOP_RUN_ID                   BOP dispatcher run id (above AGENT_RUN_ID)\n  \
         DOGSTATSD_ADDR               DogStatsD sink HOST:PORT (lower priority than --metrics)";
     eprintln!("{m}");
 }
@@ -608,7 +608,7 @@ impl Tool for TaskTool {
 
 /// Resolve the run identity for `agent run`.
 ///
-/// Precedence: `--run-id` > `AGENT_RUN_ID` > `BOP_RUN_ID` > minted
+/// Precedence: `--run-id` > `BOP_RUN_ID` > `AGENT_RUN_ID` > minted
 /// `run-<unix-ms>`. Empty env values are treated as unset. An explicit id
 /// that fails [`runlog::validate_run_id`] is an error — never silently
 /// replaced, since the caller owns the identity.
@@ -621,10 +621,10 @@ fn resolve_run_id(
     let nonempty = |v: Option<String>| v.filter(|s| !s.is_empty());
     let (source, id) = if let Some(id) = flag {
         ("--run-id", id)
-    } else if let Some(id) = nonempty(agent_env) {
-        ("AGENT_RUN_ID", id)
     } else if let Some(id) = nonempty(bop_env) {
         ("BOP_RUN_ID", id)
+    } else if let Some(id) = nonempty(agent_env) {
+        ("AGENT_RUN_ID", id)
     } else {
         return Ok(format!("run-{now_ms}"));
     };
@@ -1431,10 +1431,10 @@ mod run_id_tests {
     }
 
     #[test]
-    fn precedence_flag_then_agent_env_then_bop_env_then_minted() {
+    fn precedence_flag_then_bop_env_then_agent_env_then_minted() {
         assert_eq!(resolve_run_id(some("f"), some("a"), some("b"), 7).unwrap(), "f");
-        assert_eq!(resolve_run_id(None, some("a"), some("b"), 7).unwrap(), "a");
-        assert_eq!(resolve_run_id(None, None, some("b"), 7).unwrap(), "b");
+        assert_eq!(resolve_run_id(None, some("a"), some("b"), 7).unwrap(), "b");
+        assert_eq!(resolve_run_id(None, some("a"), None, 7).unwrap(), "a");
         assert_eq!(resolve_run_id(None, None, None, 7).unwrap(), "run-7");
     }
 
@@ -1449,6 +1449,8 @@ mod run_id_tests {
     #[test]
     fn invalid_explicit_id_names_its_source() {
         let e = resolve_run_id(None, None, some("../x"), 7).unwrap_err();
+        assert!(e.starts_with("BOP_RUN_ID:"), "{e}");
+        let e = resolve_run_id(None, some("a"), some("../x"), 7).unwrap_err();
         assert!(e.starts_with("BOP_RUN_ID:"), "{e}");
         let e = resolve_run_id(None, some("a b"), None, 7).unwrap_err();
         assert!(e.starts_with("AGENT_RUN_ID:"), "{e}");

@@ -219,8 +219,8 @@ fn run_id_flag_names_runlog_and_seq_is_contiguous() {
     cleanup(&dir);
 }
 
-/// With no flag, a BOP dispatcher's `BOP_RUN_ID` is honoured, and
-/// `AGENT_RUN_ID` takes precedence over it.
+/// With no flag, a BOP dispatcher's `BOP_RUN_ID` takes precedence
+/// over an inherited `AGENT_RUN_ID`.
 #[test]
 fn run_id_env_precedence() {
     let dir = tempdir("runid_env");
@@ -230,13 +230,23 @@ fn run_id_env_precedence() {
     assert_eq!(code, Some(0), "{e}");
     assert!(dir.join("bop-7.jsonl").exists(), "{:?}", ls(&dir));
 
+    let bop_run_id = "0123456789abcdef0123456789abcdef";
     let (code, _o, e) = run_agent_env(
         &["run", "--mock", "--runlog", d, "x"],
-        &[("BOP_RUN_ID", "bop-8"), ("AGENT_RUN_ID", "agent-8")],
+        &[("BOP_RUN_ID", bop_run_id), ("AGENT_RUN_ID", "agent-8")],
     );
     assert_eq!(code, Some(0), "{e}");
-    assert!(dir.join("agent-8.jsonl").exists(), "{:?}", ls(&dir));
-    assert!(!dir.join("bop-8.jsonl").exists());
+    assert!(dir.join(format!("{bop_run_id}.jsonl")).exists(), "{:?}", ls(&dir));
+    assert!(!dir.join("agent-8.jsonl").exists());
+    let lines = runlog_lines(&dir, bop_run_id);
+    assert!(lines.len() >= 3, "expected start..done, got {lines:?}");
+    for (i, line) in lines.iter().enumerate() {
+        assert_eq!(seq_of(line), Some(i as u64), "line {i}: {line}");
+        assert!(line.contains(&format!(r#""run_id":"{bop_run_id}""#)), "line {i}: {line}");
+    }
+    assert!(lines[0].contains(r#""kind":"start""#), "{lines:?}");
+    assert!(lines.last().unwrap().contains(r#""kind":"done""#), "{lines:?}");
+    assert_eq!(ls(&dir).len(), 2, "no minted run file: {:?}", ls(&dir));
     cleanup(&dir);
 }
 
