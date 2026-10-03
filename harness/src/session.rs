@@ -15,7 +15,7 @@
 //!      loop back to (2). Otherwise return.
 
 use std::sync::Arc;
-use std::sync::mpsc::SyncSender;
+use std::sync::mpsc::{Receiver, SyncSender};
 
 use actor::{Actor, ActorRef};
 use wire::find_tag;
@@ -190,6 +190,16 @@ pub enum SessionMsg {
         /// almost always wrong.
         events: SyncSender<StreamEvent>,
     },
+    /// Audit-required stream. The producer waits for one acknowledgement
+    /// after every event before model/tool progression. Dropping `ack`
+    /// cancels at this boundary; callers must acknowledge only after their
+    /// audit write has succeeded.
+    PromptStreamAudited {
+        text: String,
+        structured_output_tag: Option<String>,
+        events: SyncSender<StreamEvent>,
+        ack: Receiver<()>,
+    },
     Shell {
         cmd: String,
         reply: SyncSender<Result<ShellResult, SandboxError>>,
@@ -222,7 +232,7 @@ impl Actor for Session {
                 let _ = reply.send(self.run_prompt(text, structured_output_tag));
             }
             SessionMsg::PromptStream { text, structured_output_tag, events } => {
-                let result = self.run_prompt_inner(text, structured_output_tag, Some(&events));
+                let result = self.run_prompt_inner(text, structured_output_tag, Some(&events), None);
                 // Best-effort terminal event. Cancellation already emitted
                 // its own terminal so we skip emitting Done after Cancelled.
                 if result.is_err() {
@@ -232,6 +242,17 @@ impl Actor for Session {
                 }
                 // result == Ok(None) means the receiver dropped — Cancelled
                 // was already sent (or attempted). Nothing to do.
+            }
+            SessionMsg::PromptStreamAudited { text, structured_output_tag, events, ack } => {
+                let result = self.run_prompt_inner(text, structured_output_tag, Some(&events), Some(&ack));
+                // Terminal events have no following model/tool work. The
+                // consumer still records and syncs them before reporting
+                // request success, but no further acknowledgement is needed.
+                if result.is_err() {
+                    let _ = events.send(StreamEvent::Error(result.err().unwrap()));
+                } else if let Ok(Some(pr)) = result {
+                    let _ = events.send(StreamEvent::Done(pr));
+                }
             }
             SessionMsg::Shell { cmd, reply } => {
                 if self
@@ -253,7 +274,7 @@ impl Session {
         text: String,
         structured_output_tag: Option<String>,
     ) -> Result<PromptResult, SessionError> {
-        match self.run_prompt_inner(text, structured_output_tag, None)? {
+        match self.run_prompt_inner(text, structured_output_tag, None, None)? {
             Some(pr) => Ok(pr),
             // events is None → cancellation impossible → always Some
             None => unreachable!("non-streaming run can't be cancelled"),
@@ -270,6 +291,7 @@ impl Session {
         text: String,
         structured_output_tag: Option<String>,
         events: Option<&SyncSender<StreamEvent>>,
+        audit_ack: Option<&Receiver<()>>,
     ) -> Result<Option<PromptResult>, SessionError> {
         self.history.push(ChatMessage::user(text));
 
@@ -285,11 +307,12 @@ impl Session {
         metrics.count("agent.prompt.started", 1, &[]);
         let outcome = PromptOutcomeGuard::new(&metrics);
 
-        // Closure: emit + detect cancellation. Returns false if the receiver
-        // dropped, true to keep going. No-op if there's no receiver.
+        // Audit callers acknowledge only after the event was recorded. This
+        // serializes the producer with the audit sink before any tool call;
+        // ordinary streams retain their existing asynchronous behavior.
         let emit = |evs: Option<&SyncSender<StreamEvent>>, ev: StreamEvent| -> bool {
             match evs {
-                Some(tx) => tx.send(ev).is_ok(),
+                Some(tx) => tx.send(ev).is_ok() && audit_ack.is_none_or(|ack| ack.recv().is_ok()),
                 None => true,
             }
         };
@@ -1098,6 +1121,127 @@ mod tests {
         assert_eq!(sandbox.recorded.lock().unwrap().len(), 1);
 
         session.join().unwrap();
+        instance.join().unwrap();
+    }
+
+    #[test]
+    fn audited_stream_waits_for_commit_ack_before_tool_dispatch() {
+        use std::sync::mpsc::{channel, sync_channel};
+        let (instance, session, _model, sandbox) = rig(
+            vec![
+                vec![
+                    ModelEvent::ToolUseStart { id: "toolu_1".into(), name: "bash".into() },
+                    ModelEvent::ToolUseInputDelta(r#"{"command":"echo hi"}"#.into()),
+                    ModelEvent::BlockStop,
+                    ModelEvent::Stop { reason: Some("tool_use".into()) },
+                ],
+                vec![ModelEvent::TextDelta("done".into()), ModelEvent::Stop { reason: Some("end_turn".into()) }],
+            ],
+            vec![ShellResult { exit_code: 0, stdout: b"hi\n".to_vec(), stderr: Vec::new() }],
+        );
+        let (events_tx, events_rx) = sync_channel(0);
+        let (ack_tx, ack_rx) = channel();
+        session.addr.send(SessionMsg::PromptStreamAudited {
+            text: "run".into(), structured_output_tag: None, events: events_tx, ack: ack_rx,
+        }).unwrap();
+        loop {
+            let ev = events_rx.recv().unwrap();
+            if matches!(ev, StreamEvent::TurnComplete { .. }) {
+                assert!(sandbox.recorded.lock().unwrap().is_empty(), "tool ran before audit ack");
+                ack_tx.send(()).unwrap();
+                break;
+            }
+            ack_tx.send(()).unwrap();
+        }
+        for ev in events_rx.iter() {
+            if matches!(ev, StreamEvent::Done(_)) { break; }
+            ack_tx.send(()).unwrap();
+        }
+        assert_eq!(sandbox.recorded.lock().unwrap().len(), 1);
+        drop(ack_tx);
+        session.join().unwrap();
+        instance.join().unwrap();
+    }
+
+    #[test]
+    fn audited_stream_failed_ack_cancels_before_tool_dispatch() {
+        use std::sync::mpsc::{channel, sync_channel};
+        let (instance, session, _model, sandbox) = rig(
+            vec![vec![
+                ModelEvent::ToolUseStart { id: "toolu_1".into(), name: "bash".into() },
+                ModelEvent::ToolUseInputDelta(r#"{"command":"echo hi"}"#.into()),
+                ModelEvent::BlockStop,
+                ModelEvent::Stop { reason: Some("tool_use".into()) },
+            ]],
+            vec![ShellResult { exit_code: 0, stdout: b"hi\n".to_vec(), stderr: Vec::new() }],
+        );
+        let (events_tx, events_rx) = sync_channel(0);
+        let (ack_tx, ack_rx) = channel();
+        session.addr.send(SessionMsg::PromptStreamAudited {
+            text: "run".into(), structured_output_tag: None, events: events_tx, ack: ack_rx,
+        }).unwrap();
+        loop {
+            let ev = events_rx.recv().unwrap();
+            if matches!(ev, StreamEvent::TurnComplete { .. }) {
+                drop(ack_tx);
+                break;
+            }
+            ack_tx.send(()).unwrap();
+        }
+        drop(events_rx);
+        session.join().unwrap();
+        assert!(sandbox.recorded.lock().unwrap().is_empty(), "tool ran after audit failure");
+        instance.join().unwrap();
+    }
+
+    #[test]
+    fn audited_stream_failing_sink_at_turn_boundary_prevents_sandbox_call() {
+        use std::io::{self, Write};
+        use std::sync::mpsc::{channel, sync_channel};
+
+        struct FailAtTurn;
+        impl Write for FailAtTurn {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                if buf == b"turn_complete" {
+                    Err(io::Error::new(io::ErrorKind::BrokenPipe, "client disconnected"))
+                } else {
+                    Ok(buf.len())
+                }
+            }
+            fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        }
+
+        let (instance, session, _model, sandbox) = rig(
+            vec![vec![
+                ModelEvent::ToolUseStart { id: "toolu_1".into(), name: "bash".into() },
+                ModelEvent::ToolUseInputDelta(r#"{"command":"echo hi"}"#.into()),
+                ModelEvent::BlockStop,
+                ModelEvent::Stop { reason: Some("tool_use".into()) },
+            ]],
+            vec![ShellResult { exit_code: 0, stdout: b"hi\n".to_vec(), stderr: Vec::new() }],
+        );
+        let (events_tx, events_rx) = sync_channel(0);
+        let (ack_tx, ack_rx) = channel();
+        session.addr.send(SessionMsg::PromptStreamAudited {
+            text: "run".into(), structured_output_tag: None, events: events_tx, ack: ack_rx,
+        }).unwrap();
+        let mut sink = FailAtTurn;
+        loop {
+            let ev = events_rx.recv().unwrap();
+            let frame = if matches!(ev, StreamEvent::TurnComplete { .. }) {
+                b"turn_complete".as_slice()
+            } else {
+                b"event".as_slice()
+            };
+            if sink.write_all(frame).is_err() {
+                drop(ack_tx); // a failed local write never authorizes the tool
+                break;
+            }
+            ack_tx.send(()).unwrap();
+        }
+        drop(events_rx);
+        session.join().unwrap();
+        assert!(sandbox.recorded.lock().unwrap().is_empty(), "sandbox ran after sink failure");
         instance.join().unwrap();
     }
 
