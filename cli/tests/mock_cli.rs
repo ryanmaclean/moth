@@ -37,6 +37,8 @@ fn agent_cmd() -> Command {
         .env_remove("MODEL")
         .env_remove("SESSIONS_DIR")
         .env_remove("RUNLOG_DIR")
+        .env_remove("AGENT_RUN_ID")
+        .env_remove("BOP_RUN_ID")
         .env_remove("AGENTS_ROOT")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -49,7 +51,38 @@ fn agent_cmd() -> Command {
 /// with whatever was captured so far, which is what we want — silent
 /// timeouts hide the real failure.
 fn run_agent(args: &[&str]) -> (Option<i32>, String, String) {
-    let mut child = agent_cmd().args(args).spawn().expect("spawn agent");
+    run_agent_env(args, &[])
+}
+
+/// [`run_agent`] with extra environment variables set on the child.
+fn run_agent_env(args: &[&str], envs: &[(&str, &str)]) -> (Option<i32>, String, String) {
+    run_agent_env_stdin(args, envs, None)
+}
+
+/// Send byte-exact stdin and close the pipe. Closing is part of the CLI
+/// contract: `--prompt-stdin` must wait for EOF before opening its runlog.
+fn run_agent_stdin(args: &[&str], input: &[u8]) -> (Option<i32>, String, String) {
+    run_agent_env_stdin(args, &[], Some(input))
+}
+
+fn run_agent_env_stdin(
+    args: &[&str],
+    envs: &[(&str, &str)],
+    input: Option<&[u8]>,
+) -> (Option<i32>, String, String) {
+    let mut cmd = agent_cmd();
+    if input.is_some() {
+        cmd.stdin(Stdio::piped());
+    }
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.args(args).spawn().expect("spawn agent");
+    let input_handle = input.map(|bytes| {
+        let mut pipe = child.stdin.take().expect("stdin piped");
+        let bytes = bytes.to_vec();
+        std::thread::spawn(move || pipe.write_all(&bytes))
+    });
     let mut stdout = child.stdout.take().expect("stdout piped");
     let mut stderr = child.stderr.take().expect("stderr piped");
 
@@ -73,6 +106,9 @@ fn run_agent(args: &[&str]) -> (Option<i32>, String, String) {
             None => {
                 if start.elapsed() > RUN_TIMEOUT {
                     let _ = child.kill();
+                    if let Some(handle) = input_handle {
+                        let _ = handle.join();
+                    }
                     let out = stdout_handle.join().unwrap_or_default();
                     let err = stderr_handle.join().unwrap_or_default();
                     panic!(
@@ -84,6 +120,12 @@ fn run_agent(args: &[&str]) -> (Option<i32>, String, String) {
             }
         }
     };
+    if let Some(handle) = input_handle {
+        let write_result = handle.join().expect("stdin writer panicked");
+        if status.success() {
+            write_result.expect("successful agent exited before consuming stdin");
+        }
+    }
     let stdout = stdout_handle.join().unwrap_or_default();
     let stderr = stderr_handle.join().unwrap_or_default();
     (status.code(), stdout, stderr)
@@ -104,6 +146,62 @@ fn mock_model_run_emits_canned_response() {
         stdout.contains("hello from the test"),
         "stdout missing echoed prompt\nstdout=<<<{stdout}>>>"
     );
+}
+
+#[test]
+fn prompt_stdin_help_is_a_nonblocking_capability_marker() {
+    let (code, _stdout, stderr) = run_agent(&["run", "--help"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stderr.contains("--prompt-stdin"), "{stderr}");
+}
+
+#[test]
+fn prompt_stdin_preserves_utf8_newlines_and_opens_requested_runlog() {
+    let dir = tempdir("prompt_stdin");
+    let logs = dir.join("logs");
+    let input = "first line\nsecond  café\n";
+    let (code, stdout, stderr) = run_agent_stdin(
+        &["run", "--mock", "--prompt-stdin", "--runlog", logs.to_str().unwrap(), "--run-id", "pipe-1"],
+        input.as_bytes(),
+    );
+    assert_eq!(code, Some(0), "stdout={stdout:?} stderr={stderr:?}");
+    assert!(stdout.contains(&format!("[mock] received: {input}")), "{stdout}");
+    let lines = runlog_lines(&logs, "pipe-1");
+    assert!(lines.first().is_some_and(|line| line.contains(r#""kind":"start""#)), "{lines:?}");
+    assert!(lines.last().is_some_and(|line| line.contains(r#""kind":"done""#)), "{lines:?}");
+    cleanup(&dir);
+}
+
+#[test]
+fn prompt_stdin_invalid_and_empty_input_precede_audit() {
+    for input in [&b""[..], &b"\xff"[..]] {
+        let dir = tempdir("prompt_stdin_bad");
+        let logs = dir.join("logs");
+        let (code, stdout, stderr) = run_agent_stdin(
+            &["run", "--mock", "--prompt-stdin", "--runlog", logs.to_str().unwrap(), "--run-id", "pipe-bad"],
+            input,
+        );
+        assert_eq!(code, Some(2), "stdout={stdout:?} stderr={stderr:?}");
+        assert!(stderr.contains("--prompt-stdin"), "{stderr}");
+        assert!(!stdout.contains("[mock] received:"), "{stdout}");
+        assert!(!logs.exists(), "invalid input created an audit path: {:?}", ls(&logs));
+        cleanup(&dir);
+    }
+}
+
+#[test]
+fn prompt_stdin_rejects_other_prompt_sources_before_audit() {
+    for extra in [vec!["positional"], vec!["--skill", "review"], vec!["--arg", "PR=123"]] {
+        let dir = tempdir("prompt_stdin_conflict");
+        let logs = dir.join("logs");
+        let mut args = vec!["run", "--mock", "--prompt-stdin", "--runlog", logs.to_str().unwrap()];
+        args.extend(extra);
+        let (code, stdout, stderr) = run_agent_stdin(&args, b"valid prompt");
+        assert_eq!(code, Some(2), "stdout={stdout:?} stderr={stderr:?}");
+        assert!(stderr.contains("cannot be combined"), "{stderr}");
+        assert!(!logs.exists(), "conflict created an audit path: {:?}", ls(&logs));
+        cleanup(&dir);
+    }
 }
 
 /// `agent run --mock-script PATH <prompt>` should load the script,
@@ -155,6 +253,157 @@ fn mock_script_bad_json_reports_line_col() {
     assert_ne!(code, Some(0), "expected non-zero exit for bad JSON");
     assert!(stderr.contains("script.json:"), "stderr missing path prefix\nstderr=<<<{stderr}>>>");
 
+    cleanup(&dir);
+}
+
+// ----- run identity + ordered runlog -----------------------------------------
+
+/// Parse `N` from a runlog line beginning `{"seq":N,`.
+fn seq_of(line: &str) -> Option<u64> {
+    let rest = line.strip_prefix(r#"{"seq":"#)?;
+    rest[..rest.find(',')?].parse().ok()
+}
+
+fn runlog_lines(dir: &std::path::Path, run_id: &str) -> Vec<String> {
+    let path = dir.join(format!("{run_id}.jsonl"));
+    let s = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("read {path:?}: {e}; dir has {:?}", ls(dir)));
+    s.lines().map(str::to_string).collect()
+}
+
+fn ls(dir: &std::path::Path) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into()).collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `--run-id` names the runlog file and stamps every record; records carry
+/// a contiguous `seq` from 0 and the run ends with a `done` record.
+#[test]
+fn run_id_flag_names_runlog_and_seq_is_contiguous() {
+    let dir = tempdir("runid_flag");
+    let (code, stdout, stderr) = run_agent(&[
+        "run",
+        "--mock",
+        "--runlog",
+        dir.to_str().unwrap(),
+        "--run-id",
+        "bop:card-42.r1",
+        "hi",
+    ]);
+    assert_eq!(code, Some(0), "stdout=<<<{stdout}>>>\nstderr=<<<{stderr}>>>");
+    let lines = runlog_lines(&dir, "bop:card-42.r1");
+    assert!(lines.len() >= 3, "expected start..done, got {lines:?}");
+    for (i, l) in lines.iter().enumerate() {
+        assert_eq!(seq_of(l), Some(i as u64), "line {i}: {l}");
+        assert!(l.contains(r#""run_id":"bop:card-42.r1""#), "line {i}: {l}");
+    }
+    assert!(lines[0].contains(r#""kind":"start""#));
+    assert!(lines.last().unwrap().contains(r#""kind":"done""#), "{lines:?}");
+    assert_eq!(ls(&dir).len(), 1, "no minted run-<ms> file alongside: {:?}", ls(&dir));
+    cleanup(&dir);
+}
+
+/// With no flag, a BOP dispatcher's `BOP_RUN_ID` takes precedence
+/// over an inherited `AGENT_RUN_ID`.
+#[test]
+fn run_id_env_precedence() {
+    let dir = tempdir("runid_env");
+    let d = dir.to_str().unwrap();
+    let (code, _o, e) =
+        run_agent_env(&["run", "--mock", "--runlog", d, "x"], &[("BOP_RUN_ID", "bop-7")]);
+    assert_eq!(code, Some(0), "{e}");
+    assert!(dir.join("bop-7.jsonl").exists(), "{:?}", ls(&dir));
+
+    let bop_run_id = "0123456789abcdef0123456789abcdef";
+    let (code, _o, e) = run_agent_env(
+        &["run", "--mock", "--runlog", d, "x"],
+        &[("BOP_RUN_ID", bop_run_id), ("AGENT_RUN_ID", "agent-8")],
+    );
+    assert_eq!(code, Some(0), "{e}");
+    assert!(dir.join(format!("{bop_run_id}.jsonl")).exists(), "{:?}", ls(&dir));
+    assert!(!dir.join("agent-8.jsonl").exists());
+    let lines = runlog_lines(&dir, bop_run_id);
+    assert!(lines.len() >= 3, "expected start..done, got {lines:?}");
+    for (i, line) in lines.iter().enumerate() {
+        assert_eq!(seq_of(line), Some(i as u64), "line {i}: {line}");
+        assert!(line.contains(&format!(r#""run_id":"{bop_run_id}""#)), "line {i}: {line}");
+    }
+    assert!(lines[0].contains(r#""kind":"start""#), "{lines:?}");
+    assert!(lines.last().unwrap().contains(r#""kind":"done""#), "{lines:?}");
+    assert_eq!(ls(&dir).len(), 2, "no minted run file: {:?}", ls(&dir));
+    cleanup(&dir);
+}
+
+/// Re-running with the same external run id (a retry) appends to the same
+/// file and continues `seq` rather than restarting it.
+#[test]
+fn rerun_same_run_id_continues_seq() {
+    let dir = tempdir("runid_retry");
+    let d = dir.to_str().unwrap();
+    for _ in 0..2 {
+        let (code, _o, e) =
+            run_agent(&["run", "--mock", "--runlog", d, "--run-id", "retry-1", "x"]);
+        assert_eq!(code, Some(0), "{e}");
+    }
+    let lines = runlog_lines(&dir, "retry-1");
+    let starts = lines.iter().filter(|l| l.contains(r#""kind":"start""#)).count();
+    assert_eq!(starts, 2, "{lines:?}");
+    for (i, l) in lines.iter().enumerate() {
+        assert_eq!(seq_of(l), Some(i as u64), "line {i}: {l}");
+    }
+    cleanup(&dir);
+}
+
+/// An unsafe external id is refused (exit 2) before any runlog file is
+/// created, instead of being silently replaced by a minted id.
+#[test]
+fn invalid_run_id_is_rejected() {
+    let dir = tempdir("runid_bad");
+    let logs = dir.join("logs");
+    let (code, _o, stderr) = run_agent(&[
+        "run",
+        "--mock",
+        "--runlog",
+        logs.to_str().unwrap(),
+        "--run-id",
+        "../escape",
+        "x",
+    ]);
+    assert_eq!(code, Some(2), "stderr=<<<{stderr}>>>");
+    assert!(stderr.contains("--run-id") && stderr.contains("invalid run id"), "{stderr}");
+    assert!(!dir.join("escape.jsonl").exists());
+    assert!(!logs.exists(), "no runlog dir should be created: {:?}", ls(&dir));
+
+    let (code, _o, stderr) = run_agent_env(
+        &["run", "--mock", "--runlog", logs.to_str().unwrap(), "x"],
+        &[("BOP_RUN_ID", "a/b")],
+    );
+    assert_eq!(code, Some(2), "stderr=<<<{stderr}>>>");
+    assert!(stderr.contains("BOP_RUN_ID"), "{stderr}");
+    cleanup(&dir);
+}
+
+#[test]
+fn requested_runlog_open_failure_prevents_model_execution() {
+    let dir = tempdir("runlog_required");
+    let blocked = dir.join("not-a-directory");
+    std::fs::write(&blocked, b"sentinel").unwrap();
+    let (code, stdout, stderr) = run_agent(&[
+        "run",
+        "--mock",
+        "--runlog",
+        blocked.to_str().unwrap(),
+        "--run-id",
+        "r1",
+        "prompt",
+    ]);
+    assert_eq!(code, Some(1), "stdout={stdout:?} stderr={stderr:?}");
+    assert!(stderr.contains("runlog: open"), "{stderr}");
+    assert!(!stdout.contains("[mock] received:"), "model ran without audit log: {stdout}");
+    assert_eq!(std::fs::read(&blocked).unwrap(), b"sentinel");
     cleanup(&dir);
 }
 

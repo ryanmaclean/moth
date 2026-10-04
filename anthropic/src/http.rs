@@ -22,6 +22,7 @@
 use std::ffi::CString;
 use std::os::raw::{c_char, c_void};
 use std::ptr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender};
 use std::thread::JoinHandle;
@@ -47,12 +48,18 @@ pub(crate) enum Chunk {
 pub(crate) struct Stream {
     pub(crate) rx: Receiver<Chunk>,
     pub(crate) handle: Option<JoinHandle<()>>,
+    aborted: Arc<AtomicBool>,
 }
 
 impl Drop for Stream {
     fn drop(&mut self) {
-        // Dropping rx closes the channel; the next write callback returns
-        // CURLE_WRITE_ERROR and curl_easy_perform exits.
+        // Signal curl during a silent connect/read, then close the real
+        // receiver before joining. A full bounded send cannot finish while
+        // that receiver remains live.
+        self.aborted.store(true, Ordering::Release);
+        let (_, disconnected) = std::sync::mpsc::channel();
+        let rx = std::mem::replace(&mut self.rx, disconnected);
+        drop(rx);
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
@@ -61,10 +68,9 @@ impl Drop for Stream {
 
 struct Ctx {
     tx: SyncSender<Chunk>,
-    /// Set when the caller has dropped the receiver (write_cb's `tx.send`
-    /// fails) OR when classification decides we must give up. Both write_cb
-    /// and xferinfo_cb read it.
-    aborted: AtomicBool,
+    /// Set by Stream::drop before closing the receiver, or when a send
+    /// observes receiver disconnection. Both callbacks read it.
+    aborted: Arc<AtomicBool>,
     /// Set on the first successful `tx.send`. Once true, the streaming
     /// contract has been observed externally and the request is no longer
     /// safe to retry.
@@ -77,7 +83,7 @@ extern "C" fn write_cb(ptr: *mut c_char, size: usize, nmemb: usize, user: *mut c
         return 0;
     }
     let ctx = unsafe { &*(user as *const Ctx) };
-    if ctx.aborted.load(Ordering::Relaxed) {
+    if ctx.aborted.load(Ordering::Acquire) {
         return 0;
     }
     let slice = unsafe { std::slice::from_raw_parts(ptr as *const u8, total) };
@@ -95,16 +101,16 @@ extern "C" fn write_cb(ptr: *mut c_char, size: usize, nmemb: usize, user: *mut c
 
 extern "C" fn xferinfo_cb(
     user: *mut c_void,
-    _dltotal: f64,
-    _dlnow: f64,
-    _ultotal: f64,
-    _ulnow: f64,
+    _dltotal: c::curl_off_t,
+    _dlnow: c::curl_off_t,
+    _ultotal: c::curl_off_t,
+    _ulnow: c::curl_off_t,
 ) -> i32 {
     let ctx = unsafe { &*(user as *const Ctx) };
     // Non-zero return triggers CURLE_ABORTED_BY_CALLBACK from curl, which
     // unblocks any connect/recv that's currently parked. Polled by curl
     // roughly once per second, so this matters most for between-byte stalls.
-    i32::from(ctx.aborted.load(Ordering::Relaxed))
+    i32::from(ctx.aborted.load(Ordering::Acquire))
 }
 
 pub(crate) fn post_stream(api_key: &str, body: String) -> Result<Stream, Error> {
@@ -121,6 +127,8 @@ pub(crate) fn post_stream(api_key: &str, body: String) -> Result<Stream, Error> 
     }
 
     let (tx, rx) = std::sync::mpsc::sync_channel::<Chunk>(64);
+    let aborted = Arc::new(AtomicBool::new(false));
+    let worker_aborted = Arc::clone(&aborted);
 
     let url = CString::new(URL).map_err(|_| Error::Http("bad URL".into()))?;
     let key_header = CString::new(format!("x-api-key: {api_key}"))
@@ -134,11 +142,14 @@ pub(crate) fn post_stream(api_key: &str, body: String) -> Result<Stream, Error> 
     let handle = std::thread::spawn(move || {
         let ctx = Ctx {
             tx: tx.clone(),
-            aborted: AtomicBool::new(false),
+            aborted: worker_aborted,
             delivered: AtomicBool::new(false),
         };
         let policy = wire::retry::RetryPolicy::default();
         let result = wire::retry::with_backoff(&policy, |_attempt| {
+            if ctx.aborted.load(Ordering::Acquire) {
+                return wire::retry::Outcome::Fatal(Error::Http("stream cancelled".into()));
+            }
             // Fresh body clone per attempt: curl reads from the buffer for
             // the duration of `curl_easy_perform`, and a retried call may
             // re-issue the same bytes. Cloning `Vec<u8>` is cheap.
@@ -157,8 +168,15 @@ pub(crate) fn post_stream(api_key: &str, body: String) -> Result<Stream, Error> 
             // Strict invariant: never retry once bytes have crossed the
             // channel into the iterator consumer.
             let delivered = ctx.delivered.load(Ordering::Relaxed);
-            classify(perform, delivered)
+            if ctx.aborted.load(Ordering::Acquire) {
+                wire::retry::Outcome::Fatal(Error::Http("stream cancelled".into()))
+            } else {
+                classify(perform, delivered)
+            }
         });
+        if ctx.aborted.load(Ordering::Acquire) {
+            return;
+        }
         match &result {
             Ok(_) => wire::retry::record_success("api.anthropic.com", &breaker_cfg),
             Err(_) => wire::retry::record_failure("api.anthropic.com", &breaker_cfg),
@@ -166,7 +184,7 @@ pub(crate) fn post_stream(api_key: &str, body: String) -> Result<Stream, Error> 
         let _ = tx.send(Chunk::End(result));
     });
 
-    Ok(Stream { rx, handle: Some(handle) })
+    Ok(Stream { rx, handle: Some(handle), aborted })
 }
 
 /// One curl_easy_perform's worth of outcome, factored out so the body of
@@ -469,6 +487,24 @@ mod tests {
     use super::*;
     use wire::retry::Outcome;
 
+    #[test]
+    fn dropping_full_stream_disconnects_before_join() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Chunk>(1);
+        assert!(tx.send(Chunk::Data(vec![1])).is_ok());
+        let aborted = Arc::new(AtomicBool::new(false));
+        let worker_aborted = Arc::clone(&aborted);
+        let worker_finished = Arc::new(AtomicBool::new(false));
+        let finished_in_worker = Arc::clone(&worker_finished);
+        let handle = std::thread::spawn(move || {
+            assert!(tx.send(Chunk::Data(vec![2])).is_err());
+            assert!(worker_aborted.load(Ordering::Acquire));
+            finished_in_worker.store(true, Ordering::Release);
+        });
+        drop(Stream { rx, handle: Some(handle), aborted: Arc::clone(&aborted) });
+        assert!(aborted.load(Ordering::Acquire));
+        assert!(worker_finished.load(Ordering::Acquire));
+    }
+
     fn ok(rc: c::CURLcode, status: i64) -> Result<PerformOutcome, Error> {
         Ok(PerformOutcome { rc, status })
     }
@@ -666,7 +702,11 @@ mod tests {
         let body = b"{}".to_vec();
 
         let (tx, _rx) = std::sync::mpsc::sync_channel::<Chunk>(1);
-        let ctx = Ctx { tx, aborted: AtomicBool::new(false), delivered: AtomicBool::new(false) };
+        let ctx = Ctx {
+            tx,
+            aborted: Arc::new(AtomicBool::new(false)),
+            delivered: AtomicBool::new(false),
+        };
 
         let started = std::time::Instant::now();
         let result = unsafe {
@@ -697,10 +737,14 @@ mod tests {
     #[test]
     fn xferinfo_cb_returns_nonzero_when_aborted() {
         let (tx, _rx) = std::sync::mpsc::sync_channel::<Chunk>(1);
-        let ctx = Ctx { tx, aborted: AtomicBool::new(false), delivered: AtomicBool::new(false) };
+        let ctx = Ctx {
+            tx,
+            aborted: Arc::new(AtomicBool::new(false)),
+            delivered: AtomicBool::new(false),
+        };
         let ptr = &ctx as *const Ctx as *mut c_void;
-        assert_eq!(xferinfo_cb(ptr, 0.0, 0.0, 0.0, 0.0), 0);
+        assert_eq!(xferinfo_cb(ptr, 0, 0, 0, 0), 0);
         ctx.aborted.store(true, Ordering::Relaxed);
-        assert_ne!(xferinfo_cb(ptr, 0.0, 0.0, 0.0, 0.0), 0, "non-zero signals abort to curl");
+        assert_ne!(xferinfo_cb(ptr, 0, 0, 0, 0), 0, "non-zero signals abort to curl");
     }
 }
