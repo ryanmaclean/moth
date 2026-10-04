@@ -390,16 +390,58 @@ fn truncate_for_mock(s: &str) -> String {
     out
 }
 
-/// Build a `MockModel` that, on every call, emits a single `TextDelta`
-/// echoing the user's prompt (truncated to 80 chars) followed by
-/// `Stop { reason: "end_turn" }`. The same canned turn replays on every
-/// call since `MockModel` cycles when its scripts list is exhausted.
-fn build_mock_canned(prompt: &str) -> MockModel {
-    let echo = format!("[mock] received: {}\n", truncate_for_mock(prompt));
-    MockModel::single(vec![
+/// Choose the normal capped mock echo or an exact-match debug fixture.
+fn mock_echo_text(
+    prompt: &str,
+    expected: Option<&str>,
+    debug_assertions: bool,
+) -> Result<String, String> {
+    match expected {
+        None => Ok(truncate_for_mock(prompt)),
+        Some(_) if !debug_assertions => {
+            Err("MOTH_TEST_ECHO_FULL_PROMPT requires a debug build".into())
+        }
+        Some(expected) if expected == prompt => Ok(prompt.to_owned()),
+        Some(_) => Err("MOTH_TEST_ECHO_FULL_PROMPT does not match stdin".into()),
+    }
+}
+
+/// Test-only full echo is enabled solely when a debug mock run receives the
+/// exact synthetic prompt supplied in MOTH_TEST_ECHO_FULL_PROMPT. Normal mock
+/// output keeps its 80-character cap, and mismatches never print prompt bytes.
+fn build_mock_canned(prompt: &str) -> Result<MockModel, String> {
+    let expected = match std::env::var("MOTH_TEST_ECHO_FULL_PROMPT") {
+        Ok(expected) => Some(expected),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err("MOTH_TEST_ECHO_FULL_PROMPT must be UTF-8".into());
+        }
+    };
+    let echoed = mock_echo_text(prompt, expected.as_deref(), cfg!(debug_assertions))?;
+    let echo = format!("[mock] received: {echoed}\n");
+    Ok(MockModel::single(vec![
         ModelEvent::TextDelta(echo),
         ModelEvent::Stop { reason: Some("end_turn".into()) },
-    ])
+    ]))
+}
+
+#[cfg(test)]
+mod mock_echo_fixture_tests {
+    use super::{mock_echo_text, truncate_for_mock};
+
+    #[test]
+    fn default_echo_still_truncates() {
+        let prompt = "x".repeat(160);
+        assert!(mock_echo_text(&prompt, None, true).unwrap() == truncate_for_mock(&prompt));
+    }
+
+    #[test]
+    fn full_echo_needs_an_exact_debug_fixture() {
+        let prompt = format!("fixture 雪🙂\n{}\nend", "x".repeat(160));
+        assert!(mock_echo_text(&prompt, Some(prompt.as_str()), true).unwrap() == prompt);
+        assert!(mock_echo_text(&prompt, Some("different"), true).is_err());
+        assert!(mock_echo_text(&prompt, Some(prompt.as_str()), false).is_err());
+    }
 }
 
 /// Compute (line, col), both 1-indexed, for a byte offset into `src`.
@@ -889,7 +931,13 @@ fn run_cmd_with_output(mut args: Vec<String>, out: &mut dyn std::io::Write) -> E
                     return ExitCode::from(2);
                 }
             },
-            None => build_mock_canned(&prompt),
+            None => match build_mock_canned(&prompt) {
+                Ok(mm) => mm,
+                Err(e) => {
+                    eprintln!("{e}");
+                    return ExitCode::from(2);
+                }
+            },
         };
         Arc::new(mm)
     } else {
@@ -1664,7 +1712,9 @@ mod run_id_tests {
             std::process::id(),
             super::unix_ms_now(),
         ));
-        let model: Arc<dyn Model> = Arc::new(build_mock_canned("test"));
+        let model: Arc<dyn Model> = Arc::new(
+            build_mock_canned("test").expect("default mock fixture should be valid"),
+        );
         let handler = ChatHandler {
             model,
             tools: Arc::new(Vec::new()),
