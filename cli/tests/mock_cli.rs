@@ -56,11 +56,33 @@ fn run_agent(args: &[&str]) -> (Option<i32>, String, String) {
 
 /// [`run_agent`] with extra environment variables set on the child.
 fn run_agent_env(args: &[&str], envs: &[(&str, &str)]) -> (Option<i32>, String, String) {
+    run_agent_env_stdin(args, envs, None)
+}
+
+/// Send byte-exact stdin and close the pipe. Closing is part of the CLI
+/// contract: `--prompt-stdin` must wait for EOF before opening its runlog.
+fn run_agent_stdin(args: &[&str], input: &[u8]) -> (Option<i32>, String, String) {
+    run_agent_env_stdin(args, &[], Some(input))
+}
+
+fn run_agent_env_stdin(
+    args: &[&str],
+    envs: &[(&str, &str)],
+    input: Option<&[u8]>,
+) -> (Option<i32>, String, String) {
     let mut cmd = agent_cmd();
+    if input.is_some() {
+        cmd.stdin(Stdio::piped());
+    }
     for (k, v) in envs {
         cmd.env(k, v);
     }
     let mut child = cmd.args(args).spawn().expect("spawn agent");
+    let input_handle = input.map(|bytes| {
+        let mut pipe = child.stdin.take().expect("stdin piped");
+        let bytes = bytes.to_vec();
+        std::thread::spawn(move || pipe.write_all(&bytes))
+    });
     let mut stdout = child.stdout.take().expect("stdout piped");
     let mut stderr = child.stderr.take().expect("stderr piped");
 
@@ -84,6 +106,9 @@ fn run_agent_env(args: &[&str], envs: &[(&str, &str)]) -> (Option<i32>, String, 
             None => {
                 if start.elapsed() > RUN_TIMEOUT {
                     let _ = child.kill();
+                    if let Some(handle) = input_handle {
+                        let _ = handle.join();
+                    }
                     let out = stdout_handle.join().unwrap_or_default();
                     let err = stderr_handle.join().unwrap_or_default();
                     panic!(
@@ -95,6 +120,12 @@ fn run_agent_env(args: &[&str], envs: &[(&str, &str)]) -> (Option<i32>, String, 
             }
         }
     };
+    if let Some(handle) = input_handle {
+        let write_result = handle.join().expect("stdin writer panicked");
+        if status.success() {
+            write_result.expect("successful agent exited before consuming stdin");
+        }
+    }
     let stdout = stdout_handle.join().unwrap_or_default();
     let stderr = stderr_handle.join().unwrap_or_default();
     (status.code(), stdout, stderr)
@@ -115,6 +146,62 @@ fn mock_model_run_emits_canned_response() {
         stdout.contains("hello from the test"),
         "stdout missing echoed prompt\nstdout=<<<{stdout}>>>"
     );
+}
+
+#[test]
+fn prompt_stdin_help_is_a_nonblocking_capability_marker() {
+    let (code, _stdout, stderr) = run_agent(&["run", "--help"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stderr.contains("--prompt-stdin"), "{stderr}");
+}
+
+#[test]
+fn prompt_stdin_preserves_utf8_newlines_and_opens_requested_runlog() {
+    let dir = tempdir("prompt_stdin");
+    let logs = dir.join("logs");
+    let input = "first line\nsecond  café\n";
+    let (code, stdout, stderr) = run_agent_stdin(
+        &["run", "--mock", "--prompt-stdin", "--runlog", logs.to_str().unwrap(), "--run-id", "pipe-1"],
+        input.as_bytes(),
+    );
+    assert_eq!(code, Some(0), "stdout={stdout:?} stderr={stderr:?}");
+    assert!(stdout.contains(&format!("[mock] received: {input}")), "{stdout}");
+    let lines = runlog_lines(&logs, "pipe-1");
+    assert!(lines.first().is_some_and(|line| line.contains(r#""kind":"start""#)), "{lines:?}");
+    assert!(lines.last().is_some_and(|line| line.contains(r#""kind":"done""#)), "{lines:?}");
+    cleanup(&dir);
+}
+
+#[test]
+fn prompt_stdin_invalid_and_empty_input_precede_audit() {
+    for input in [&b""[..], &b"\xff"[..]] {
+        let dir = tempdir("prompt_stdin_bad");
+        let logs = dir.join("logs");
+        let (code, stdout, stderr) = run_agent_stdin(
+            &["run", "--mock", "--prompt-stdin", "--runlog", logs.to_str().unwrap(), "--run-id", "pipe-bad"],
+            input,
+        );
+        assert_eq!(code, Some(2), "stdout={stdout:?} stderr={stderr:?}");
+        assert!(stderr.contains("--prompt-stdin"), "{stderr}");
+        assert!(!stdout.contains("[mock] received:"), "{stdout}");
+        assert!(!logs.exists(), "invalid input created an audit path: {:?}", ls(&logs));
+        cleanup(&dir);
+    }
+}
+
+#[test]
+fn prompt_stdin_rejects_other_prompt_sources_before_audit() {
+    for extra in [vec!["positional"], vec!["--skill", "review"], vec!["--arg", "PR=123"]] {
+        let dir = tempdir("prompt_stdin_conflict");
+        let logs = dir.join("logs");
+        let mut args = vec!["run", "--mock", "--prompt-stdin", "--runlog", logs.to_str().unwrap()];
+        args.extend(extra);
+        let (code, stdout, stderr) = run_agent_stdin(&args, b"valid prompt");
+        assert_eq!(code, Some(2), "stdout={stdout:?} stderr={stderr:?}");
+        assert!(stderr.contains("cannot be combined"), "{stderr}");
+        assert!(!logs.exists(), "conflict created an audit path: {:?}", ls(&logs));
+        cleanup(&dir);
+    }
 }
 
 /// `agent run --mock-script PATH <prompt>` should load the script,
