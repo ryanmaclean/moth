@@ -1,6 +1,7 @@
 //! Agent CLI.
 //!
-//! `agent run [opts] <prompt>` — one-shot. Routes the prompt through a
+//! `agent run [opts] <prompt>` or `agent run [opts] --prompt-stdin` — one-shot.
+//! Routes the prompt through a
 //! Session with bash + read_file + write_file + edit_file tools, the
 //! AuditedShell decorator, and the chosen model provider. Streams the
 //! final response to stdout.
@@ -117,6 +118,7 @@ fn usage_and_exit(code: u8) -> ExitCode {
         --model NAME                 model id\n  \
         --skill NAME                 load .agents/skills/NAME.md\n  \
         --arg KEY=VAL                substitute {{KEY}} in the skill (repeatable)\n  \
+        --prompt-stdin               [run] read the complete prompt from stdin to EOF\n  \
         --sessions DIR               persist message history to DIR (or SESSIONS_DIR env)\n  \
         --mcp 'CMD ARGS'             spawn MCP server, register its tools (repeatable)\n  \
         --runlog DIR                 tee every StreamEvent to <DIR>/<run_id>.jsonl (or RUNLOG_DIR env)\n  \
@@ -138,13 +140,16 @@ fn print_run_help() {
         usage:\n  \
         agent run [opts] <prompt>\n  \
         agent run [opts] --skill NAME [--arg KEY=VAL ...]\n\n\
+        agent run [opts] --prompt-stdin\n\n\
         required:\n  \
-        <prompt>                     free-text prompt, OR use --skill to load one\n\n\
+        <prompt>                     free-text prompt, OR use --skill or --prompt-stdin\n\n\
         flags:\n  \
         --openai                     use OpenAI-compatible provider (default: Anthropic)\n  \
         --model NAME                 model id (defaults: claude-haiku-4-5 / gpt-4o-mini)\n  \
         --skill NAME                 load .agents/skills/NAME.md as the prompt\n  \
         --arg KEY=VAL                substitute {{KEY}} in the skill (repeatable)\n  \
+        --prompt-stdin               read the complete UTF-8 prompt from stdin to EOF;\n                               \
+                              cannot combine with <prompt>, --skill, or --arg\n  \
         --sessions DIR               persist message history to DIR\n  \
         --mcp 'CMD ARGS'             spawn MCP server, register its tools (repeatable)\n  \
         --runlog DIR                 audit to <DIR>/<run_id>.jsonl; relative DIR uses the\n                               \
@@ -166,6 +171,7 @@ fn print_run_help() {
         agent run \"explain this repo in 3 bullets\"\n  \
         agent run --openai --model gpt-4o-mini \"write a haiku\"\n  \
         agent run --skill review --arg PR=123\n  \
+        agent run --prompt-stdin --runlog ./logs --run-id card-42.r1\n  \
         agent run --mock \"hello\"                  # no API key required\n  \
         agent run --mock-script ./script.json \"hi\"\n\n\
         env:\n  \
@@ -651,6 +657,66 @@ fn write_newline(out: &mut dyn std::io::Write) -> std::io::Result<()> {
     out.flush()
 }
 
+/// Read one complete pipe payload before creating the runlog or model. There
+/// is no Moth-specific byte ceiling: BOP currently has no matching prompt
+/// size limit. Reserve each incoming chunk fallibly so an allocation failure
+/// returns a diagnostic rather than relying on an unchecked Vec growth path.
+/// A process-wide OOM or a provider's own context limit remains outside this
+/// reader's guarantees.
+fn read_prompt_stdin(mut input: impl std::io::Read) -> Result<String, String> {
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let n = match input.read(&mut chunk) {
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(format!("--prompt-stdin: read failed: {e}")),
+        };
+        if n == 0 {
+            break;
+        }
+        bytes
+            .try_reserve(n)
+            .map_err(|e| format!("--prompt-stdin: allocation failed: {e}"))?;
+        bytes.extend_from_slice(&chunk[..n]);
+    }
+    if bytes.is_empty() {
+        return Err("--prompt-stdin: no prompt bytes before EOF".into());
+    }
+    String::from_utf8(bytes).map_err(|e| format!("--prompt-stdin: invalid UTF-8: {e}"))
+}
+
+#[cfg(test)]
+mod prompt_stdin_reader_tests {
+    use super::read_prompt_stdin;
+    use std::io::{self, Read};
+
+    #[test]
+    fn whitespace_is_preserved_and_only_zero_bytes_are_empty() {
+        assert_eq!(read_prompt_stdin(&b" \n\t"[..]).unwrap(), " \n\t");
+        assert!(read_prompt_stdin(&b""[..]).unwrap_err().contains("no prompt bytes"));
+    }
+
+    struct ErrorAfterChunk(bool);
+    impl Read for ErrorAfterChunk {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            if !self.0 {
+                self.0 = true;
+                out[..4].copy_from_slice(b"part");
+                Ok(4)
+            } else {
+                Err(io::Error::new(io::ErrorKind::Other, "injected read failure"))
+            }
+        }
+    }
+
+    #[test]
+    fn partial_prompt_followed_by_read_error_is_not_accepted() {
+        let err = read_prompt_stdin(ErrorAfterChunk(false)).unwrap_err();
+        assert!(err.contains("read failed") && err.contains("injected read failure"), "{err}");
+    }
+}
+
 fn run_cmd(args: Vec<String>) -> ExitCode {
     let mut stdout = std::io::stdout();
     run_cmd_with_output(args, &mut stdout)
@@ -665,6 +731,8 @@ fn run_cmd_with_output(mut args: Vec<String>, out: &mut dyn std::io::Write) -> E
 
     let mut skill_name: Option<String> = None;
     let mut skill_args: HashMap<String, String> = HashMap::new();
+    let mut saw_skill_flag = false;
+    let mut saw_skill_arg = false;
     let mut strategy_spec: Option<String> = None;
     // --mock / --mock-script. Either flag enables mock mode and skips the
     // API-key check; --mock-script additionally loads scripted turns from
@@ -672,16 +740,27 @@ fn run_cmd_with_output(mut args: Vec<String>, out: &mut dyn std::io::Write) -> E
     let mut mock: bool = false;
     let mut mock_script_path: Option<PathBuf> = None;
     let mut run_id_flag: Option<String> = None;
+    let mut prompt_stdin = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "--prompt-stdin" => {
+                if prompt_stdin {
+                    eprintln!("--prompt-stdin may be passed only once");
+                    return ExitCode::from(2);
+                }
+                prompt_stdin = true;
+                args.remove(i);
+            }
             "--skill" => {
+                saw_skill_flag = true;
                 args.remove(i);
                 if i < args.len() {
                     skill_name = Some(args.remove(i));
                 }
             }
             "--arg" => {
+                saw_skill_arg = true;
                 args.remove(i);
                 if i < args.len() {
                     let kv = args.remove(i);
@@ -750,18 +829,31 @@ fn run_cmd_with_output(mut args: Vec<String>, out: &mut dyn std::io::Write) -> E
         }
     };
 
-    let prompt = match (skill_name.as_deref(), args.join(" ")) {
-        (Some(name), _) => match render_skill(name, &skill_args) {
+    if prompt_stdin && (saw_skill_flag || saw_skill_arg || !args.is_empty()) {
+        eprintln!("--prompt-stdin cannot be combined with <prompt>, --skill, or --arg");
+        return ExitCode::from(2);
+    }
+    let positional_prompt = args.join(" ");
+    let prompt = if prompt_stdin {
+        match read_prompt_stdin(std::io::stdin().lock()) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::from(2);
+            }
+        }
+    } else if let Some(name) = skill_name.as_deref() {
+        match render_skill(name, &skill_args) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("skill {name}: {e}");
                 return ExitCode::from(2);
             }
-        },
-        (None, p) if !p.is_empty() => p,
-        (None, _) => {
-            return usage_and_exit(2);
         }
+    } else if !positional_prompt.is_empty() {
+        positional_prompt
+    } else {
+        return usage_and_exit(2);
     };
 
     // Resolve the audit path against the caller's cwd and open it before
