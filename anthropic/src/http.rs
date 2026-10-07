@@ -75,6 +75,8 @@ struct Ctx {
     /// contract has been observed externally and the request is no longer
     /// safe to retry.
     delivered: AtomicBool,
+    redirecting: AtomicBool,
+    header_error: AtomicBool,
 }
 
 extern "C" fn write_cb(ptr: *mut c_char, size: usize, nmemb: usize, user: *mut c_void) -> usize {
@@ -85,6 +87,9 @@ extern "C" fn write_cb(ptr: *mut c_char, size: usize, nmemb: usize, user: *mut c
     let ctx = unsafe { &*(user as *const Ctx) };
     if ctx.aborted.load(Ordering::Acquire) {
         return 0;
+    }
+    if ctx.redirecting.load(Ordering::Acquire) {
+        return total;
     }
     let slice = unsafe { std::slice::from_raw_parts(ptr as *const u8, total) };
     match ctx.tx.send(Chunk::Data(slice.to_vec())) {
@@ -97,6 +102,36 @@ extern "C" fn write_cb(ptr: *mut c_char, size: usize, nmemb: usize, user: *mut c
             0
         }
     }
+}
+
+extern "C" fn header_cb(ptr: *mut c_char, size: usize, nmemb: usize, user: *mut c_void) -> usize {
+    let total = size.saturating_mul(nmemb);
+    if total == 0 { return 0; }
+    let line = unsafe { std::slice::from_raw_parts(ptr as *const u8, total) };
+    let ctx = unsafe { &*(user as *const Ctx) };
+    if line.starts_with(b"HTTP/") {
+        // libcurl delivers a complete status line before any body callback.
+        // Unknown status syntax aborts the transfer while body forwarding
+        // remains disabled; it must never be treated as a non-redirect.
+        let status = std::str::from_utf8(line).ok()
+            .and_then(|text| text.split_ascii_whitespace().nth(1))
+            .and_then(|digits| digits.parse::<u16>().ok());
+        match status {
+            Some(code) if (100..600).contains(&code) => {
+                ctx.redirecting.store(code < 200 || (300..400).contains(&code), Ordering::Release);
+            }
+            _ => {
+                ctx.header_error.store(true, Ordering::Release);
+                return 0;
+            }
+        }
+    } else if line.starts_with(b"HTTP")
+        || (!line.iter().all(u8::is_ascii_whitespace) && !line.contains(&b':')) {
+        // Any other non-header line could be an unrecognized status line.
+        ctx.header_error.store(true, Ordering::Release);
+        return 0;
+    }
+    total
 }
 
 extern "C" fn xferinfo_cb(
@@ -144,6 +179,8 @@ pub(crate) fn post_stream(api_key: &str, body: String) -> Result<Stream, Error> 
             tx: tx.clone(),
             aborted: worker_aborted,
             delivered: AtomicBool::new(false),
+            redirecting: AtomicBool::new(true),
+            header_error: AtomicBool::new(false),
         };
         let policy = wire::retry::RetryPolicy::default();
         let result = wire::retry::with_backoff(&policy, |_attempt| {
@@ -261,6 +298,60 @@ unsafe fn run_easy(
     body: &[u8],
     ctx: *const Ctx,
 ) -> Result<PerformOutcome, Error> {
+    unsafe { run_easy_with_hook(url, key_header, version_header, content_type, accept, body, ctx, |_| {}) }
+}
+
+unsafe fn run_easy_with_hook<F: FnMut(usize)>(
+    url: &CString,
+    key_header: &CString,
+    version_header: &CString,
+    content_type: &CString,
+    accept: &CString,
+    body: &[u8],
+    ctx: *const Ctx,
+    mut after_redirect: F,
+) -> Result<PerformOutcome, Error> {
+    let original = url.to_str().map_err(|_| Error::Http("URL is not UTF-8".into()))?;
+    wire::http_origin::valid_http_origin(original)
+        .map_err(|e| Error::Http(format!("invalid Anthropic HTTP origin: {e}")))?;
+    let mut current = url.clone();
+    let mut use_post = true;
+    for hop in 0..=10 {
+        if unsafe { (&*ctx).aborted.load(Ordering::Acquire) } {
+            return Err(Error::Http("stream cancelled".into()));
+        }
+        let (outcome, redirect) = unsafe {
+            run_easy_once(&current, key_header, version_header, content_type, accept, body, ctx, use_post)?
+        };
+        if outcome.rc != c::CURLE_OK || !matches!(outcome.status, 301 | 302 | 303 | 307 | 308) {
+            return Ok(outcome);
+        }
+        if hop == 10 {
+            return Err(Error::Http("Anthropic HTTP redirect limit exceeded".into()));
+        }
+        let next = redirect.ok_or_else(|| Error::Http("Anthropic HTTP redirect lacks Location".into()))?;
+        if !wire::http_origin::same_http_origin(original, &next)
+            .map_err(|e| Error::Http(format!("invalid Anthropic HTTP redirect origin: {e}")))?
+        {
+            return Err(Error::Http("cross-origin Anthropic HTTP redirect refused".into()));
+        }
+        use_post = use_post && !matches!(outcome.status, 301 | 302 | 303);
+        current = CString::new(next).map_err(|_| Error::Http("redirect URL contains NUL".into()))?;
+        after_redirect(hop);
+    }
+    unreachable!("bounded redirect loop returns")
+}
+
+unsafe fn run_easy_once(
+    url: &CString,
+    key_header: &CString,
+    version_header: &CString,
+    content_type: &CString,
+    accept: &CString,
+    body: &[u8],
+    ctx: *const Ctx,
+    use_post: bool,
+) -> Result<(PerformOutcome, Option<String>), Error> {
     unsafe {
         curl_global_init_once();
         let easy = c::curl_easy_init();
@@ -277,12 +368,18 @@ unsafe fn run_easy(
         let guard = Handle { easy, headers };
 
         setopt_ptr(easy, c::CURLOPT_URL, url.as_ptr() as *const c_void, "URL")?;
-        setopt_long(easy, c::CURLOPT_POST, 1, "POST")?;
-        setopt_ptr(easy, c::CURLOPT_POSTFIELDS, body.as_ptr() as *const c_void, "POSTFIELDS")?;
-        setopt_long(easy, c::CURLOPT_POSTFIELDSIZE, body.len() as i64, "POSTFIELDSIZE")?;
+        if use_post {
+            setopt_long(easy, c::CURLOPT_POST, 1, "POST")?;
+            setopt_ptr(easy, c::CURLOPT_POSTFIELDS, body.as_ptr() as *const c_void, "POSTFIELDS")?;
+            setopt_long(easy, c::CURLOPT_POSTFIELDSIZE, body.len() as i64, "POSTFIELDSIZE")?;
+        } else {
+            setopt_long(easy, c::CURLOPT_HTTPGET, 1, "HTTPGET")?;
+        }
         setopt_ptr(easy, c::CURLOPT_HTTPHEADER, headers as *const c_void, "HTTPHEADER")?;
         setopt_ptr(easy, c::CURLOPT_WRITEFUNCTION, write_cb as *const c_void, "WRITEFUNCTION")?;
         setopt_ptr(easy, c::CURLOPT_WRITEDATA, ctx as *const c_void, "WRITEDATA")?;
+        setopt_ptr(easy, c::CURLOPT_HEADERFUNCTION, header_cb as *const c_void, "HEADERFUNCTION")?;
+        setopt_ptr(easy, c::CURLOPT_HEADERDATA, ctx as *const c_void, "HEADERDATA")?;
         // Cancellation: xferinfo_cb returns non-zero when ctx.aborted is set,
         // which lets curl break out of connect/recv stalls without waiting
         // for the next byte to flow through write_cb.
@@ -294,7 +391,7 @@ unsafe fn run_easy(
             "XFERINFOFUNCTION",
         )?;
         setopt_ptr(easy, CURLOPT_XFERINFODATA, ctx as *const c_void, "XFERINFODATA")?;
-        setopt_long(easy, c::CURLOPT_FOLLOWLOCATION, 1, "FOLLOWLOCATION")?;
+        setopt_long(easy, c::CURLOPT_FOLLOWLOCATION, 0, "FOLLOWLOCATION")?;
         // Connection-level timeouts so a half-open or LB-dropped TCP socket
         // can't wedge the worker thread indefinitely. No hard CURLOPT_TIMEOUT
         // — streams can legitimately run for many minutes — but require at
@@ -304,13 +401,27 @@ unsafe fn run_easy(
         setopt_long(easy, c::CURLOPT_LOW_SPEED_LIMIT, 1, "LOW_SPEED_LIMIT")?;
         setopt_long(easy, c::CURLOPT_LOW_SPEED_TIME, 60, "LOW_SPEED_TIME")?;
 
+        (&*ctx).redirecting.store(true, Ordering::Release);
+        (&*ctx).header_error.store(false, Ordering::Release);
         let perform_rc = c::curl_easy_perform(easy);
         let mut status: i64 = 0;
         c::curl_easy_getinfo(easy, c::CURLINFO_RESPONSE_CODE, &mut status);
-
+        let mut redirect_ptr: *mut c_char = ptr::null_mut();
+        let info_rc = c::curl_easy_getinfo(easy, c::CURLINFO_REDIRECT_URL, &mut redirect_ptr);
+        let redirect = if info_rc == c::CURLE_OK && !redirect_ptr.is_null() {
+            Some(std::ffi::CStr::from_ptr(redirect_ptr).to_str()
+                .map_err(|_| Error::Http("redirect URL is not UTF-8".into()))?.to_owned())
+        } else {
+            None
+        };
         drop(guard);
-
-        Ok(PerformOutcome { rc: perform_rc, status })
+        if (&*ctx).header_error.load(Ordering::Acquire) {
+            return Err(Error::Http("malformed HTTP response header/status".into()));
+        }
+        if perform_rc == c::CURLE_OK && info_rc != c::CURLE_OK {
+            return Err(curl_err(info_rc, "redirect URL"));
+        }
+        Ok((PerformOutcome { rc: perform_rc, status }, redirect))
     }
 }
 
@@ -667,6 +778,162 @@ mod tests {
         assert_eq!(attempts, 1, "Ok outcome must short-circuit");
     }
 
+    #[test]
+    fn cross_origin_redirect_never_reaches_second_server() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let first = TcpListener::bind("127.0.0.1:0").unwrap();
+        let second = TcpListener::bind("127.0.0.1:0").unwrap();
+        let first_addr = first.local_addr().unwrap();
+        let second_addr = second.local_addr().unwrap();
+        second.set_nonblocking(true).unwrap();
+        let contacted = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let contacted_in_server = Arc::clone(&contacted);
+        let stop_in_server = Arc::clone(&stop);
+        let second_thread = std::thread::spawn(move || {
+            while !stop_in_server.load(Ordering::Acquire) {
+                match second.accept() {
+                    Ok((mut stream, _)) => {
+                        contacted_in_server.store(true, Ordering::Release);
+                        let mut buf = [0u8; 1024];
+                        let _ = stream.read(&mut buf);
+                        let _ = stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+                        break;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        let first_thread = std::thread::spawn(move || {
+            let (mut stream, _) = first.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            let response = format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nlocation: http://{second_addr}/v1/messages\r\ncontent-length: 13\r\nconnection: close\r\n\r\nredirect-body"
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        let url = CString::new(format!("http://{first_addr}/v1/messages")).unwrap();
+        let key_header = CString::new("x-api-key: key-sentinel").unwrap();
+        let version_header = CString::new("anthropic-version: 2023-06-01").unwrap();
+        let content_type = CString::new("content-type: application/json").unwrap();
+        let accept = CString::new("accept: text/event-stream").unwrap();
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Chunk>(1);
+        let ctx = Ctx {
+            tx,
+            aborted: Arc::new(AtomicBool::new(false)),
+            delivered: AtomicBool::new(false),
+            redirecting: AtomicBool::new(true),
+            header_error: AtomicBool::new(false),
+        };
+        let error = unsafe {
+            run_easy(&url, &key_header, &version_header, &content_type, &accept, b"{}", &ctx)
+        }.err().expect("cross-origin redirect must fail");
+        let message = match error {
+            Error::Http(message) => message,
+            other => panic!("unexpected error: {other:?}"),
+        };
+        assert!(message.contains("cross-origin"), "unexpected error: {message}");
+        first_thread.join().unwrap();
+        stop.store(true, Ordering::Release);
+        second_thread.join().unwrap();
+        assert!(!contacted.load(Ordering::Acquire));
+        assert!(!ctx.delivered.load(Ordering::Acquire));
+        assert!(rx.try_recv().is_err(), "redirect body must not become a stream chunk");
+    }
+    #[test]
+    fn header_gate_suppresses_nonempty_http2_redirects_after_interim_status() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Chunk>(2);
+        let ctx = Ctx {
+            tx,
+            aborted: Arc::new(AtomicBool::new(false)),
+            delivered: AtomicBool::new(false),
+            redirecting: AtomicBool::new(true),
+            header_error: AtomicBool::new(false),
+        };
+        let user = &ctx as *const Ctx as *mut c_void;
+        for status in [307, 308] {
+            let interim = b"HTTP/1.1 100 Continue\r\n";
+            assert_eq!(header_cb(interim.as_ptr() as *mut c_char, 1, interim.len(), user), interim.len());
+            let line = format!("HTTP/2 {status}\r\n");
+            assert_eq!(header_cb(line.as_ptr() as *mut c_char, 1, line.len(), user), line.len());
+            let body = b"redirect-body";
+            assert_eq!(write_cb(body.as_ptr() as *mut c_char, 1, body.len(), user), body.len());
+            assert!(rx.try_recv().is_err(), "3xx bytes must not reach the stream");
+            assert!(!ctx.delivered.load(Ordering::Acquire));
+        }
+        let success = b"HTTP/2 200\r\n";
+        assert_eq!(header_cb(success.as_ptr() as *mut c_char, 1, success.len(), user), success.len());
+        let answer = b"ok";
+        assert_eq!(write_cb(answer.as_ptr() as *mut c_char, 1, answer.len(), user), answer.len());
+        match rx.try_recv() {
+            Ok(Chunk::Data(data)) => assert_eq!(data, answer),
+            _ => panic!("2xx body must reach the stream"),
+        }
+        assert!(ctx.delivered.load(Ordering::Acquire));
+        let malformed = b"HTTP: 307\r\n";
+        assert_eq!(header_cb(malformed.as_ptr() as *mut c_char, 1, malformed.len(), user), 0);
+        assert!(ctx.header_error.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn cancellation_between_same_origin_hops_starts_no_second_request() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::AtomicUsize;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let count_server = Arc::clone(&count);
+        let stop_server = Arc::clone(&stop);
+        let server = std::thread::spawn(move || {
+            while !stop_server.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        count_server.fetch_add(1, Ordering::AcqRel);
+                        let mut buf = [0u8; 1024];
+                        let _ = stream.read(&mut buf);
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 307 Temporary Redirect\r\nlocation: /again\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                        );
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        let url = CString::new(format!("http://{addr}/v1/messages")).unwrap();
+        let key = CString::new("x-api-key: key-sentinel").unwrap();
+        let version = CString::new("anthropic-version: 2023-06-01").unwrap();
+        let content_type = CString::new("content-type: application/json").unwrap();
+        let accept = CString::new("accept: text/event-stream").unwrap();
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<Chunk>(1);
+        let aborted = Arc::new(AtomicBool::new(false));
+        let ctx = Ctx {
+            tx, aborted: Arc::clone(&aborted),
+            delivered: AtomicBool::new(false),
+            redirecting: AtomicBool::new(true),
+            header_error: AtomicBool::new(false),
+        };
+        let error = unsafe {
+            run_easy_with_hook(&url, &key, &version, &content_type, &accept, b"{}", &ctx, |_| {
+                aborted.store(true, Ordering::Release);
+            })
+        }.err().expect("cancelled redirect must stop");
+        assert!(error.to_string().contains("cancelled"), "{error}");
+        stop.store(true, Ordering::Release);
+        server.join().unwrap();
+        assert_eq!(count.load(Ordering::Acquire), 1);
+    }
+
     /// A silent peer: a TcpListener that `accept`s a single connection and
     /// then holds it open without reading or writing. Models the LB-dropped
     /// / NAT-timeout / half-open case where TCP handshakes succeed but no
@@ -706,6 +973,8 @@ mod tests {
             tx,
             aborted: Arc::new(AtomicBool::new(false)),
             delivered: AtomicBool::new(false),
+            redirecting: AtomicBool::new(true),
+            header_error: AtomicBool::new(false),
         };
 
         let started = std::time::Instant::now();
@@ -741,6 +1010,8 @@ mod tests {
             tx,
             aborted: Arc::new(AtomicBool::new(false)),
             delivered: AtomicBool::new(false),
+            redirecting: AtomicBool::new(true),
+            header_error: AtomicBool::new(false),
         };
         let ptr = &ctx as *const Ctx as *mut c_void;
         assert_eq!(xferinfo_cb(ptr, 0, 0, 0, 0), 0);
