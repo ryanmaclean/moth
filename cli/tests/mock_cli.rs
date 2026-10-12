@@ -424,3 +424,16 @@ fn tempdir(label: &str) -> PathBuf {
 fn cleanup(p: &std::path::Path) {
     let _ = std::fs::remove_dir_all(p);
 }
+
+#[test]
+fn mock_task_tool_releases_parent_state_and_finishes_receipt() {
+    let dir = tempdir("task_tool_cycle");
+    let (code, stdout, stderr) = run_agent(&[
+        "run", "--mock", "--task-tool", "--runlog", dir.to_str().unwrap(),
+        "--run-id", "task-cycle", "synthetic parent state cycle",
+    ]);
+    assert_eq!(code, Some(0), "stdout={stdout:?} stderr={stderr:?}");
+    let lines = runlog_lines(&dir, "task-cycle");
+    assert!(lines.last().is_some_and(|line| line.contains(r#""kind":"done""#)));
+    cleanup(&dir);
+}

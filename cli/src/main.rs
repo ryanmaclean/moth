@@ -61,6 +61,7 @@ fn install_signals() {
     }
 }
 
+#[cfg(test)]
 use actor::spawn;
 use git::{AgentStatus, Branch, BranchStrategy, HeadStrategy, MergeToHeadStrategy};
 use harness::{
@@ -73,6 +74,14 @@ const DEFAULT_ANTHROPIC_MODEL: &str = "claude-haiku-4-5";
 const DEFAULT_OPENAI_MODEL: &str = "gpt-4o-mini";
 
 fn main() -> ExitCode {
+    let mut private_args = std::env::args_os().skip(1);
+    let private_command = private_args.next();
+    if private_command.as_deref() == Some(std::ffi::OsStr::new(vshell::ownership::PRIVATE_LAUNCH_COMMAND)) {
+        return ExitCode::from(vshell::ownership::private_launch(private_args.collect()) as u8);
+    }
+    if private_command.as_deref() == Some(std::ffi::OsStr::new(vshell::ownership::PRIVATE_COMMAND)) {
+        return ExitCode::from(vshell::ownership::private_main(private_args.collect()) as u8);
+    }
     install_signals();
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
@@ -345,13 +354,16 @@ type McpConn = (Vec<mcp::McpClient>, Vec<Arc<dyn Tool>>);
 
 /// Returns owned clients so they live the duration of the run, plus the
 /// flattened tool list to register with the harness.
-fn connect_mcp(specs: &[String]) -> Result<McpConn, String> {
+fn connect_mcp(specs: &[String], registry: Option<&Arc<vshell::ownership::OwnerRegistry>>) -> Result<McpConn, String> {
     let mut clients = Vec::new();
     let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
     for spec in specs {
         let parts: Vec<&str> = spec.split_whitespace().collect();
         let (cmd, args) = parts.split_first().ok_or("empty --mcp value")?;
-        let client = mcp::McpClient::stdio(cmd, args).map_err(|e| format!("mcp {cmd}: {e:?}"))?;
+        let client = match registry {
+            Some(registry) => mcp::McpClient::stdio_owned(registry.clone(), cmd, args),
+            None => mcp::McpClient::stdio(cmd, args),
+        }.map_err(|e| format!("mcp {cmd}: {e:?}"))?;
         for t in client.tools() {
             tools.push(Arc::new(t));
         }
@@ -606,16 +618,40 @@ fn default_tools(root: Option<PathBuf>) -> Vec<Arc<dyn Tool>> {
 /// text. Exposes Flue-style `session.task()` semantics through the model
 /// interface so the LLM can fan out exploratory work to a child it
 /// describes in a JSON `prompt` argument.
+fn run_cancelled() -> bool {
+    cancellation_requested(CANCEL.load(Ordering::Acquire), SHUTDOWN.load(Ordering::Acquire))
+}
+
+fn cancellation_requested(interrupt: bool, terminate: bool) -> bool { interrupt || terminate }
+
+// A broken diagnostic sink must not unwind past retained worker ownership.
+macro_rules! lifecycle_diagnostic {
+    ($($arg:tt)*) => {{
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr().lock(), $($arg)*);
+        }));
+    }};
+}
+
 struct TaskTool {
     parent_state: std::sync::RwLock<Option<Arc<HarnessState>>>,
+    stop: actor::Cancellation,
 }
 
 impl TaskTool {
     fn new() -> Self {
-        Self { parent_state: std::sync::RwLock::new(None) }
+        Self { parent_state: std::sync::RwLock::new(None), stop: actor::Cancellation::default() }
     }
     fn set_state(&self, state: Arc<HarnessState>) {
-        *self.parent_state.write().unwrap() = Some(state);
+        *self.parent_state.write().unwrap_or_else(|e| e.into_inner()) = Some(state);
+    }
+
+    fn request_stop(&self) { self.stop.request(); }
+
+    /// Call after Session retirement: no tool call can acquire a new parent.
+    fn clear_state(&self) {
+        *self.parent_state.write().unwrap_or_else(|e| e.into_inner()) = None;
     }
 }
 
@@ -643,13 +679,30 @@ impl Tool for TaskTool {
         let parent = self
             .parent_state
             .read()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .clone()
             .ok_or_else(|| harness::ToolError("task tool: parent state not bound".into()))?;
-        let handle = subagent::spawn_task(parent, prompt, role);
-        match handle.join() {
-            Ok(pr) => Ok(pr.text),
-            Err(e) => Err(harness::ToolError(format!("subagent: {e:?}"))),
+        if self.stop.is_requested() || run_cancelled() {
+            return Err(harness::ToolError("task cancelled before admission".into()));
+        }
+        let mut handle = subagent::try_spawn_task(parent, prompt, role)
+            .map_err(|error| harness::ToolError(format!("subagent startup: {error}")))?;
+        loop {
+            if self.stop.is_requested() || run_cancelled() {
+                handle.request_stop();
+            }
+            match handle.try_join() {
+                actor::JoinPoll::Pending => std::thread::sleep(std::time::Duration::from_millis(10)),
+                actor::JoinPoll::Joined(Ok(Ok(pr))) => {
+                    if self.stop.is_requested() || run_cancelled() {
+                        return Err(harness::ToolError("task cancelled".into()));
+                    }
+                    return Ok(pr.text);
+                }
+                actor::JoinPoll::Joined(Ok(Err(e))) => return Err(harness::ToolError(format!("subagent: {e:?}"))),
+                actor::JoinPoll::Joined(Err(_)) => return Err(harness::ToolError("subagent worker panicked".into())),
+                actor::JoinPoll::AlreadyJoined => return Err(harness::ToolError("subagent join already consumed".into())),
+            }
         }
     }
 }
@@ -788,7 +841,7 @@ fn run_cmd_with_output(mut args: Vec<String>, out: &mut dyn std::io::Write) -> E
         match args[i].as_str() {
             "--prompt-stdin" => {
                 if prompt_stdin {
-                    eprintln!("--prompt-stdin may be passed only once");
+                    lifecycle_diagnostic!("--prompt-stdin may be passed only once");
                     return ExitCode::from(2);
                 }
                 prompt_stdin = true;
@@ -809,7 +862,7 @@ fn run_cmd_with_output(mut args: Vec<String>, out: &mut dyn std::io::Write) -> E
                     if let Some((k, v)) = kv.split_once('=') {
                         skill_args.insert(k.to_string(), v.to_string());
                     } else {
-                        eprintln!("--arg expects KEY=VALUE, got: {kv}");
+                        lifecycle_diagnostic!("--arg expects KEY=VALUE, got: {kv}");
                         return ExitCode::from(2);
                     }
                 }
@@ -825,7 +878,7 @@ fn run_cmd_with_output(mut args: Vec<String>, out: &mut dyn std::io::Write) -> E
                 if i < args.len() {
                     run_id_flag = Some(args.remove(i));
                 } else {
-                    eprintln!("--run-id requires an ID argument");
+                    lifecycle_diagnostic!("--run-id requires an ID argument");
                     return ExitCode::from(2);
                 }
             }
@@ -839,7 +892,7 @@ fn run_cmd_with_output(mut args: Vec<String>, out: &mut dyn std::io::Write) -> E
                     mock = true;
                     mock_script_path = Some(PathBuf::from(args.remove(i)));
                 } else {
-                    eprintln!("--mock-script requires a PATH argument");
+                    lifecycle_diagnostic!("--mock-script requires a PATH argument");
                     return ExitCode::from(2);
                 }
             }
@@ -858,7 +911,7 @@ fn run_cmd_with_output(mut args: Vec<String>, out: &mut dyn std::io::Write) -> E
     ) {
         Ok(id) => id,
         Err(e) => {
-            eprintln!("{e}");
+            lifecycle_diagnostic!("{e}");
             return ExitCode::from(2);
         }
     };
@@ -866,13 +919,13 @@ fn run_cmd_with_output(mut args: Vec<String>, out: &mut dyn std::io::Write) -> E
     let strategy = match parse_strategy(strategy_spec.as_deref()) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("{e}");
+            lifecycle_diagnostic!("{e}");
             return ExitCode::from(2);
         }
     };
 
     if prompt_stdin && (saw_skill_flag || saw_skill_arg || !args.is_empty()) {
-        eprintln!("--prompt-stdin cannot be combined with <prompt>, --skill, or --arg");
+        lifecycle_diagnostic!("--prompt-stdin cannot be combined with <prompt>, --skill, or --arg");
         return ExitCode::from(2);
     }
     let positional_prompt = args.join(" ");
@@ -880,7 +933,7 @@ fn run_cmd_with_output(mut args: Vec<String>, out: &mut dyn std::io::Write) -> E
         match read_prompt_stdin(std::io::stdin().lock()) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("{e}");
+                lifecycle_diagnostic!("{e}");
                 return ExitCode::from(2);
             }
         }
@@ -888,7 +941,7 @@ fn run_cmd_with_output(mut args: Vec<String>, out: &mut dyn std::io::Write) -> E
         match render_skill(name, &skill_args) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("skill {name}: {e}");
+                lifecycle_diagnostic!("skill {name}: {e}");
                 return ExitCode::from(2);
             }
         }
@@ -904,7 +957,7 @@ fn run_cmd_with_output(mut args: Vec<String>, out: &mut dyn std::io::Write) -> E
         Some(dir) => match std::env::current_dir() {
             Ok(cwd) => Some(anchor_runlog_dir(&cwd, dir)),
             Err(e) => {
-                eprintln!("runlog: cannot determine caller cwd: {e}");
+                lifecycle_diagnostic!("runlog: cannot determine caller cwd: {e}");
                 return ExitCode::from(1);
             }
         },
@@ -913,7 +966,7 @@ fn run_cmd_with_output(mut args: Vec<String>, out: &mut dyn std::io::Write) -> E
     let runlog_handle = match open_runlog(anchored_runlog_dir.as_ref(), &run_id) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("{e}");
+            lifecycle_diagnostic!("{e}");
             return ExitCode::from(1);
         }
     };
@@ -927,14 +980,14 @@ fn run_cmd_with_output(mut args: Vec<String>, out: &mut dyn std::io::Write) -> E
             Some(p) => match load_mock_script(p) {
                 Ok(turns) => MockModel::new(turns),
                 Err(e) => {
-                    eprintln!("{e}");
+                    lifecycle_diagnostic!("{e}");
                     return ExitCode::from(2);
                 }
             },
             None => match build_mock_canned(&prompt) {
                 Ok(mm) => mm,
                 Err(e) => {
-                    eprintln!("{e}");
+                    lifecycle_diagnostic!("{e}");
                     return ExitCode::from(2);
                 }
             },
@@ -950,221 +1003,366 @@ fn run_cmd_with_output(mut args: Vec<String>, out: &mut dyn std::io::Write) -> E
         }
     };
 
-    let (mcp_clients, mcp_tools) = match connect_mcp(&common.mcp_specs) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("{e}");
+    // Own the native registry before any MCP or shell child can be admitted.
+    let owner_registry = match run_owner_registry() {
+        Ok(registry) => registry,
+        Err(error) => {
+            lifecycle_diagnostic!("native owner registry: {error}");
             return ExitCode::from(1);
         }
     };
-    let store = match open_store(common.sessions_dir.as_ref()) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("{e}");
-            return ExitCode::from(1);
-        }
-    };
-
-    // If a branch strategy was given, prepare the workspace and constrain
-    // fstools + vshell to it. Caller's cwd is moved to the workspace path
-    // for the duration of the run.
-    let (workspace, strategy) = match strategy {
-        Some(s) => {
-            let repo_root = match std::env::current_dir() {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("cwd: {e}");
-                    return ExitCode::from(1);
-                }
-            };
-            match s.prepare(&repo_root) {
-                Ok(ws) => {
-                    if let Err(e) = std::env::set_current_dir(&ws.path) {
-                        eprintln!("cd {ws_path:?}: {e}", ws_path = ws.path);
-                        return ExitCode::from(1);
-                    }
-                    (Some(ws), Some(s))
-                }
-                Err(e) => {
-                    eprintln!("branch strategy prepare: {e:?}");
-                    return ExitCode::from(1);
-                }
-            }
-        }
-        None => (None, None),
-    };
-
-    let fstools_root = workspace.as_ref().map(|w| w.path.clone());
-    let mut tools = default_tools(fstools_root);
-    tools.extend(mcp_tools);
-
-    // Optional `task` tool — the LLM can spawn subagents at will.
-    let task_tool = if common.enable_task_tool {
-        let t = Arc::new(TaskTool::new());
-        tools.push(t.clone() as Arc<dyn Tool>);
-        Some(t)
-    } else {
-        None
-    };
-
-    let sandbox: Box<dyn Sandbox> = Box::new(AuditedShell::new(vshell::VShell::new()));
-    let inst = spawn(Instance::new("cli", sandbox));
-    let metrics_client = Arc::new(
-        metrics::Client::resolve(common.metrics_addr.as_deref())
-            .with_tag("provider", if common.openai { "openai" } else { "anthropic" }),
-    );
-    let mut state_build = HarnessState::new("default", model.clone(), inst.addr.clone())
-        .with_tools(tools)
-        .with_metrics(metrics_client);
-    if let Some(budget) = common.compact_budget {
-        let compactor = compact::Compactor::new(model.clone(), budget);
-        let cb: Arc<harness::CompactFn> =
-            Arc::new(move |msgs| compactor.maybe_compact(msgs.clone()).unwrap_or(msgs));
-        state_build = state_build.with_compactor(cb);
-    }
-    let state = Arc::new(state_build);
-    if let Some(tt) = &task_tool {
-        tt.set_state(state.clone());
-    }
-    let mut sess_build = Session::new("default", state.clone());
-    if let Some(s) = store {
-        sess_build = sess_build.with_store(s);
-    }
-    let sess = spawn(sess_build);
-
-    // Use streaming so text deltas print to stdout as the model generates them.
-    let (tx, rx) = std::sync::mpsc::sync_channel::<harness::StreamEvent>(256);
-    let (audit_ack_tx, audit_ack_rx) = std::sync::mpsc::channel::<()>();
-    let stream_msg = if runlog_handle.is_some() {
-        SessionMsg::PromptStreamAudited {
-            text: prompt,
-            structured_output_tag: None,
-            events: tx,
-            ack: audit_ack_rx,
-        }
-    } else {
-        SessionMsg::PromptStream { text: prompt, structured_output_tag: None, events: tx }
-    };
-    if let Err(e) = sess.addr.send(stream_msg) {
-        eprintln!("send failed: {e}");
-        drop(mcp_clients);
-        if let (Some(s), Some(ws)) = (strategy, workspace) {
-            let _ = s.finish(ws, AgentStatus::Failure(e.to_string()));
-        }
-        return ExitCode::from(1);
-    }
-
-    use std::io::Write as _;
-    let mut completed = false;
-    let mut turns = 0usize;
-    let mut last_was_newline = true;
-    let (exit, agent_status) = loop {
-        // SIGINT? Drop the receiver to signal cancellation to the session.
-        if CANCEL.load(Ordering::SeqCst) {
-            drop(rx);
-            eprintln!("[cancelling on SIGINT]");
-            break (ExitCode::from(130), AgentStatus::Failure("cancelled by signal".into()));
-        }
-        let ev = match rx.recv() {
-            Ok(ev) => ev,
-            Err(_) => {
-                eprintln!("session dropped event channel");
-                break (
-                    ExitCode::from(1),
-                    AgentStatus::Failure("session dropped event channel".into()),
-                );
+    let exit = 'owned_run: {
+        let (mcp_clients, mcp_tools) = match connect_mcp(&common.mcp_specs, owner_registry.as_ref()) {
+            Ok(t) => t,
+            Err(e) => {
+                lifecycle_diagnostic!("{e}");
+                break 'owned_run ExitCode::from(1);
             }
         };
-        // Commit each event before presenting it. An audit write failure
-        // cancels further processing instead of silently dropping records.
-        if let Some(log) = &runlog_handle
-            && let Err(e) = log.record_event(&ev)
-        {
-            eprintln!("runlog: record failed: {e}");
-            drop(rx);
-            break (ExitCode::from(1), AgentStatus::Failure(format!("runlog: {e}")));
-        }
-        match ev {
-            harness::StreamEvent::TextDelta(s) => {
-                last_was_newline = s.ends_with('\n');
-                if let Err(e) = out.write_all(s.as_bytes()).and_then(|_| out.flush()) {
-                    eprintln!("stdout: {e}");
-                    drop(rx);
-                    break (ExitCode::from(1), AgentStatus::Failure(format!("stdout: {e}")));
-                }
+        let store = match open_store(common.sessions_dir.as_ref()) {
+            Ok(s) => s,
+            Err(e) => {
+                lifecycle_diagnostic!("{e}");
+                break 'owned_run ExitCode::from(1);
             }
-            harness::StreamEvent::ToolUseStart { name, .. } => {
-                if !last_was_newline {
-                    if let Err(e) = write_newline(out) {
-                        eprintln!("stdout: {e}");
-                        drop(rx);
-                        break (ExitCode::from(1), AgentStatus::Failure(format!("stdout: {e}")));
-                    }
-                }
-                eprintln!("[tool: {name}]");
-                last_was_newline = true;
-            }
-            harness::StreamEvent::ToolResult { is_error, .. } => {
-                if is_error {
-                    eprintln!("[tool error]");
-                }
-            }
-            harness::StreamEvent::TurnComplete { turn, .. } => {
-                turns = turn;
-            }
-            harness::StreamEvent::Done(pr) => {
-                if !last_was_newline {
-                    if let Err(e) = write_newline(out) {
-                        eprintln!("stdout: {e}");
-                        drop(rx);
-                        break (ExitCode::from(1), AgentStatus::Failure(format!("stdout: {e}")));
-                    }
-                }
-                completed = pr.completed;
-                turns = pr.turns;
-                break (ExitCode::SUCCESS, AgentStatus::Success);
-            }
-            harness::StreamEvent::Cancelled => {
-                eprintln!("[cancelled]");
-                break (ExitCode::from(130), AgentStatus::Failure("cancelled".into()));
-            }
-            harness::StreamEvent::Error(e) => {
-                eprintln!("session error: {e:?}");
-                break (ExitCode::from(1), AgentStatus::Failure(format!("{e:?}")));
-            }
-            _ => {}
-        }
-        if runlog_handle.is_some() {
-            let _ = audit_ack_tx.send(());
-        }
-    };
-    if completed {
-        eprintln!("[completion signal fired after {turns} turn(s)]");
-    } else if turns > 1 {
-        eprintln!("[{turns} turn(s)]");
-    }
+        };
 
-    drop(audit_ack_tx); // unblock an audited producer after cancellation
-    let _ = sess.join();
-    // `state` (and the optional `task_tool`, which retains a parent-state
-    // clone) hold extra `ActorRef<InstanceMsg>` clones via
-    // `HarnessState::instance`. The instance actor only stops once
-    // every sender is dropped, so we must drop those handles BEFORE
-    // `inst.join()` — otherwise the join blocks forever. This surfaced
-    // as a hang under `--mock` (where the Session finishes before any
-    // other Arc holder); the real-provider path didn't hit it because
-    // the model call took long enough that other ordering hid the
-    // deadlock.
-    drop(task_tool);
-    drop(state);
-    let _ = inst.join();
-    drop(mcp_clients);
-    if let (Some(s), Some(ws)) = (strategy, workspace)
-        && let Err(e) = s.finish(ws, agent_status)
-    {
-        eprintln!("branch strategy finish: {e:?}");
-    }
+        // If a branch strategy was given, prepare the workspace and constrain
+        // fstools + vshell to it. Caller's cwd is moved to the workspace path
+        // for the duration of the run.
+        let (workspace, strategy) = match strategy {
+            Some(s) => {
+                let repo_root = match std::env::current_dir() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        lifecycle_diagnostic!("cwd: {e}");
+                        break 'owned_run ExitCode::from(1);
+                    }
+                };
+                match s.prepare(&repo_root) {
+                    Ok(ws) => {
+                        if let Err(e) = std::env::set_current_dir(&ws.path) {
+                            lifecycle_diagnostic!("cd {ws_path:?}: {e}", ws_path = ws.path);
+                            break 'owned_run ExitCode::from(1);
+                        }
+                        (Some(ws), Some(s))
+                    }
+                    Err(e) => {
+                        lifecycle_diagnostic!("branch strategy prepare: {e:?}");
+                        break 'owned_run ExitCode::from(1);
+                    }
+                }
+            }
+            None => (None, None),
+        };
+
+        let fstools_root = workspace.as_ref().map(|w| w.path.clone());
+        let mut tools = default_tools(fstools_root);
+        tools.extend(mcp_tools);
+
+        // Optional `task` tool — the LLM can spawn subagents at will.
+        let task_tool = if common.enable_task_tool {
+            let t = Arc::new(TaskTool::new());
+            tools.push(t.clone() as Arc<dyn Tool>);
+            Some(t)
+        } else {
+            None
+        };
+
+        let mut shell = vshell::VShell::new();
+        if let Some(registry) = &owner_registry { shell = shell.with_owner_registry(registry.clone()); }
+        let sandbox: Box<dyn Sandbox> = Box::new(AuditedShell::new(shell));
+        let inst = match actor::try_spawn(Instance::new("cli", sandbox)) {
+            Ok(instance) => instance,
+            Err(error) => { lifecycle_diagnostic!("instance startup: {error}"); break 'owned_run ExitCode::from(1); }
+        };
+        let metrics_client = Arc::new(
+            metrics::Client::resolve(common.metrics_addr.as_deref())
+                .with_tag("provider", if common.openai { "openai" } else { "anthropic" }),
+        );
+        let mut state_build = HarnessState::new("default", model.clone(), inst.addr.clone())
+            .with_tools(tools)
+            .with_metrics(metrics_client);
+        if let Some(budget) = common.compact_budget {
+            let compactor = compact::Compactor::new(model.clone(), budget);
+            let cb: Arc<harness::CompactFn> =
+                Arc::new(move |msgs| compactor.maybe_compact(msgs.clone()).unwrap_or(msgs));
+            state_build = state_build.with_compactor(cb);
+        }
+        let state = Arc::new(state_build);
+        if let Some(tt) = &task_tool {
+            tt.set_state(state.clone());
+        }
+        let mut sess_build = Session::new("default", state.clone());
+        if let Some(s) = store {
+            sess_build = sess_build.with_store(s);
+        }
+        let sess = match actor::try_spawn(sess_build) {
+            Ok(session) => session,
+            Err(error) => {
+                lifecycle_diagnostic!("session startup: {error}");
+                for client in &mcp_clients { client.request_stop(); }
+                if let Some(tool) = &task_tool { tool.request_stop(); tool.clear_state(); }
+                drop(state);
+                if let Err(error) = retire_startup_instance(inst, owner_registry.as_ref()) {
+                    lifecycle_diagnostic!("instance startup rollback: {error}");
+                }
+                break 'owned_run ExitCode::from(1);
+            }
+        };
+
+        // Use streaming so text deltas print to stdout as the model generates them.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<harness::StreamEvent>(256);
+        let (audit_ack_tx, audit_ack_rx) = std::sync::mpsc::channel::<()>();
+        let stream_msg = if runlog_handle.is_some() {
+            SessionMsg::PromptStreamAudited {
+                text: prompt,
+                structured_output_tag: None,
+                events: tx,
+                ack: audit_ack_rx,
+            }
+        } else {
+            SessionMsg::PromptStream { text: prompt, structured_output_tag: None, events: tx }
+        };
+        // A failed admission still reaches the common retirement barrier.
+        let send_error = sess.addr.send(stream_msg).err().map(|e| e.to_string());
+        use std::io::Write as _;
+        let mut completed = false;
+        let mut turns = 0usize;
+        let mut last_was_newline = true;
+        let mut pending_done: Option<harness::PromptResult> = None;
+        let (mut exit, mut agent_status) = loop {
+            if let Some(error) = &send_error {
+                break (ExitCode::from(1), AgentStatus::Failure(format!("send failed: {error}")));
+            }
+            if let Some(registry) = &owner_registry { let _ = registry.poll(); }
+            // SIGINT and SIGTERM are observed even while the event stream is idle.
+            if run_cancelled() {
+                lifecycle_diagnostic!("[cancelling on signal]");
+                break (ExitCode::from(130), AgentStatus::Failure("cancelled by signal".into()));
+            }
+            let ev = match rx.recv_timeout(std::time::Duration::from_millis(25)) {
+                Ok(ev) => ev,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    lifecycle_diagnostic!("session dropped event channel");
+                    break (
+                        ExitCode::from(1),
+                        AgentStatus::Failure("session dropped event channel".into()),
+                    );
+                }
+            };
+            // Commit each event before presenting it. An audit write failure
+            // cancels further processing instead of silently dropping records.
+            if !matches!(&ev, harness::StreamEvent::Done(_))
+                && let Some(log) = &runlog_handle
+                && let Err(e) = log.record_event(&ev)
+            {
+                lifecycle_diagnostic!("runlog: record failed: {e}");
+                break (ExitCode::from(1), AgentStatus::Failure(format!("runlog: {e}")));
+            }
+            match ev {
+                harness::StreamEvent::TextDelta(s) => {
+                    last_was_newline = s.ends_with('\n');
+                    if let Err(e) = out.write_all(s.as_bytes()).and_then(|_| out.flush()) {
+                        lifecycle_diagnostic!("stdout: {e}");
+                        break (ExitCode::from(1), AgentStatus::Failure(format!("stdout: {e}")));
+                    }
+                }
+                harness::StreamEvent::ToolUseStart { name, .. } => {
+                    if !last_was_newline {
+                        if let Err(e) = write_newline(out) {
+                            lifecycle_diagnostic!("stdout: {e}");
+                            break (ExitCode::from(1), AgentStatus::Failure(format!("stdout: {e}")));
+                        }
+                    }
+                    lifecycle_diagnostic!("[tool: {name}]");
+                    last_was_newline = true;
+                }
+                harness::StreamEvent::ToolResult { is_error, .. } => {
+                    if is_error {
+                        lifecycle_diagnostic!("[tool error]");
+                    }
+                }
+                harness::StreamEvent::TurnComplete { turn, .. } => {
+                    turns = turn;
+                }
+                harness::StreamEvent::Done(pr) => {
+                    if !last_was_newline {
+                        if let Err(e) = write_newline(out) {
+                            lifecycle_diagnostic!("stdout: {e}");
+                                        break (ExitCode::from(1), AgentStatus::Failure(format!("stdout: {e}")));
+                        }
+                    }
+                    completed = pr.completed;
+                    turns = pr.turns;
+                    pending_done = Some(pr);
+                    break (ExitCode::SUCCESS, AgentStatus::Success);
+                }
+                harness::StreamEvent::Cancelled => {
+                    lifecycle_diagnostic!("[cancelled]");
+                    break (ExitCode::from(130), AgentStatus::Failure("cancelled".into()));
+                }
+                harness::StreamEvent::Error(e) => {
+                    lifecycle_diagnostic!("session error: {e:?}");
+                    break (ExitCode::from(1), AgentStatus::Failure(format!("{e:?}")));
+                }
+                _ => {}
+            }
+            if runlog_handle.is_some() {
+                let _ = audit_ack_tx.send(());
+            }
+        };
+        // Stop/cancel endpoints before waiting, including failed initial send.
+        drop(rx);
+        drop(audit_ack_tx);
+        let session_cancel = sess.cancellation();
+        let instance_cancel = inst.cancellation();
+        if !matches!(&agent_status, AgentStatus::Success) {
+            session_cancel.request();
+            instance_cancel.request();
+            for client in &mcp_clients { client.request_stop(); }
+            if let Some(registry) = &owner_registry { registry.close_admission(); registry.cancel_all(); }
+            if let Some(tool) = &task_tool { tool.request_stop(); }
+        }
+        let mut observe_signal = || {
+            if let Some(registry) = &owner_registry { let _ = registry.poll(); }
+            if run_cancelled() {
+                session_cancel.request();
+                instance_cancel.request();
+                for client in &mcp_clients { client.request_stop(); }
+                if let Some(registry) = &owner_registry { registry.close_admission(); registry.cancel_all(); }
+                if let Some(tool) = &task_tool { tool.request_stop(); }
+            }
+        };
+        if let Err(error) = retire_actor(sess.into_retirement(), &mut observe_signal) {
+            exit = ExitCode::from(1);
+            agent_status = AgentStatus::Failure(format!("session retirement: {error}"));
+            instance_cancel.request();
+            for client in &mcp_clients { client.request_stop(); }
+            if let Some(registry) = &owner_registry { registry.close_admission(); registry.cancel_all(); }
+            if let Some(tool) = &task_tool { tool.request_stop(); }
+        }
+        // Every TaskTool call retains its child until join, so Session retirement
+        // also fences those calls. Break the explicit tools -> state -> tools cycle.
+        if let Some(tool) = &task_tool { tool.clear_state(); }
+        drop(state);
+        if let Err(error) = retire_actor(inst.into_retirement(), &mut observe_signal) {
+            exit = ExitCode::from(1);
+            agent_status = AgentStatus::Failure(format!("instance retirement: {error}"));
+        }
+        drop(observe_signal);
+        drop(task_tool);
+        for client in &mcp_clients { client.request_stop(); }
+        drop(mcp_clients);
+        retire_registry(owner_registry.as_ref());
+        if run_cancelled() {
+            exit = ExitCode::from(130);
+            agent_status = AgentStatus::Failure("cancelled by signal".into());
+        }
+        let mut successful = matches!(&agent_status, AgentStatus::Success);
+        if let (Some(s), Some(ws)) = (strategy, workspace)
+            && let Err(e) = s.finish(ws, agent_status)
+        {
+            lifecycle_diagnostic!("branch strategy finish: {e:?}");
+            successful = false;
+            exit = ExitCode::from(1);
+        }
+        if run_cancelled() {
+            successful = false;
+            exit = ExitCode::from(130);
+        }
+        // No successful terminal audit record before the actual worker barrier
+        // and strategy finalization. Native registry retirement is checked above;
+        // its source API still requires independent integration/native admission.
+        if successful {
+            if let Err(error) = commit_done_after_retirement(runlog_handle.as_deref(), pending_done, Ok(())) {
+                lifecycle_diagnostic!("{error}");
+                successful = false;
+                exit = ExitCode::from(1);
+            }
+        }
+        if successful && completed {
+            lifecycle_diagnostic!("[completion signal fired after {turns} turn(s)]");
+        } else if turns > 1 {
+            lifecycle_diagnostic!("[{turns} turn(s)]");
+        }
+        exit
+    };
+    // Covers every setup failure after registry construction as well as the
+    // normal path. Returning Unknown must never drop the final owner Arc.
+    retire_registry(owner_registry.as_ref());
     exit
+}
+
+/// Roll back a partially started actor pair. Keep the actual Instance join and
+/// native registry authority until both barriers complete; never detach on error.
+fn retire_startup_instance<M: Send + 'static>(
+    instance: actor::Spawned<M>,
+    registry: Option<&Arc<vshell::ownership::OwnerRegistry>>,
+) -> Result<(), String> {
+    instance.request_stop();
+    if let Some(owner) = registry { owner.close_admission(); owner.cancel_all(); }
+    let result = retire_actor(instance.into_retirement(), || {
+        if let Some(owner) = registry { let _ = owner.poll(); }
+    });
+    retire_registry(registry);
+    result
+}
+
+/// Keep the owner during Pending. This intentionally waits for real retirement;
+/// cancellation cannot manufacture a deadline for a blocked provider callback.
+fn retire_actor(mut owner: actor::Retirement<()>, mut on_tick: impl FnMut()) -> Result<(), String> {
+    loop {
+        on_tick();
+        match owner.try_join() {
+            actor::JoinPoll::Pending => std::thread::sleep(std::time::Duration::from_millis(10)),
+            actor::JoinPoll::Joined(Ok(())) => return Ok(()),
+            actor::JoinPoll::Joined(Err(_)) => return Err("worker panicked".into()),
+            actor::JoinPoll::AlreadyJoined => return Err("join was already consumed".into()),
+        }
+    }
+}
+
+fn run_owner_registry() -> Result<Option<Arc<vshell::ownership::OwnerRegistry>>, String> {
+    #[cfg(target_os = "freebsd")]
+    {
+        let agent = std::env::current_exe().map_err(|error| error.to_string())?;
+        vshell::ownership::OwnerRegistry::new(agent).map(Some).map_err(|error| error.to_string())
+    }
+    #[cfg(not(target_os = "freebsd"))]
+    {
+        // Existing ordinary route remains available; no native-domain claim.
+        Ok(None)
+    }
+}
+
+fn retire_registry(registry: Option<&Arc<vshell::ownership::OwnerRegistry>>) {
+    let Some(registry) = registry else { return; };
+    registry.close_admission();
+    registry.cancel_all();
+    loop {
+        let state = registry.poll();
+        if state.active == 0 && state.unconfirmed == 0 { return; }
+        // Unconfirmed remains owned. No deadline converts it into success.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// A terminal record can only be attempted after the supplied retirement
+/// result succeeds. The caller must supply its actual complete owner barrier.
+fn commit_done_after_retirement(
+    log: Option<&runlog::RunLog>,
+    done: Option<harness::PromptResult>,
+    retired: Result<(), String>,
+) -> Result<(), String> {
+    retired?;
+    let done = done.ok_or_else(|| "session completed without Done".to_string())?;
+    if let Some(log) = log {
+        log.record_event(&harness::StreamEvent::Done(done))
+            .map_err(|error| format!("runlog: terminal record failed: {error}"))?;
+    }
+    Ok(())
 }
 
 fn parse_strategy(spec: Option<&str>) -> Result<Option<Box<dyn BranchStrategy>>, String> {
@@ -1215,7 +1413,7 @@ fn serve_cmd(mut args: Vec<String>) -> ExitCode {
         }
     }
     if !args.is_empty() {
-        eprintln!("unexpected args: {args:?}");
+        lifecycle_diagnostic!("unexpected args: {args:?}");
         return usage_and_exit(2);
     }
 
@@ -1227,18 +1425,23 @@ fn serve_cmd(mut args: Vec<String>) -> ExitCode {
         }
     };
 
-    let (mcp_clients, mcp_tools) = match connect_mcp(&common.mcp_specs) {
+    let owner_registry = match run_owner_registry() {
+        Ok(registry) => registry,
+        Err(error) => { lifecycle_diagnostic!("native owner registry: {error}"); return ExitCode::from(1); }
+    };
+    let exit = 'owned_serve: {
+    let (mcp_clients, mcp_tools) = match connect_mcp(&common.mcp_specs, owner_registry.as_ref()) {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("{e}");
-            return ExitCode::from(1);
+            lifecycle_diagnostic!("{e}");
+            break 'owned_serve ExitCode::from(1);
         }
     };
     let store = match open_store(common.sessions_dir.as_ref()) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("{e}");
-            return ExitCode::from(1);
+            lifecycle_diagnostic!("{e}");
+            break 'owned_serve ExitCode::from(1);
         }
     };
 
@@ -1265,42 +1468,58 @@ fn serve_cmd(mut args: Vec<String>) -> ExitCode {
         }),
     );
 
-    eprintln!("serving on {addr}");
+    lifecycle_diagnostic!("serving on {addr}");
     // Bind first so binding errors don't get mixed up with shutdown state.
     let listener = match std::net::TcpListener::bind(&addr) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("bind {addr}: {e}");
+            lifecycle_diagnostic!("bind {addr}: {e}");
             drop(mcp_clients);
-            return ExitCode::from(1);
+            break 'owned_serve ExitCode::from(1);
         }
     };
-    // Bridge the process-wide SHUTDOWN flag (set by SIGTERM) into the
-    // server's typed Arc<AtomicBool>. The poll thread is cheap (one
-    // 50ms tick) and exits when the server returns.
+    // Keep persistent MCP owners separate from each request's shell registry.
+    let mcp_clients = Arc::new(mcp_clients);
     let shutdown = Arc::new(AtomicBool::new(false));
-    let shutdown_clone = shutdown.clone();
-    let bridge = std::thread::spawn(move || {
-        while !shutdown_clone.load(Ordering::Acquire) {
-            if SHUTDOWN.load(Ordering::Acquire) {
-                shutdown_clone.store(true, Ordering::Release);
-                return;
+    let bridge_shutdown = shutdown.clone();
+    let bridge_clients = mcp_clients.clone();
+    let bridge_registry = owner_registry.clone();
+    let bridge = match std::thread::Builder::new().spawn(move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            while !bridge_shutdown.load(Ordering::Acquire) && !run_cancelled() {
+                if let Some(registry) = &bridge_registry { let _ = registry.poll(); }
+                std::thread::sleep(std::time::Duration::from_millis(25));
             }
-            std::thread::sleep(std::time::Duration::from_millis(50));
+        }));
+        // Server errors also publish shutdown before its worker join barrier.
+        bridge_shutdown.store(true, Ordering::Release);
+        SHUTDOWN.store(true, Ordering::Release);
+        for client in bridge_clients.iter() { client.request_stop(); }
+        if let Some(registry) = &bridge_registry { registry.close_admission(); registry.cancel_all(); }
+        if let Err(payload) = result { std::panic::resume_unwind(payload); }
+    }) {
+        Ok(bridge) => bridge,
+        Err(error) => {
+            lifecycle_diagnostic!("server cancellation bridge: {error}");
+            break 'owned_serve ExitCode::from(1);
         }
+    };
+    let result = srv.serve_listener_with_shutdown(listener, ServerConfig::default(), shutdown.clone());
+    shutdown.store(true, Ordering::Release);
+    let bridge_result = retire_actor(actor::Retirement::new(bridge), || {
+        if let Some(registry) = &owner_registry { let _ = registry.poll(); }
     });
-    let result =
-        srv.serve_listener_with_shutdown(listener, ServerConfig::default(), shutdown.clone());
-    shutdown.store(true, Ordering::Release); // stop the bridge thread
-    let _ = bridge.join();
+    for client in mcp_clients.iter() { client.request_stop(); }
     drop(mcp_clients);
-    match result {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("serve failed: {e}");
-            ExitCode::from(1)
-        }
+    retire_registry(owner_registry.as_ref());
+    match (result, bridge_result) {
+        (Ok(()), Ok(())) => ExitCode::SUCCESS,
+        (Err(error), _) => { lifecycle_diagnostic!("serve failed: {error}"); ExitCode::from(1) }
+        (_, Err(error)) => { lifecycle_diagnostic!("server cancellation bridge: {error}"); ExitCode::from(1) }
     }
+    };
+    retire_registry(owner_registry.as_ref());
+    exit
 }
 
 /// One `ChatHandler` per server; one fresh Instance + Session per request.
@@ -1325,42 +1544,66 @@ impl ChatHandler {
         runlog: Option<Arc<runlog::RunLog>>,
         sink: &mut EventSink,
     ) -> Result<(), HandlerError> {
-        sink.emit(Some("start"), id).map_err(|e| HandlerError(format!("SSE start: {e}")))?;
-
-        let sandbox: Box<dyn Sandbox> = Box::new(AuditedShell::new(vshell::VShell::new()));
-        let inst = spawn(Instance::new(id, sandbox));
+        sink.emit(Some("start"), id).map_err(|error| HandlerError(format!("SSE start: {error}")))?;
+        // Request-local shell owners are separate from persistent server MCP
+        // owners; ending one request must not kill another request's clients.
+        let registry = run_owner_registry().map_err(HandlerError)?;
+        let mut shell = vshell::VShell::new();
+        if let Some(registry) = &registry { shell = shell.with_owner_registry(registry.clone()); }
+        let sandbox: Box<dyn Sandbox> = Box::new(AuditedShell::new(shell));
+        let inst = match actor::try_spawn(Instance::new(id, sandbox)) {
+            Ok(instance) => instance,
+            Err(error) => {
+                retire_registry(registry.as_ref());
+                return Err(HandlerError(format!("instance startup: {error}")));
+            }
+        };
         let state = HarnessState::new("chat", self.model.clone(), inst.addr.clone())
             .with_tools((*self.tools).clone())
             .with_metrics(self.metrics.clone());
         let mut sess_build = Session::new(id, Arc::new(state));
-        if let Some(s) = &self.store {
-            sess_build = sess_build.with_store(s.clone());
-        }
-        let sess = spawn(sess_build);
-
-        // Streaming: forward each Session StreamEvent to the SSE client as
-        // it arrives. Client-disconnect (sink.emit fails) propagates to the
-        // session as a closed receiver, which triggers in-loop cancellation.
+        if let Some(store) = &self.store { sess_build = sess_build.with_store(store.clone()); }
+        let sess = match actor::try_spawn(sess_build) {
+            Ok(session) => session,
+            Err(error) => {
+                let rollback = retire_startup_instance(inst, registry.as_ref());
+                return Err(HandlerError(format!("session startup: {error}; instance rollback: {rollback:?}")));
+            }
+        };
         let (tx, rx) = std::sync::mpsc::sync_channel::<harness::StreamEvent>(256);
         let (audit_ack_tx, audit_ack_rx) = std::sync::mpsc::channel::<()>();
         let stream_msg = if runlog.is_some() {
             SessionMsg::PromptStreamAudited {
-                text: prompt,
-                structured_output_tag: None,
-                events: tx,
-                ack: audit_ack_rx,
+                text: prompt, structured_output_tag: None, events: tx, ack: audit_ack_rx,
             }
         } else {
             SessionMsg::PromptStream { text: prompt, structured_output_tag: None, events: tx }
         };
-        sess.addr.send(stream_msg).map_err(|e| HandlerError(format!("session send: {e}")))?;
-
-        let mut final_err: Option<HandlerError> = None;
-        for ev in rx.iter() {
+        let mut final_err = sess.addr.send(stream_msg).err()
+            .map(|error| HandlerError(format!("session send: {error}")));
+        let mut pending_done = None;
+        while final_err.is_none() {
+            if let Some(registry) = &registry { let _ = registry.poll(); }
+            if run_cancelled() {
+                final_err = Some(HandlerError("server shutdown cancelled request".into()));
+                break;
+            }
+            let ev = match rx.recv_timeout(std::time::Duration::from_millis(25)) {
+                Ok(event) => event,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    final_err = Some(HandlerError("session closed without Done".into()));
+                    break;
+                }
+            };
+            if let harness::StreamEvent::Done(done) = ev {
+                pending_done = Some(done);
+                break;
+            }
             if let Some(log) = &runlog
-                && let Err(e) = log.record_event(&ev)
+                && let Err(error) = log.record_event(&ev)
             {
-                final_err = Some(HandlerError(format!("runlog: {e}")));
+                final_err = Some(HandlerError(format!("runlog: {error}")));
                 break;
             }
             let write_result = match &ev {
@@ -1379,37 +1622,59 @@ impl ChatHandler {
                     Some("turn_complete"),
                     &format!("{}\t{}", turn, stop_reason.as_deref().unwrap_or("")),
                 ),
-                harness::StreamEvent::Done(pr) => sink
-                    .emit(Some("done"), &format!("turns={}\tcompleted={}", pr.turns, pr.completed)),
-                harness::StreamEvent::Cancelled => sink.emit(Some("cancelled"), ""),
+                harness::StreamEvent::Done(_) => unreachable!("Done is held for retirement"),
+                harness::StreamEvent::Cancelled => {
+                    final_err = Some(HandlerError("session cancelled".into()));
+                    sink.emit(Some("cancelled"), "")
+                },
                 harness::StreamEvent::Error(e) => {
                     final_err = Some(HandlerError(format!("{e:?}")));
                     Ok(())
                 }
             };
-            if let Err(e) = write_result {
-                // No ACK after a failed local SSE write. Dropping the ACK
-                // sender below cancels before the next tool dispatch.
-                final_err = Some(HandlerError(format!("SSE sink: {e}")));
+            if let Err(error) = write_result {
+                final_err = Some(HandlerError(format!("SSE sink: {error}")));
                 break;
             }
-            if runlog.is_some() {
-                let _ = audit_ack_tx.send(());
-            }
-            if matches!(&ev, harness::StreamEvent::Done(_) | harness::StreamEvent::Cancelled) {
-                break;
-            }
+            if final_err.is_some() { break; }
+            if runlog.is_some() { let _ = audit_ack_tx.send(()); }
         }
-
-        drop(rx); // signal cancellation to the still-running session if any
-        drop(audit_ack_tx); // release a producer awaiting failed audit write
-        let _ = sess.join();
-        let _ = inst.join();
-        match final_err {
-            Some(e) => Err(e),
-            None => Ok(()),
+        drop(rx);
+        drop(audit_ack_tx);
+        let session_cancel = sess.cancellation();
+        let instance_cancel = inst.cancellation();
+        if final_err.is_some() {
+            session_cancel.request();
+            instance_cancel.request();
+            if let Some(registry) = &registry { registry.close_admission(); registry.cancel_all(); }
         }
+        let mut tick = || {
+            if run_cancelled() {
+                session_cancel.request();
+                instance_cancel.request();
+                if let Some(registry) = &registry { registry.close_admission(); registry.cancel_all(); }
+            }
+            if let Some(registry) = &registry { let _ = registry.poll(); }
+        };
+        if let Err(error) = retire_actor(sess.into_retirement(), &mut tick) {
+            final_err = Some(HandlerError(format!("session retirement: {error}")));
+            instance_cancel.request();
+            if let Some(registry) = &registry { registry.close_admission(); registry.cancel_all(); }
+        }
+        if let Err(error) = retire_actor(inst.into_retirement(), &mut tick) {
+            final_err = Some(HandlerError(format!("instance retirement: {error}")));
+        }
+        retire_registry(registry.as_ref());
+        if run_cancelled() { final_err = Some(HandlerError("server shutdown cancelled request".into())); }
+        if let Some(error) = final_err { return Err(error); }
+        let done = pending_done.ok_or_else(|| HandlerError("session completed without Done".into()))?;
+        // Preserve audit-before-presentation. SSE delivery can still fail after
+        // a durable model-completion record; that delivery error is returned.
+        commit_done_after_retirement(runlog.as_deref(), Some(done.clone()), Ok(())).map_err(HandlerError)?;
+        sink.emit(Some("done"), &format!("turns={}\tcompleted={}", done.turns, done.completed))
+            .map_err(|error| HandlerError(format!("SSE done: {error}")))
     }
+
 }
 
 impl AgentHandler for ChatHandler {
@@ -1470,45 +1735,69 @@ fn unix_ms_now() -> u128 {
 /// call our tool registry (bash + read/write/edit + audit). Useful for
 /// chaining agents: parent agent A connects to child agent B's mcp server.
 fn mcp_serve_cmd(mut args: Vec<String>) -> ExitCode {
-    if wants_help(&args) {
-        print_mcp_serve_help();
-        return ExitCode::SUCCESS;
-    }
+    if wants_help(&args) { print_mcp_serve_help(); return ExitCode::SUCCESS; }
     let common = parse_common(&mut args);
-    if !args.is_empty() {
-        eprintln!("unexpected args: {args:?}");
-        return usage_and_exit(2);
-    }
-
-    let (mcp_clients, mcp_tools) = match connect_mcp(&common.mcp_specs) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("{e}");
-            return ExitCode::from(1);
-        }
+    if !args.is_empty() { eprintln!("unexpected args: {args:?}"); return usage_and_exit(2); }
+    let registry = match run_owner_registry() {
+        Ok(value) => value,
+        Err(error) => { lifecycle_diagnostic!("owner registry: {error}"); return ExitCode::from(1); }
     };
-    let mut tools = default_tools(None);
-    tools.extend(mcp_tools);
-
-    let sandbox: Box<dyn Sandbox> = Box::new(AuditedShell::new(vshell::VShell::new()));
-    let inst = spawn(Instance::new("mcp-serve", sandbox));
-
-    let mut srv = mcp::server::Server::new("moth", env!("CARGO_PKG_VERSION"), inst.addr.clone());
-    for t in tools {
-        srv.register(t);
-    }
-
-    eprintln!("mcp server: stdio (waiting for handshake)");
-    let result = srv.serve_stdio();
-    drop(mcp_clients);
-    let _ = inst.join();
-    match result {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("mcp serve: {e:?}");
-            ExitCode::from(1)
+    let outcome = 'owned_mcp: {
+        let (clients, extra_tools) = match connect_mcp(&common.mcp_specs, registry.as_ref()) {
+            Ok(value) => value,
+            Err(error) => { lifecycle_diagnostic!("{error}"); break 'owned_mcp ExitCode::from(1); }
+        };
+        let mut tools = default_tools(None);
+        tools.extend(extra_tools);
+        let mut shell = vshell::VShell::new();
+        if let Some(owner) = &registry { shell = shell.with_owner_registry(owner.clone()); }
+        let inst = match actor::try_spawn(Instance::new("mcp-serve", Box::new(AuditedShell::new(shell)))) {
+            Ok(instance) => instance,
+            Err(error) => { lifecycle_diagnostic!("MCP instance startup: {error}"); break 'owned_mcp ExitCode::from(1); }
+        };
+        let stop = inst.cancellation();
+        let mut srv = mcp::server::Server::new("moth", env!("CARGO_PKG_VERSION"), inst.addr.clone());
+        for tool in tools { srv.register(tool); }
+        lifecycle_diagnostic!("mcp server: stdio (waiting for handshake)");
+        // The worker owns every server-held address. Its actual join precedes Instance join.
+        // Cancellation cannot interrupt a blocked stdin/provider operation: retain Pending.
+        let worker = std::thread::Builder::new().name("moth-mcp-stdio".into()).spawn(move || srv.serve_stdio());
+        let mut failed = false;
+        match worker {
+            Ok(worker) => {
+                let mut worker = actor::Retirement::new(worker);
+                loop {
+                    if let Some(owner) = &registry { let _ = owner.poll(); }
+                    if run_cancelled() {
+                        failed = true;
+                        stop.request();
+                        for client in &clients { client.request_stop(); }
+                        if let Some(owner) = &registry { owner.close_admission(); owner.cancel_all(); }
+                    }
+                    match worker.try_join() {
+                        actor::JoinPoll::Pending => std::thread::sleep(std::time::Duration::from_millis(10)),
+                        actor::JoinPoll::Joined(Ok(Ok(()))) => break,
+                        actor::JoinPoll::Joined(Ok(Err(error))) => { lifecycle_diagnostic!("mcp serve: {error:?}"); failed = true; break; }
+                        actor::JoinPoll::Joined(Err(_)) | actor::JoinPoll::AlreadyJoined => { lifecycle_diagnostic!("mcp server worker failed"); failed = true; break; }
+                    }
+                }
+            }
+            Err(error) => { lifecycle_diagnostic!("mcp server worker: {error}"); failed = true; }
         }
-    }
+        if failed { stop.request(); }
+        for client in &clients { client.request_stop(); }
+        // Server was dropped by its joined worker (or failed spawn closure), breaking its
+        // Instance address ownership before consuming the remaining actor owner.
+        if let Err(error) = retire_actor(inst.into_retirement(), || {
+            if let Some(owner) = &registry { let _ = owner.poll(); }
+            if run_cancelled() { stop.request(); }
+        }) { lifecycle_diagnostic!("mcp instance: {error}"); failed = true; }
+        drop(clients);
+        retire_registry(registry.as_ref());
+        if failed || run_cancelled() { ExitCode::from(1) } else { ExitCode::SUCCESS }
+    };
+    retire_registry(registry.as_ref());
+    outcome
 }
 
 #[cfg(test)]
@@ -1929,4 +2218,100 @@ mod run_id_tests {
         drop(log);
         std::fs::remove_dir_all(dir).unwrap();
     }
+}
+
+#[cfg(test)]
+mod lifetime_completion_tests {
+    use super::*;
+
+    #[test]
+    fn clearing_task_tool_state_breaks_instance_reference_cycle() {
+        let instance = spawn(Instance::new("cycle", Box::new(harness::MockSandbox::new(vec![]))));
+        let task = Arc::new(TaskTool::new());
+        let state = Arc::new(HarnessState::new(
+            "cycle", Arc::new(MockModel::new(vec![])), instance.addr.clone(),
+        ).with_tools(vec![task.clone() as Arc<dyn Tool>]));
+        let weak = Arc::downgrade(&state);
+        task.set_state(state.clone());
+        drop(state);
+        assert!(weak.upgrade().is_some(), "fixture must contain the real strong cycle");
+        task.clear_state();
+        assert!(weak.upgrade().is_none(), "parent state must be released before Instance join");
+        drop(task);
+        retire_actor(instance.into_retirement(), || {}).unwrap();
+    }
+
+    #[test]
+    fn actual_actor_retirement_failure_withholds_done_record() {
+        struct StopsBadly;
+        impl actor::Actor for StopsBadly {
+            type Msg = ();
+            fn handle(&mut self, _: ()) {}
+            fn stopped(&mut self) { panic!("synthetic retirement failure"); }
+        }
+        static SEQUENCE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!("moth-terminal-retirement-{}-{}-{}",
+            std::process::id(), unix_ms_now(), SEQUENCE.fetch_add(1, Ordering::SeqCst)));
+        std::fs::create_dir(&dir).unwrap();
+        let log = runlog::RunLog::open(&dir, "retirement-failure").unwrap();
+        let result = retire_actor(spawn(StopsBadly).into_retirement(), || {});
+        assert!(result.is_err());
+        let done = harness::PromptResult { text: "synthetic".into(), structured: None, completed: true, turns: 1 };
+        assert!(commit_done_after_retirement(Some(&log), Some(done), result).is_err());
+        drop(log);
+        let text = std::fs::read_to_string(dir.join("retirement-failure.jsonl")).unwrap();
+        assert!(!text.lines().any(|line| line.contains(r#""kind":"done""#)));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn either_signal_requests_run_cancellation() {
+        assert!(!cancellation_requested(false, false));
+        assert!(cancellation_requested(true, false));
+        assert!(cancellation_requested(false, true));
+        assert!(cancellation_requested(true, true));
+    }
+
+    #[test]
+    fn dropping_mcp_server_releases_its_instance_address() {
+        let instance = spawn(Instance::new("mcp-retirement", Box::new(harness::MockSandbox::new(vec![]))));
+        let server = mcp::server::Server::new("test", "0", instance.addr.clone());
+        let mut owner = instance.into_retirement();
+        assert!(matches!(owner.try_join(), actor::JoinPoll::Pending));
+        drop(server);
+        retire_actor(owner, || {}).unwrap();
+    }
+    #[test]
+    fn partial_startup_rollback_retains_inflight_actor_and_revokes_held_address() {
+        struct Gated {
+            entered: std::sync::mpsc::SyncSender<()>,
+            release: std::sync::mpsc::Receiver<()>,
+            stopped: Arc<AtomicBool>,
+        }
+        impl actor::Actor for Gated {
+            type Msg = ();
+            fn handle(&mut self, _: ()) { self.entered.send(()).unwrap(); self.release.recv().unwrap(); }
+            fn stopped(&mut self) { self.stopped.store(true, Ordering::Release); }
+        }
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let stopped = Arc::new(AtomicBool::new(false));
+        let instance = actor::try_spawn(Gated { entered: entered_tx, release: release_rx, stopped: stopped.clone() }).unwrap();
+        let held = instance.addr.clone();
+        instance.addr.send(()).unwrap();
+        entered_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        let (barrier_tx, barrier_rx) = std::sync::mpsc::sync_channel(1);
+        let rollback = std::thread::spawn(move || {
+            barrier_tx.send(()).unwrap();
+            retire_startup_instance(instance, None)
+        });
+        barrier_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        assert!(!rollback.is_finished());
+        assert!(!stopped.load(Ordering::Acquire));
+        release_tx.send(()).unwrap();
+        rollback.join().unwrap().unwrap();
+        assert!(stopped.load(Ordering::Acquire));
+        assert!(held.send(()).is_err(), "kept sender cannot keep a rolled-back actor alive");
+    }
+
 }

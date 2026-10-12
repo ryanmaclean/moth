@@ -17,7 +17,9 @@
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, SyncSender};
 
-use actor::{Actor, ActorRef};
+use actor::{Actor, ActorRef, Cancellation};
+use std::sync::mpsc::{RecvTimeoutError, TrySendError};
+use std::time::Duration;
 use wire::find_tag;
 
 use crate::instance::InstanceMsg;
@@ -109,11 +111,12 @@ pub struct Session {
     /// rewrites `history` in place) must reset this to 0 — see the call to
     /// `mark_history_replaced` in `run_prompt_inner`.
     last_persisted_len: usize,
+    cancel: Cancellation,
 }
 
 impl Session {
     pub fn new(name: impl Into<String>, harness: Arc<HarnessState>) -> Self {
-        Self { name: name.into(), history: Vec::new(), harness, store: None, last_persisted_len: 0 }
+        Self { name: name.into(), history: Vec::new(), harness, store: None, last_persisted_len: 0, cancel: Cancellation::default() }
     }
 
     /// Attach a persistence store and load any previous history under
@@ -166,6 +169,8 @@ pub enum SessionError {
     Model(String),
     Mailbox,
     TurnLimitExceeded,
+    /// Cooperative cancellation; blocked provider/tool work is not interrupted.
+    Cancelled,
 }
 
 pub enum SessionMsg {
@@ -226,10 +231,17 @@ pub enum StreamEvent {
 impl Actor for Session {
     type Msg = SessionMsg;
 
+    fn set_cancellation(&mut self, cancel: Cancellation) { self.cancel = cancel; }
+
     fn handle(&mut self, msg: SessionMsg) {
         match msg {
             SessionMsg::Prompt { text, structured_output_tag, reply } => {
-                let _ = reply.send(self.run_prompt(text, structured_output_tag));
+                let result = self.run_prompt(text, structured_output_tag);
+                if self.cancel.is_requested() {
+                    let _ = reply.try_send(result);
+                } else {
+                    let _ = send_until_cancelled(&reply, result, &self.cancel);
+                }
             }
             SessionMsg::PromptStream { text, structured_output_tag, events } => {
                 let result =
@@ -237,11 +249,11 @@ impl Actor for Session {
                 // Best-effort terminal event. Cancellation already emitted
                 // its own terminal so we skip emitting Done after Cancelled.
                 if result.is_err() {
-                    let _ = events.send(StreamEvent::Error(result.err().unwrap()));
+                    let _ = send_until_cancelled(&events, StreamEvent::Error(result.err().unwrap()), &self.cancel);
                 } else if let Ok(Some(pr)) = result {
-                    let _ = events.send(StreamEvent::Done(pr));
+                    let _ = send_until_cancelled(&events, StreamEvent::Done(pr), &self.cancel);
                 }
-                // result == Ok(None) means the receiver dropped — Cancelled
+                // Ok(None) means receiver loss or explicit stop — Cancelled
                 // was already sent (or attempted). Nothing to do.
             }
             SessionMsg::PromptStreamAudited { text, structured_output_tag, events, ack } => {
@@ -251,9 +263,9 @@ impl Actor for Session {
                 // consumer still records and syncs them before reporting
                 // request success, but no further acknowledgement is needed.
                 if result.is_err() {
-                    let _ = events.send(StreamEvent::Error(result.err().unwrap()));
+                    let _ = send_until_cancelled(&events, StreamEvent::Error(result.err().unwrap()), &self.cancel);
                 } else if let Ok(Some(pr)) = result {
-                    let _ = events.send(StreamEvent::Done(pr));
+                    let _ = send_until_cancelled(&events, StreamEvent::Done(pr), &self.cancel);
                 }
             }
             SessionMsg::Shell { cmd, reply } => {
@@ -263,7 +275,7 @@ impl Actor for Session {
                     .send(InstanceMsg::Shell { cmd, reply: reply.clone() })
                     .is_err()
                 {
-                    let _ = reply.send(Err(SandboxError("instance mailbox closed".into())));
+                    let _ = send_until_cancelled(&reply, Err(SandboxError("instance mailbox closed".into())), &self.cancel);
                 }
             }
         }
@@ -278,15 +290,14 @@ impl Session {
     ) -> Result<PromptResult, SessionError> {
         match self.run_prompt_inner(text, structured_output_tag, None, None)? {
             Some(pr) => Ok(pr),
-            // events is None → cancellation impossible → always Some
-            None => unreachable!("non-streaming run can't be cancelled"),
+            None => Err(SessionError::Cancelled),
         }
     }
 
     /// Inner iteration loop shared by `run_prompt` (blocking) and
     /// `SessionMsg::PromptStream`. `Ok(Some(pr))` on completion;
-    /// `Ok(None)` if `events` is set and the receiver dropped (cancellation
-    /// — partial assistant turn is still appended to history). `Err(_)` for
+    /// Ok(None) on explicit stop or receiver loss (partial assistant history
+    /// is preserved at cancellation boundaries). Err(_) for
     /// real failures (model error, turn-limit, etc.).
     fn run_prompt_inner(
         &mut self,
@@ -295,6 +306,7 @@ impl Session {
         events: Option<&SyncSender<StreamEvent>>,
         audit_ack: Option<&Receiver<()>>,
     ) -> Result<Option<PromptResult>, SessionError> {
+        if self.cancel.is_requested() { return Ok(None); }
         self.history.push(ChatMessage::user(text));
 
         let mut response_text = String::new();
@@ -312,14 +324,36 @@ impl Session {
         // Audit callers acknowledge only after the event was recorded. This
         // serializes the producer with the audit sink before any tool call;
         // ordinary streams retain their existing asynchronous behavior.
+        let cancel = self.cancel.clone();
         let emit = |evs: Option<&SyncSender<StreamEvent>>, ev: StreamEvent| -> bool {
+            if cancel.is_requested() {
+                // Terminal notification is best effort and never blocks cleanup.
+                if matches!(&ev, StreamEvent::Cancelled) {
+                    if let Some(tx) = evs { let _ = tx.try_send(ev); }
+                }
+                return false;
+            }
             match evs {
-                Some(tx) => tx.send(ev).is_ok() && audit_ack.is_none_or(|ack| ack.recv().is_ok()),
+                Some(tx) => send_until_cancelled(tx, ev, &cancel)
+                    && audit_ack.is_none_or(|ack| loop {
+                        if cancel.is_requested() { break false; }
+                        match ack.recv_timeout(Duration::from_millis(10)) {
+                            Ok(()) => break !cancel.is_requested(),
+                            Err(RecvTimeoutError::Timeout) => continue,
+                            Err(RecvTimeoutError::Disconnected) => break false,
+                        }
+                    }),
                 None => true,
             }
         };
 
         loop {
+            if cancel.is_requested() {
+                self.persist_tail();
+                let _ = emit(events, StreamEvent::Cancelled);
+                outcome.set("cancelled");
+                return Ok(None);
+            }
             turns += 1;
             if turns > MAX_TURNS_PER_PROMPT {
                 outcome.set("turn_limit");
@@ -348,6 +382,12 @@ impl Session {
                 }
             }
 
+            if cancel.is_requested() {
+                self.persist_tail();
+                let _ = emit(events, StreamEvent::Cancelled);
+                outcome.set("cancelled");
+                return Ok(None);
+            }
             let req = ModelRequest {
                 system: self.harness.default_system.clone(),
                 messages: self.history.clone(),
@@ -361,7 +401,13 @@ impl Session {
             let mut stop_reason: Option<String> = None;
             let mut cancelled = false;
 
-            for ev in self.harness.model.stream(req) {
+            // stream() and next() remain provider-owned blocking operations.
+            // A stop suppresses subsequent calls; it cannot interrupt one in flight.
+            let mut stream = self.harness.model.stream(req);
+            for ev in std::iter::from_fn(|| {
+                if cancel.is_requested() { None } else { stream.next() }
+            }) {
+                if cancel.is_requested() { cancelled = true; break; }
                 match ev {
                     Ok(ModelEvent::TextDelta(s)) => {
                         current_text.push_str(&s);
@@ -451,7 +497,7 @@ impl Session {
 
             self.history.push(ChatMessage { role: Role::Assistant, content: blocks });
 
-            if cancelled {
+            if cancelled || cancel.is_requested() {
                 // Persist partial history then surface Cancelled to the caller.
                 self.persist_tail();
                 let _ = emit(events, StreamEvent::Cancelled);
@@ -477,6 +523,13 @@ impl Session {
 
             let mut results: Vec<ContentBlock> = Vec::with_capacity(tool_uses.len());
             for (id, name, input) in tool_uses {
+                if cancel.is_requested() {
+                    if !results.is_empty() { self.history.push(ChatMessage { role: Role::User, content: results }); }
+                    self.persist_tail();
+                    let _ = emit(events, StreamEvent::Cancelled);
+                    outcome.set("cancelled");
+                    return Ok(None);
+                }
                 let block = self.execute_tool(&id, &name, &input);
                 if let ContentBlock::ToolResult { tool_use_id, content, is_error } = &block
                     && !emit(
@@ -507,6 +560,11 @@ impl Session {
             .and_then(|tag| find_tag(response_text.as_bytes(), tag.as_bytes()).map(<[u8]>::to_vec));
 
         self.persist_tail();
+        if cancel.is_requested() {
+            let _ = emit(events, StreamEvent::Cancelled);
+            outcome.set("cancelled");
+            return Ok(None);
+        }
 
         // Successful exit. Turn count is reported separately as a histogram.
         metrics.histogram("agent.prompt.turns", turns as f64, &[]);
@@ -562,6 +620,22 @@ impl Session {
                     content: e.0.into(),
                     is_error: true,
                 }
+            }
+        }
+    }
+}
+
+/// Bounded channel capacity is preserved without an uninterruptible send.
+/// This only bounds cancellation observation between retries, not scheduling.
+fn send_until_cancelled<T>(tx: &SyncSender<T>, mut value: T, cancel: &Cancellation) -> bool {
+    loop {
+        if cancel.is_requested() { return false; }
+        match tx.try_send(value) {
+            Ok(()) => return true,
+            Err(TrySendError::Disconnected(_)) => return false,
+            Err(TrySendError::Full(returned)) => {
+                value = returned;
+                std::thread::sleep(Duration::from_millis(10));
             }
         }
     }
@@ -1400,5 +1474,52 @@ mod tests {
 
         sess.join().unwrap();
         inst.join().unwrap();
+    }
+
+    #[test]
+    fn stop_unblocks_audit_ack_without_starting_more_work() {
+        let (instance, session, _model, sandbox) = rig(
+            vec![vec![ModelEvent::TextDelta("first".into()), ModelEvent::TextDelta("second".into())]],
+            vec![],
+        );
+        let (events_tx, events_rx) = std::sync::mpsc::sync_channel(1);
+        let (_ack_tx, ack_rx) = std::sync::mpsc::sync_channel(1);
+        session.addr.send(SessionMsg::PromptStreamAudited {
+            text: "stop after first event".into(), structured_output_tag: None,
+            events: events_tx, ack: ack_rx,
+        }).unwrap();
+        assert!(matches!(events_rx.recv_timeout(Duration::from_secs(2)).unwrap(), StreamEvent::TextDelta(_)));
+        session.request_stop();
+        let mut retirement = session.into_retirement();
+        let until = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match retirement.try_join() {
+                actor::JoinPoll::Joined(result) => { result.unwrap(); break; }
+                actor::JoinPoll::Pending if std::time::Instant::now() < until => std::thread::yield_now(),
+                _ => panic!("session did not retire after audit cancellation"),
+            }
+        }
+        // The acknowledgement sender stayed alive: stop, not EOF, released it.
+        assert!(events_rx.try_iter().all(|event| matches!(event, StreamEvent::Cancelled)));
+        assert!(sandbox.recorded.lock().unwrap().is_empty());
+        instance.join().unwrap();
+    }
+
+    #[test]
+    fn stop_releases_full_event_channel_without_replacing_queued_event() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        tx.send(1).unwrap();
+        let cancel = Cancellation::default();
+        let worker_cancel = cancel.clone();
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            entered_tx.send(()).unwrap();
+            send_until_cancelled(&tx, 2, &worker_cancel)
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        cancel.request();
+        assert!(!worker.join().unwrap());
+        assert_eq!(rx.recv().unwrap(), 1);
+        assert!(rx.try_recv().is_err());
     }
 }
