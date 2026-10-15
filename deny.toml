@@ -1,0 +1,24 @@
+# cargo-deny configuration for the literal MIT/BSD/Apache-2.0 policy.
+# Licenses outside this allow list are denied. Do not add per-package
+# exceptions to conceal dependencies that still need replacement.
+
+[licenses]
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+]
+include-dev = true
+
+[bans]
+# No explicit package bans needed for the license check.
+deny = []
+
+[advisories]
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# No blanket ignores. Any future advisory ignore must be added here as
+# its own entry with the advisory id, the dependency path, and a review
+# date, e.g.:
+#   ignore = ["RUSTSEC-XXXX-NNNN"]  # <crate path> — reviewed YYYY-MM-DD, re-check by YYYY-MM-DD

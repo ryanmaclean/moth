@@ -90,7 +90,7 @@ suite with measured numbers; cross-crate integration suite (16 default
 | `git/` | Branch strategies for code-editing agents: `HeadStrategy` (works in repo_root, refuses dirty tree), `MergeToHeadStrategy` (temp worktree + merge back on success, leave on failure), `Branch{name}` (named persistent branch). Shells out to `git(1)`. | — |
 | `integration/` | Cross-crate scenario tests. 12 whole-stack tests covering tool routing, audit blocking, fstools sandboxing, session persistence, MCP wiring, completion signal, turn cap, structured output extraction. | every crate it tests |
 | `benches/` | Microbenchmarks for the SIMD/parsing hot paths. `std::time::Instant`-based, no criterion. `cargo test -p benches --release -- --nocapture`. | `wire`, `audit`, `anthropic`, `vshell` |
-| `runlog/` | File-backed JSONL audit trail. Subscribes to `harness::StreamEvent` and writes one record per event. Atomic appends, mutex-guarded; ms-precision UNIX timestamps. | `harness`, `anthropic` |
+| `runlog/` | File-backed JSONL audit trail. Subscribes to `harness::StreamEvent` and writes one record per event. Caller-owned `run_id` (validated as a filename), per-run contiguous `seq` as the only ordering source (resumed on re-open; `ts_ms` is metadata), `fdatasync` after terminal records, torn-tail isolation on re-open. | `harness`, `anthropic` |
 | `metrics/` | DogStatsD-over-UDP emitter. Load-bearing observability: counters/gauges/histograms/timers for prompt outcome, tool calls, and audit blocks, wired through `HarnessState` across `run`/`serve` and inherited by subagents. Opt-in via `--metrics`/`DOGSTATSD_ADDR`; a zero-cost no-op when disabled. | — |
 | `compact/` | Message-history compaction. Pure layer (`estimate_chars`, `split_for_compaction`) + model-driven `Compactor` that replaces older turns with a single synthetic summary message. Wires into `HarnessState::with_compactor`. | `harness` |
 | `subagent/` | Flue-style `session.task()`: spawn a focused child agent that shares the parent's sandbox + tools but starts with empty history. Optional role overlay. Streaming variant available. | `harness`, `actor` |
@@ -137,6 +137,8 @@ cargo run --bin agent -- run --mcp 'npx -y @modelcontextprotocol/server-filesyst
 
 # Tee every StreamEvent to a JSONL log for audit / debugging
 cargo run --bin agent -- run --runlog ./.runs "do something"
+# run identity from the caller (e.g. a BOP dispatcher): names the file + stamps every record
+cargo run --bin agent -- run --runlog ./.runs --run-id bop:card-42.r1 "do something"   # or AGENT_RUN_ID / BOP_RUN_ID
 
 # Emit DogStatsD metrics over UDP (run + serve); also via DOGSTATSD_ADDR.
 # Opt-in, no-op when unset. See QUICKSTART.md "Metrics & observability".

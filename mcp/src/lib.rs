@@ -21,12 +21,12 @@ pub mod server;
 mod transport;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use anthropic::json::{Json, parse as parse_json};
 use harness::{Tool, ToolCtx, ToolError};
 
-pub use transport::{HttpTransport, StdioTransport, Transport};
+pub use transport::{HttpTransport, OwnedStdioTransport, StdioTransport, Transport};
 
 /// Errors surfaced by the MCP client. Compact on purpose: most failures
 /// upstream just want a message to log, not a typed taxonomy.
@@ -68,10 +68,31 @@ struct ToolMeta {
 pub(crate) struct McpInner {
     transport: Box<dyn Transport>,
     next_id: AtomicU64,
+    request_gate: std::sync::Mutex<()>,
+    stopped: AtomicBool,
     tools: Vec<ToolMeta>,
 }
 
 impl McpInner {
+    fn stop(&self) {
+        self.stopped.store(true, Ordering::Release);
+        self.transport.request_stop();
+    }
+
+    fn acquire_request(&self, deadline: std::time::Instant) -> Result<std::sync::MutexGuard<'_, ()>, McpError> {
+        loop {
+            if self.stopped.load(Ordering::Acquire) || std::time::Instant::now() >= deadline {
+                self.stop();
+                return Err(McpError::Transport("MCP request cancelled or timed out while queued".into()));
+            }
+            match self.request_gate.try_lock() {
+                Ok(guard) => return Ok(guard),
+                Err(std::sync::TryLockError::WouldBlock) => std::thread::sleep(std::time::Duration::from_millis(10)),
+                Err(std::sync::TryLockError::Poisoned(_)) => { self.stop(); return Err(McpError::Transport("MCP request lock poisoned".into())); }
+            }
+        }
+    }
+
     /// Allocate the next JSON-RPC request id. Monotonic per-client.
     fn next_id(&self) -> u64 {
         self.next_id.fetch_add(1, Ordering::SeqCst)
@@ -85,11 +106,27 @@ impl McpInner {
     /// caller will inspect. We re-parse rather than thread lifetimes
     /// through the request flow.
     fn request(&self, method: &str, params: Option<&str>) -> Result<Json, McpError> {
+        // One request owns both send and response selection. Per-direction
+        // transport locks alone let concurrent tools consume each other's replies.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let _request = self.acquire_request(deadline)?;
+        let result = self.request_locked(method, params, deadline);
+        if matches!(&result, Err(McpError::Transport(_)) | Err(McpError::Protocol(_))) { self.stop(); }
+        result
+    }
+
+    fn request_locked(&self, method: &str, params: Option<&str>, deadline: std::time::Instant) -> Result<Json, McpError> {
         let id = self.next_id();
         let body = jsonrpc::build_request(id, method, params);
-        self.transport.send_line(body.as_bytes()).map_err(McpError::Transport)?;
+        self.transport.send_line_until(body.as_bytes(), deadline).map_err(McpError::Transport)?;
         loop {
-            let line = self.transport.recv_line().map_err(McpError::Transport)?;
+            if self.stopped.load(Ordering::Acquire) || std::time::Instant::now() >= deadline {
+                return Err(McpError::Transport("MCP request deadline exceeded".into()));
+            }
+            let line = self.transport.recv_line_until(deadline).map_err(McpError::Transport)?;
+            if self.stopped.load(Ordering::Acquire) || std::time::Instant::now() >= deadline {
+                return Err(McpError::Transport("MCP request deadline exceeded".into()));
+            }
             // Servers may emit blank keep-alives; ignore.
             if line.iter().all(|b| matches!(b, b' ' | b'\t' | b'\r')) {
                 continue;
@@ -129,8 +166,10 @@ impl McpInner {
 
     /// Send a notification (no id, no response expected).
     fn notify(&self, method: &str, params: Option<&str>) -> Result<(), McpError> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let _request = self.acquire_request(deadline)?;
         let body = jsonrpc::build_notification(method, params);
-        self.transport.send_line(body.as_bytes()).map_err(McpError::Transport)
+        self.transport.send_line_until(body.as_bytes(), deadline).map_err(McpError::Transport)
     }
 }
 
@@ -146,6 +185,19 @@ impl McpClient {
         let transport = StdioTransport::spawn(command, args).map_err(McpError::Transport)?;
         Self::with_transport(Box::new(transport))
     }
+
+    /// Connect to a local server through the selected native owner. The CLI
+    /// retains registry authority even if handshake or later requests fail.
+    pub fn stdio_owned(
+        registry: Arc<vshell::ownership::OwnerRegistry>,
+        command: &str, args: &[&str],
+    ) -> Result<Self, McpError> {
+        let transport = OwnedStdioTransport::spawn(registry, command, args).map_err(McpError::Transport)?;
+        Self::with_transport(Box::new(transport))
+    }
+
+    /// Request cancellation without claiming that the transport has retired.
+    pub fn request_stop(&self) { self.inner.stop(); }
 
     /// Connect to a remote MCP server over streamable HTTP. Performs the
     /// `initialize` → `notifications/initialized` → `tools/list` handshake
@@ -168,7 +220,7 @@ impl McpClient {
     /// Build a client from an arbitrary transport. Public for tests; in
     /// production, prefer [`McpClient::stdio`].
     pub fn with_transport(transport: Box<dyn Transport>) -> Result<Self, McpError> {
-        let mut inner = McpInner { transport, next_id: AtomicU64::new(1), tools: Vec::new() };
+        let mut inner = McpInner { transport, next_id: AtomicU64::new(1), request_gate: std::sync::Mutex::new(()), stopped: AtomicBool::new(false), tools: Vec::new() };
 
         // ---- initialize ----
         // Per spec, params include protocolVersion, capabilities, and
@@ -830,4 +882,59 @@ mod tests {
         // Nothing else should have been written.
         assert!(mock.try_pop_sent().is_none());
     }
+    fn request_only_inner(transport: Box<dyn Transport>) -> McpInner {
+        McpInner { transport, next_id: AtomicU64::new(1), request_gate: Mutex::new(()), stopped: AtomicBool::new(false), tools: Vec::new() }
+    }
+
+    #[test]
+    fn queued_request_observes_stop_without_acquiring_busy_gate() {
+        let mock = MockTransport::new();
+        let inner = Arc::new(request_only_inner(Box::new(MockHandle(mock.clone()))));
+        let held = inner.request_gate.lock().unwrap();
+        let other = inner.clone();
+        let (done_tx, done_rx) = channel();
+        let worker = std::thread::spawn(move || { done_tx.send(other.request("tools/call", None).map(|_| ())).unwrap(); });
+        inner.stop();
+        let observed = done_rx.recv_timeout(std::time::Duration::from_secs(2));
+        // Release on assertion failure too, so the regression never strands its worker.
+        drop(held);
+        mock.push_error("finite regression cleanup");
+        worker.join().unwrap();
+        assert!(matches!(observed, Ok(Err(McpError::Transport(_)))));
+        assert!(mock.try_pop_sent().is_none());
+    }
+
+    #[test]
+    fn protocol_failure_closes_admission_before_next_request() {
+        let mock = MockTransport::new();
+        let inner = request_only_inner(Box::new(MockHandle(mock.clone())));
+        mock.push_response("not JSON");
+        assert!(matches!(inner.request("tools/call", None), Err(McpError::Protocol(_))));
+        let _first = mock.pop_sent();
+        assert!(matches!(inner.request("tools/call", None), Err(McpError::Transport(_))));
+        assert!(mock.try_pop_sent().is_none());
+    }
+
+    #[test]
+    fn request_passes_one_deadline_through_send_and_every_notification() {
+        struct DeadlineTransport { deadline: Mutex<Option<std::time::Instant>>, reads: AtomicU64 }
+        impl Transport for DeadlineTransport {
+            fn send_line(&self, _: &[u8]) -> Result<(), String> { panic!("legacy send selected") }
+            fn recv_line(&self) -> Result<Vec<u8>, String> { panic!("legacy receive selected") }
+            fn send_line_until(&self, _: &[u8], deadline: std::time::Instant) -> Result<(), String> {
+                *self.deadline.lock().unwrap() = Some(deadline); Ok(())
+            }
+            fn recv_line_until(&self, deadline: std::time::Instant) -> Result<Vec<u8>, String> {
+                assert_eq!(*self.deadline.lock().unwrap(), Some(deadline));
+                if self.reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Ok(br#"{"jsonrpc":"2.0","method":"notifications/log"}"#.to_vec())
+                } else {
+                    Ok(br#"{"jsonrpc":"2.0","id":1,"result":{}}"#.to_vec())
+                }
+            }
+        }
+        let inner = request_only_inner(Box::new(DeadlineTransport { deadline: Mutex::new(None), reads: AtomicU64::new(0) }));
+        assert!(inner.request("tools/call", None).is_ok());
+    }
+
 }

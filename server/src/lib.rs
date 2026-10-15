@@ -16,7 +16,7 @@
 //! - Per-connection read/write timeouts (`ServerConfig::read_timeout`,
 //!   `ServerConfig::write_timeout`). A read timeout on an idle socket
 //!   produces a clean close; mid-request it produces 408.
-//! - Bounded accept counter (`ServerConfig::max_connections`). Connections
+//! - Bounded retained worker handles (`ServerConfig::max_connections`). Connections
 //!   accepted beyond the cap are closed immediately with no thread spawned.
 //! - HTTP/1.1 keep-alive for non-SSE responses (4xx error paths). SSE
 //!   responses still terminate the connection — the body is open-ended and
@@ -55,7 +55,24 @@ impl Default for ServerConfig {
     }
 }
 
+/// Prepared SSE response, executed only after required resources are reserved.
+pub type PreparedResponse<'a> = Box<dyn FnOnce(&mut EventSink) -> Result<(), HandlerError> + 'a>;
+
 pub trait AgentHandler: Send + Sync + 'static {
+    /// Reserve required resources before the HTTP 200/SSE commitment. The
+    /// default preserves simple handlers' existing behavior.
+    fn prepare<'a>(
+        &'a self,
+        id: &str,
+        request_id: &str,
+        body: &[u8],
+    ) -> Result<PreparedResponse<'a>, PrepareError> {
+        let id = id.to_owned();
+        let request_id = request_id.to_owned();
+        let body = body.to_vec();
+        Ok(Box::new(move |sink| self.handle(&id, &request_id, &body, sink)))
+    }
+
     fn handle(
         &self,
         id: &str,
@@ -106,6 +123,20 @@ impl std::fmt::Display for HandlerError {
 
 impl std::error::Error for HandlerError {}
 
+#[derive(Debug)]
+pub enum PrepareError {
+    Client(HandlerError),
+    Service(HandlerError),
+}
+
+impl std::fmt::Display for PrepareError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Client(e) | Self::Service(e) => write!(f, "{e}"),
+        }
+    }
+}
+
 pub struct Server {
     handlers: HashMap<String, Box<dyn AgentHandler>>,
 }
@@ -141,11 +172,8 @@ impl Server {
         self.serve_listener_with_shutdown(listener, cfg, Arc::new(AtomicBool::new(false)))
     }
 
-    /// Same as [`serve_listener_with`] but checks `shutdown` between
-    /// accepts. Set it to `true` from a signal handler (SIGTERM) to stop
-    /// accepting new connections; in-flight requests finish naturally,
-    /// then the call returns. Non-blocking accept with a short poll lets
-    /// the shutdown flag take effect within ~50ms of being set.
+    /// Stop admission on shutdown and retain every connection worker until
+    /// its actual join. A stuck handler remains owned; no timeout is success.
     pub fn serve_listener_with_shutdown(
         self,
         listener: TcpListener,
@@ -154,62 +182,76 @@ impl Server {
     ) -> io::Result<()> {
         listener.set_nonblocking(true)?;
         let shared = Arc::new(self);
-        let active = Arc::new(AtomicUsize::new(0));
+        let mut workers: Vec<thread::JoinHandle<io::Result<()>>> = Vec::new();
+        let mut failure = None;
         loop {
-            if shutdown.load(Ordering::Acquire) {
-                // Drain: wait for in-flight workers to drop their slot.
-                // Bound the wait at 30s so a stuck handler can't hang
-                // process exit indefinitely; orchestrators that want
-                // longer drains should configure preStop separately.
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-                while active.load(Ordering::Acquire) > 0 && std::time::Instant::now() < deadline {
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                }
-                return Ok(());
+            let mut index = 0;
+            while index < workers.len() {
+                if workers[index].is_finished() {
+                    let worker = workers.swap_remove(index);
+                    // Per-connection I/O failures retain their existing local
+                    // failure semantics. A worker panic is a server failure.
+                    if worker.join().is_err() {
+                        failure.get_or_insert_with(|| io::Error::other("connection worker panicked"));
+                        shutdown.store(true, Ordering::Release);
+                    }
+                } else { index += 1; }
             }
+            if shutdown.load(Ordering::Acquire) { break; }
             let stream = match listener.accept() {
-                Ok((s, _)) => s,
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(std::time::Duration::from_millis(50));
+                Ok((stream, _)) => stream,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(20));
                     continue;
                 }
-                Err(e) => return Err(e),
+                Err(error) => { failure = Some(error); break; }
             };
-            // Enforce the connection cap before spawning. We use a load /
-            // compare-exchange pair rather than fetch_add+rollback so we
-            // never even momentarily exceed the cap from another thread's
-            // perspective.
-            loop {
-                let current = active.load(Ordering::Acquire);
-                if current >= cfg.max_connections {
-                    // Drop the stream immediately — no thread, no buffering.
-                    let _ = stream.shutdown(std::net::Shutdown::Both);
-                    break;
-                }
-                if active
-                    .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-                {
-                    // Successfully reserved a slot — apply timeouts and
-                    // spawn a worker.
-                    let _ = stream.set_read_timeout(Some(cfg.read_timeout));
-                    let _ = stream.set_write_timeout(Some(cfg.write_timeout));
-                    let server = shared.clone();
-                    let active = active.clone();
-                    let cfg = cfg.clone();
-                    thread::spawn(move || {
-                        let _ = server.handle_connection(stream, &cfg);
-                        active.fetch_sub(1, Ordering::AcqRel);
-                    });
-                    break;
-                }
-                // Lost the race; retry the load.
+            // Only this loop admits workers; the retained handle count is
+            // the connection capacity until actual join, including panics.
+            if shutdown.load(Ordering::Acquire) || workers.len() >= cfg.max_connections {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+                continue;
+            }
+            if let Err(error) = stream.set_read_timeout(Some(cfg.read_timeout))
+                .and_then(|()| stream.set_write_timeout(Some(cfg.write_timeout)))
+            {
+                failure = Some(error);
+                break;
+            }
+            let server = shared.clone();
+            let worker_cfg = cfg.clone();
+            let worker_shutdown = shutdown.clone();
+            match thread::Builder::new().spawn(move || server.handle_connection_with_shutdown(stream, &worker_cfg, Some(&worker_shutdown))) {
+                Ok(worker) => workers.push(worker),
+                Err(error) => { failure = Some(error); break; }
             }
         }
+        // Close admission before the join barrier. Publish this on every
+        // exit, so the caller's cancellation bridge can release transports.
+        shutdown.store(true, Ordering::Release);
+        drop(listener);
+        while !workers.is_empty() {
+            let mut index = 0;
+            while index < workers.len() {
+                if workers[index].is_finished() {
+                    if workers.swap_remove(index).join().is_err() {
+                        failure.get_or_insert_with(|| io::Error::other("connection worker panicked"));
+                    }
+                } else { index += 1; }
+            }
+            if !workers.is_empty() { thread::sleep(Duration::from_millis(10)); }
+        }
+        match failure { Some(error) => Err(error), None => Ok(()) }
     }
 
-    fn handle_connection(&self, mut stream: TcpStream, cfg: &ServerConfig) -> io::Result<()> {
+    fn handle_connection_with_shutdown(
+        &self,
+        mut stream: TcpStream,
+        cfg: &ServerConfig,
+        shutdown: Option<&AtomicBool>,
+    ) -> io::Result<()> {
         loop {
+            if shutdown.is_some_and(|signal| signal.load(Ordering::Acquire)) { return Ok(()); }
             // Each iteration handles one request. We must clone the stream
             // for buffered reads because BufReader takes ownership, but the
             // raw stream stays here for writing the response and (on
@@ -221,6 +263,9 @@ impl Server {
             // returns Ok(None) and ends the loop cleanly; the second
             // returns a parse error we map to 4xx.
             let outcome = parse_request(&mut reader);
+            // A blocked read may complete after shutdown. Do not dispatch the
+            // newly parsed request or admit another keep-alive request then.
+            if shutdown.is_some_and(|signal| signal.load(Ordering::Acquire)) { return Ok(()); }
 
             let keep_alive = match outcome {
                 Ok(req) => {
@@ -300,6 +345,21 @@ impl Server {
             );
         };
 
+        let prepared = match handler.prepare(id, &request_id, &req.body) {
+            Ok(prepared) => prepared,
+            Err(e) => {
+                eprintln!("agent handler preflight failed: {e}");
+                let (status, reason) = match e {
+                    PrepareError::Client(_) => (400, "Bad Request"),
+                    PrepareError::Service(_) => (503, "Service Unavailable"),
+                };
+                return (
+                    ResponseKind::Buffered,
+                    write_simple(stream, status, reason, Some(&request_id)),
+                );
+            }
+        };
+
         // Commit SSE headers up front. Once they're on the wire any handler
         // error has to be surfaced inside the stream as an `error` event;
         // we can't retroactively change the status. The `X-Request-ID` echo
@@ -321,7 +381,7 @@ impl Server {
         }
 
         let mut sink = EventSink::new(stream);
-        if let Err(e) = handler.handle(id, &request_id, &req.body, &mut sink) {
+        if let Err(e) = prepared(&mut sink) {
             let _ = sink.emit(Some("error"), &e.0);
         }
         (ResponseKind::Sse, Ok(()))
@@ -611,6 +671,50 @@ mod tests {
         }
     }
 
+    struct PreflightRejectAgent;
+    impl AgentHandler for PreflightRejectAgent {
+        fn prepare<'a>(
+            &'a self,
+            _id: &str,
+            _request_id: &str,
+            _body: &[u8],
+        ) -> Result<PreparedResponse<'a>, PrepareError> {
+            Err(PrepareError::Service(HandlerError("required audit log unavailable".into())))
+        }
+
+        fn handle(
+            &self,
+            _id: &str,
+            _request_id: &str,
+            _body: &[u8],
+            _sink: &mut EventSink,
+        ) -> Result<(), HandlerError> {
+            panic!("handler must not run after failed preflight")
+        }
+    }
+
+    struct PreflightClientRejectAgent;
+    impl AgentHandler for PreflightClientRejectAgent {
+        fn prepare<'a>(
+            &'a self,
+            _id: &str,
+            _request_id: &str,
+            _body: &[u8],
+        ) -> Result<PreparedResponse<'a>, PrepareError> {
+            Err(PrepareError::Client(HandlerError("invalid prompt".into())))
+        }
+
+        fn handle(
+            &self,
+            _id: &str,
+            _request_id: &str,
+            _body: &[u8],
+            _sink: &mut EventSink,
+        ) -> Result<(), HandlerError> {
+            panic!("handler must not run after invalid prompt")
+        }
+    }
+
     struct LenAgent;
     impl AgentHandler for LenAgent {
         fn handle(
@@ -655,6 +759,8 @@ mod tests {
         server.register("err", Box::new(ErrAgent));
         server.register("len", Box::new(LenAgent));
         server.register("reqid", Box::new(EchoReqIdAgent));
+        server.register("preflight", Box::new(PreflightRejectAgent));
+        server.register("badprompt", Box::new(PreflightClientRejectAgent));
         let handle = thread::spawn(move || {
             let _ = server.serve_listener_with(listener, cfg);
         });
@@ -804,6 +910,30 @@ mod tests {
         assert!(head.starts_with("HTTP/1.1 200 OK"));
         let body = String::from_utf8(body).unwrap();
         assert!(body.contains("event: error\ndata: boom\n\n"), "body: {body:?}");
+    }
+
+    #[test]
+    fn failed_required_preflight_returns_503_before_sse_or_handler_work() {
+        let (addr, _h) = spawn_server();
+        let req = b"POST /agents/preflight/x HTTP/1.1\r\nX-Request-ID: trace-1\r\nContent-Length: 0\r\n\r\n";
+        let resp = send(addr, req);
+        let (head, body) = split_headers_body(&resp);
+        assert!(head.starts_with("HTTP/1.1 503"), "{head}");
+        assert!(head.contains("X-Request-ID: trace-1"));
+        assert!(!head.contains("text/event-stream"));
+        assert_eq!(body, b"Service Unavailable");
+    }
+
+    #[test]
+    fn client_preflight_error_returns_400_before_sse() {
+        let (addr, _h) = spawn_server();
+        let req = b"POST /agents/badprompt/x HTTP/1.1\r\nX-Request-ID: trace-1\r\nContent-Length: 0\r\n\r\n";
+        let resp = send(addr, req);
+        let (head, body) = split_headers_body(&resp);
+        assert!(head.starts_with("HTTP/1.1 400"), "{head}");
+        assert!(head.contains("X-Request-ID: trace-1"));
+        assert!(!head.contains("text/event-stream"));
+        assert_eq!(body, b"Bad Request");
     }
 
     #[test]
@@ -1282,5 +1412,99 @@ mod tests {
         let a = generate_request_id();
         let b = generate_request_id();
         assert_ne!(a, b, "generator collided immediately: {a} == {b}");
+    }
+
+    #[test]
+    fn shutdown_waits_for_actual_worker_retirement() {
+        struct Held(std::sync::mpsc::Sender<()>, Mutex<std::sync::mpsc::Receiver<()>>);
+        impl AgentHandler for Held {
+            fn handle(&self, _: &str, _: &str, _: &[u8], _: &mut EventSink) -> Result<(), HandlerError> {
+                self.0.send(()).unwrap();
+                self.1.lock().unwrap().recv().unwrap();
+                Ok(())
+            }
+        }
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut server = Server::new();
+        server.register("held", Box::new(Held(entered_tx, Mutex::new(release_rx))));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let signal = shutdown.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let owner = thread::spawn(move || {
+            let result = server.serve_listener_with_shutdown(listener, ServerConfig::default(), signal);
+            done_tx.send(result).unwrap();
+        });
+        let mut socket = TcpStream::connect(addr).unwrap();
+        socket.write_all(b"POST /agents/held/x HTTP/1.1\r\nContent-Length: 0\r\n\r\n").unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        shutdown.store(true, Ordering::Release);
+        let before_release = done_rx.recv_timeout(Duration::from_millis(100));
+        // Release before asserting, so even a regression does not strand the fixture worker.
+        release_tx.send(()).unwrap();
+        let completed = match before_release {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => done_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            _ => { owner.join().unwrap(); panic!("server returned before worker retirement"); }
+        };
+        owner.join().unwrap();
+        assert!(completed.is_ok());
+    }
+
+    #[test]
+    fn worker_panic_is_a_failed_server_retirement() {
+        struct Panics;
+        impl AgentHandler for Panics {
+            fn handle(&self, _: &str, _: &str, _: &[u8], _: &mut EventSink) -> Result<(), HandlerError> {
+                panic!("finite worker failure")
+            }
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut server = Server::new();
+        server.register("panic", Box::new(Panics));
+        let signal = Arc::new(AtomicBool::new(false));
+        let stop = signal.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let owner = thread::spawn(move || {
+            done_tx.send(server.serve_listener_with_shutdown(listener, ServerConfig::default(), signal)).unwrap();
+        });
+        let mut socket = TcpStream::connect(addr).unwrap();
+        socket.write_all(b"POST /agents/panic/x HTTP/1.1\r\nContent-Length: 0\r\n\r\n").unwrap();
+        let result = done_rx.recv_timeout(Duration::from_secs(5));
+        stop.store(true, Ordering::Release);
+        owner.join().unwrap();
+        assert!(result.unwrap().is_err());
+    }
+
+    #[test]
+    fn shutdown_stops_dispatch_on_an_existing_connection() {
+        struct Count(Arc<AtomicUsize>);
+        impl AgentHandler for Count {
+            fn handle(&self, _: &str, _: &str, _: &[u8], _: &mut EventSink) -> Result<(), HandlerError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (socket, _) = listener.accept().unwrap();
+        socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut server = Server::new();
+        server.register("count", Box::new(Count(count.clone())));
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = stop.clone();
+        let worker = thread::spawn(move || server.handle_connection_with_shutdown(
+            socket, &ServerConfig::default(), Some(&worker_stop),
+        ));
+        // This socket was already accepted. Shutdown precedes arrival of a
+        // dispatchable request, whether the worker is about to read or in read.
+        stop.store(true, Ordering::Release);
+        let _ = client.write_all(b"POST /agents/count/x HTTP/1.1\r\nContent-Length: 0\r\n\r\n");
+        client.shutdown(std::net::Shutdown::Write).ok();
+        worker.join().unwrap().unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 0);
     }
 }

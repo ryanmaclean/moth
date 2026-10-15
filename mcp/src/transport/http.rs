@@ -22,8 +22,8 @@
 //!
 //! HTTPS is delegated to `curl-sys` with the same `static-curl` /
 //! `static-ssl` build the `anthropic` crate uses. One libcurl easy handle
-//! per request — no pooling. `CURLOPT_FOLLOWLOCATION` is on, matching the
-//! `anthropic` client.
+//! per request — no pooling. Automatic libcurl redirects are disabled;
+//! explicit same-origin 307/308 handling keeps session credentials scoped.
 
 use std::collections::VecDeque;
 use std::ffi::CString;
@@ -194,12 +194,58 @@ fn post(
     bearer: Option<&str>,
     session: Option<&str>,
 ) -> Result<Response, String> {
-    let url_c = CString::new(url).map_err(|_| "URL contains NUL".to_string())?;
+    post_with_budget(url, body, bearer, session, std::time::Duration::from_secs(30))
+}
 
-    // Pre-build headers we'll always send.
+fn post_with_budget(
+    url: &str,
+    body: &[u8],
+    bearer: Option<&str>,
+    session: Option<&str>,
+    budget: std::time::Duration,
+) -> Result<Response, String> {
+    wire::http_origin::valid_http_origin(url)
+        .map_err(|e| format!("invalid MCP HTTP origin: {e}"))?;
+    let started = std::time::Instant::now();
+    let mut current = url.to_string();
+    for hop in 0..=10 {
+        let remaining = budget.checked_sub(started.elapsed())
+            .filter(|time| !time.is_zero())
+            .ok_or_else(|| "MCP HTTP redirect deadline exceeded".to_string())?;
+        let (response, redirect) = post_once(&current, body, bearer, session, remaining)?;
+        if matches!(response.status, 301 | 302 | 303) {
+            return Err(format!(
+                "method-changing MCP HTTP redirect {} refused (MCP requires POST)",
+                response.status
+            ));
+        }
+        if !matches!(response.status, 307 | 308) {
+            return Ok(response);
+        }
+        if hop == 10 {
+            return Err("MCP HTTP redirect limit exceeded".into());
+        }
+        let next = redirect.ok_or_else(|| "MCP HTTP redirect lacks Location".to_string())?;
+        if !wire::http_origin::same_http_origin(url, &next)
+            .map_err(|e| format!("invalid MCP HTTP redirect origin: {e}"))?
+        {
+            return Err("cross-origin MCP HTTP redirect refused".into());
+        }
+        current = next;
+    }
+    unreachable!("bounded redirect loop returns")
+}
+
+fn post_once(
+    url: &str,
+    body: &[u8],
+    bearer: Option<&str>,
+    session: Option<&str>,
+    remaining: std::time::Duration,
+) -> Result<(Response, Option<String>), String> {
+    let url_c = CString::new(url).map_err(|_| "URL contains NUL".to_string())?;
     let mut header_strings: Vec<CString> = Vec::new();
     header_strings.push(CString::new("content-type: application/json").unwrap());
-    // Per spec the client should accept both response shapes.
     header_strings.push(CString::new("accept: application/json, text/event-stream").unwrap());
     if let Some(tok) = bearer {
         header_strings.push(
@@ -213,84 +259,94 @@ fn post(
                 .map_err(|_| "session id contains NUL".to_string())?,
         );
     }
-
     let mut body_buf: Vec<u8> = Vec::new();
     let mut header_buf: Vec<u8> = Vec::new();
-
-    let perform_status: i64;
-
-    unsafe {
+    let (perform_status, redirect) = unsafe {
         curl_global_init_once();
         let easy = c::curl_easy_init();
         if easy.is_null() {
             return Err("curl_easy_init failed".into());
         }
-
         let mut headers: *mut c::curl_slist = ptr::null_mut();
         for h in &header_strings {
             headers = c::curl_slist_append(headers, h.as_ptr());
         }
         let guard = Handle { easy, headers };
-
         setopt_ptr(easy, c::CURLOPT_URL, url_c.as_ptr() as *const c_void, "URL")?;
         setopt_long(easy, c::CURLOPT_POST, 1, "POST")?;
         setopt_ptr(easy, c::CURLOPT_POSTFIELDS, body.as_ptr() as *const c_void, "POSTFIELDS")?;
         setopt_long(easy, c::CURLOPT_POSTFIELDSIZE, body.len() as i64, "POSTFIELDSIZE")?;
         setopt_ptr(easy, c::CURLOPT_HTTPHEADER, headers as *const c_void, "HTTPHEADER")?;
         setopt_ptr(easy, c::CURLOPT_WRITEFUNCTION, write_cb as *const c_void, "WRITEFUNCTION")?;
-        setopt_ptr(
-            easy,
-            c::CURLOPT_WRITEDATA,
-            (&mut body_buf as *mut Vec<u8>) as *const c_void,
-            "WRITEDATA",
-        )?;
+        setopt_ptr(easy, c::CURLOPT_WRITEDATA, (&mut body_buf as *mut Vec<u8>) as *const c_void, "WRITEDATA")?;
         setopt_ptr(easy, c::CURLOPT_HEADERFUNCTION, header_cb as *const c_void, "HEADERFUNCTION")?;
-        setopt_ptr(
-            easy,
-            c::CURLOPT_HEADERDATA,
-            (&mut header_buf as *mut Vec<u8>) as *const c_void,
-            "HEADERDATA",
-        )?;
+        setopt_ptr(easy, c::CURLOPT_HEADERDATA, (&mut header_buf as *mut Vec<u8>) as *const c_void, "HEADERDATA")?;
         setopt_long(easy, c::CURLOPT_NOPROGRESS, 1, "NOPROGRESS")?;
-        setopt_long(easy, c::CURLOPT_FOLLOWLOCATION, 1, "FOLLOWLOCATION")?;
-        // Hard timeouts: MCP HTTP is request/response (not streaming), so a
-        // half-open / silent-after-handshake socket would otherwise pin the
-        // calling thread forever. 10s connect, 30s total.
+        setopt_long(easy, c::CURLOPT_FOLLOWLOCATION, 0, "FOLLOWLOCATION")?;
         setopt_long(easy, c::CURLOPT_CONNECTTIMEOUT, 10, "CONNECTTIMEOUT")?;
-        setopt_long(easy, c::CURLOPT_TIMEOUT, 30, "TIMEOUT")?;
+        let timeout_ms = remaining.as_millis().min(i64::MAX as u128) as i64;
+        if timeout_ms == 0 {
+            return Err("MCP HTTP redirect deadline exhausted before transfer".into());
+        }
+        setopt_long(easy, c::CURLOPT_TIMEOUT_MS, timeout_ms, "TIMEOUT_MS")?;
 
         let rc = c::curl_easy_perform(easy);
         let mut status: i64 = 0;
         c::curl_easy_getinfo(easy, c::CURLINFO_RESPONSE_CODE, &mut status);
-
+        let mut redirect_ptr: *mut std::os::raw::c_char = ptr::null_mut();
+        let info_rc = c::curl_easy_getinfo(easy, c::CURLINFO_REDIRECT_URL, &mut redirect_ptr);
+        let redirect = if info_rc == c::CURLE_OK && !redirect_ptr.is_null() {
+            Some(std::ffi::CStr::from_ptr(redirect_ptr).to_str()
+                .map_err(|_| "redirect URL is not UTF-8")?.to_owned())
+        } else {
+            None
+        };
         drop(guard);
-
         if rc != c::CURLE_OK {
             return Err(curl_err(rc, "perform"));
         }
-        perform_status = status;
-    }
-
+        if info_rc != c::CURLE_OK {
+            return Err(curl_err(info_rc, "redirect URL"));
+        }
+        (status, redirect)
+    };
     let (content_type_sse, session_id) = parse_headers(&header_buf);
-
-    Ok(Response {
+    Ok((Response {
         status: perform_status.clamp(0, u16::MAX as i64) as u16,
         body: body_buf,
         content_type_sse,
         session_id,
-    })
+    }, redirect))
 }
 
-/// Scan the captured response headers for Content-Type and
-/// Mcp-Session-Id. Header buffer holds raw bytes including CRLFs and
-/// status lines (curl forwards one call per line, all concatenated by
-/// `write_cb`). Status lines like `HTTP/1.1 200 OK` are skipped — they
-/// don't contain a colon followed by a value we care about.
+/// Read only the final HTTP response block. libcurl may deliver an interim
+/// 100 response (or proxy CONNECT response) and final 200 in one transfer;
+/// headers from earlier blocks must not become the MCP session or content type.
 fn parse_headers(buf: &[u8]) -> (bool, Option<String>) {
     let mut sse = false;
     let mut session: Option<String> = None;
+    let mut in_headers = false;
     for raw_line in buf.split(|b| *b == b'\n') {
         let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+        if line.starts_with(b"HTTP/") {
+            // A new response block supersedes *all* earlier header state,
+            // including an interim 100 or proxy CONNECT block.
+            sse = false;
+            session = None;
+            in_headers = std::str::from_utf8(line).ok()
+                .and_then(|text| text.split_ascii_whitespace().nth(1))
+                .and_then(|digits| digits.parse::<u16>().ok())
+                .is_some_and(|code| (100..600).contains(&code));
+            continue;
+        }
+        if line.is_empty() {
+            in_headers = false;
+            continue;
+        }
+        if !in_headers {
+            // Ignore a preamble or trailers after the final blank line.
+            continue;
+        }
         let Some(colon) = line.iter().position(|b| *b == b':') else {
             continue;
         };
@@ -298,23 +354,19 @@ fn parse_headers(buf: &[u8]) -> (bool, Option<String>) {
         let value =
             line[colon + 1..].iter().copied().skip_while(|b| *b == b' ').collect::<Vec<_>>();
         if eq_ignore_ascii_case(name, b"content-type") {
-            // Content-Type may carry params (charset=utf-8 etc.); we only
-            // need the bare type.
             let bare = value.split(|b| *b == b';').next().unwrap_or(&[]);
-            let trimmed = trim_ascii(bare);
-            if eq_ignore_ascii_case(trimmed, b"text/event-stream") {
-                sse = true;
-            }
+            sse = eq_ignore_ascii_case(trim_ascii(bare), b"text/event-stream");
         } else if eq_ignore_ascii_case(name, b"mcp-session-id") {
             let trimmed = trim_ascii(&value);
-            if !trimmed.is_empty() {
-                session = Some(String::from_utf8_lossy(trimmed).into_owned());
-            }
+            session = if trimmed.is_empty() {
+                None
+            } else {
+                Some(String::from_utf8_lossy(trimmed).into_owned())
+            };
         }
     }
     (sse, session)
 }
-
 fn eq_ignore_ascii_case(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.eq_ignore_ascii_case(y))
 }
@@ -443,6 +495,8 @@ mod tests {
         status_text: &'static str,
         content_type: &'static str,
         session_id: Option<String>,
+        location: Option<String>,
+        interim_headers: Option<String>,
         body: Vec<u8>,
     }
 
@@ -453,11 +507,21 @@ mod tests {
                 status_text: status_text(status),
                 content_type: "application/json",
                 session_id: None,
+                location: None,
+                interim_headers: None,
                 body: body.into(),
             }
         }
         fn with_session(mut self, sid: &str) -> Self {
             self.session_id = Some(sid.to_string());
+            self
+        }
+        fn with_location(mut self, location: impl Into<String>) -> Self {
+            self.location = Some(location.into());
+            self
+        }
+        fn with_interim_headers(mut self, headers: &str) -> Self {
+            self.interim_headers = Some(headers.to_string());
             self
         }
         fn sse(body: impl Into<Vec<u8>>) -> Self {
@@ -466,6 +530,8 @@ mod tests {
                 status_text: "OK",
                 content_type: "text/event-stream",
                 session_id: None,
+                location: None,
+                interim_headers: None,
                 body: body.into(),
             }
         }
@@ -486,6 +552,8 @@ mod tests {
     /// Recorded request captured by the mock server.
     #[derive(Debug, Clone, Default)]
     struct Captured {
+        method: String,
+        path: String,
         body: Vec<u8>,
         session_id: Option<String>,
         authorization: Option<String>,
@@ -559,6 +627,9 @@ mod tests {
         }
 
         let mut captured = Captured::default();
+        let mut request_parts = request_line.split_ascii_whitespace();
+        captured.method = request_parts.next().unwrap_or("").to_string();
+        captured.path = request_parts.next().unwrap_or("").to_string();
         let mut content_length: usize = 0;
         loop {
             let mut line = String::new();
@@ -593,11 +664,17 @@ mod tests {
         // captured Vec between perform completing and the mock loop pushing.
         captured_sink.lock().unwrap().push(captured);
 
+        if let Some(interim) = &reply.interim_headers {
+            stream.write_all(interim.as_bytes()).unwrap();
+        }
         let mut resp = format!("HTTP/1.1 {} {}\r\n", reply.status, reply.status_text);
         resp.push_str(&format!("content-type: {}\r\n", reply.content_type));
         resp.push_str(&format!("content-length: {}\r\n", reply.body.len()));
         if let Some(sid) = &reply.session_id {
             resp.push_str(&format!("mcp-session-id: {sid}\r\n"));
+        }
+        if let Some(location) = &reply.location {
+            resp.push_str(&format!("location: {location}\r\n"));
         }
         resp.push_str("connection: close\r\n\r\n");
         let _ = stream.write_all(resp.as_bytes());
@@ -629,6 +706,8 @@ mod tests {
                 status_text: "Accepted",
                 content_type: "application/json",
                 session_id: None,
+                location: None,
+                interim_headers: None,
                 body: Vec::new(),
             },
             Reply::json(200, tools_list_reply(2)),
@@ -883,6 +962,120 @@ mod tests {
         // curl_easy_perform yields CURLE_OPERATION_TIMEDOUT (28); the post()
         // helper packages it as "curl perform: ... (code 28)".
         assert!(err.contains("code 28"), "expected CURLE_OPERATION_TIMEDOUT, got {err}");
+    }
+
+    #[test]
+    fn cross_origin_307_and_308_never_reach_second_server() {
+        for status in [307, 308] {
+            // Different loopback ports are different origins. No request
+            // may reach the destination, even one without credentials.
+            let target = start_mock(vec![Reply::json(200, br#"{"ok":true}"#.to_vec())]);
+            let source = start_mock(vec![
+                Reply::json(status, Vec::<u8>::new()).with_location(target.addr.clone()),
+            ]);
+            let err = post(&source.addr, b"{}", Some("bearer-sentinel"), Some("session-sentinel"))
+                .err().expect("cross-origin redirect must be refused before transfer");
+            assert!(err.contains("cross-origin"), "unexpected error: {err}");
+            let original = source.captured.lock().unwrap();
+            assert_eq!(original.len(), 1);
+            assert_eq!(original[0].method, "POST");
+            assert_eq!(original[0].authorization.as_deref(), Some("Bearer bearer-sentinel"));
+            assert_eq!(original[0].session_id.as_deref(), Some("session-sentinel"));
+            assert!(target.captured.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn same_origin_307_and_308_keep_post_body_path_and_credentials() {
+        for status in [307, 308] {
+            let source = start_mock(vec![
+                Reply::json(status, Vec::<u8>::new()).with_location("/next"),
+                Reply::json(200, br#"{"ok":true}"#.to_vec()),
+            ]);
+            let resp = post(&source.addr, b"{}", Some("bearer-sentinel"), Some("session-sentinel"))
+                .expect("same-origin method-preserving redirect must continue");
+            assert_eq!(resp.status, 200);
+            assert_eq!(resp.body.as_slice(), br#"{"ok":true}"#);
+            let requests = source.captured.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[0].path, "/mcp");
+            assert_eq!(requests[1].path, "/next");
+            for request in requests.iter() {
+                assert_eq!(request.method, "POST");
+                assert_eq!(request.body.as_slice(), b"{}");
+                assert_eq!(request.authorization.as_deref(), Some("Bearer bearer-sentinel"));
+                assert_eq!(request.session_id.as_deref(), Some("session-sentinel"));
+            }
+        }
+    }
+
+    #[test]
+    fn same_origin_301_302_303_explicitly_refuse_method_change() {
+        for status in [301, 302, 303] {
+            let source = start_mock(vec![
+                Reply::json(status, Vec::<u8>::new()).with_location("/next"),
+                Reply::json(200, br#"{"unexpected":true}"#.to_vec()),
+            ]);
+            let err = post(&source.addr, b"{}", Some("bearer-sentinel"), Some("session-sentinel"))
+                .err().expect("MCP POST must reject method-changing redirect");
+            assert!(err.contains("method-changing"), "{err}");
+            let requests = source.captured.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].method, "POST");
+            assert_eq!(requests[0].path, "/mcp");
+            assert_eq!(requests[0].body.as_slice(), b"{}");
+        }
+    }
+
+    #[test]
+    fn interim_100_headers_do_not_persist_session_or_content_type() {
+        let interim = "HTTP/1.1 100 Continue\r\nmcp-session-id: interim\r\ncontent-type: text/event-stream\r\n\r\n";
+        let final_reply = Reply::json(200, b"{}".to_vec()).with_interim_headers(interim);
+        let source = start_mock(vec![final_reply]);
+        let transport = HttpTransport::new(&source.addr);
+        transport.send_line(b"{}").unwrap();
+        assert_eq!(transport.session_id(), None);
+        assert_eq!(transport.recv_line().unwrap(), b"{}".to_vec());
+        assert_eq!(source.captured.lock().unwrap().len(), 1);
+
+        // The pure parser pinpoints the same-transfer distinction: the final
+        // 200 has no session ID and is JSON, despite interim SSE/session data.
+        let raw = b"HTTP/1.1 100 Continue\r\nmcp-session-id: interim\r\ncontent-type: text/event-stream\r\n\r\nHTTP/2 200\r\ncontent-type: application/json\r\n\r\n";
+        assert_eq!(parse_headers(raw), (false, None));
+    }
+
+    #[test]
+    fn intermediate_session_header_is_not_persisted() {
+        let source = start_mock(vec![
+            Reply::json(307, Vec::<u8>::new()).with_session("intermediate").with_location("/next"),
+            Reply::json(202, Vec::<u8>::new()),
+        ]);
+        let transport = HttpTransport::new(&source.addr);
+        transport.send_line(b"{}").unwrap();
+        assert_eq!(transport.session_id(), None);
+        assert_eq!(source.captured.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn same_origin_redirect_loop_hits_hop_cap() {
+        let replies = (0..11).map(|_| {
+            Reply::json(307, Vec::<u8>::new()).with_location("/mcp")
+        }).collect();
+        let source = start_mock(replies);
+        let err = post(&source.addr, b"{}", None, Some("session-sentinel"))
+            .err().expect("redirect loop must stop");
+        assert!(err.contains("limit"), "{err}");
+        assert_eq!(source.captured.lock().unwrap().len(), 11);
+    }
+
+    #[test]
+    fn exhausted_deadline_starts_no_transfer() {
+        let source = start_mock(vec![Reply::json(200, b"{}".to_vec())]);
+        let err = post_with_budget(
+            &source.addr, b"{}", None, Some("session-sentinel"), std::time::Duration::ZERO
+        ).err().expect("zero budget must fail before transfer");
+        assert!(err.contains("deadline"), "{err}");
+        assert!(source.captured.lock().unwrap().is_empty());
     }
 
     #[test]

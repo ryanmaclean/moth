@@ -14,3 +14,4 @@ anthropic = { path = "../anthropic" }
 curl-sys = { version = "0.4", features = ["static-curl", "static-ssl"] }
 harness = { path = "../harness" }
 wire = { path = "../wire" }
+vshell = { path = "../vshell" }

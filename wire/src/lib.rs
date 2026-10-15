@@ -5,6 +5,7 @@
 //! Zero dependencies.
 
 mod framer;
+pub mod http_origin;
 mod ndjson;
 pub mod retry;
 mod scan;

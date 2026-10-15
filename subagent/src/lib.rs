@@ -37,6 +37,8 @@ use std::sync::Arc;
 use std::sync::mpsc::SyncSender;
 use std::thread::{self, JoinHandle};
 
+use actor::{try_spawn_with_cancellation, Cancellation, JoinPoll, Retirement};
+#[cfg(test)]
 use actor::spawn;
 use harness::{HarnessState, PromptResult, Session, SessionError, SessionMsg, StreamEvent};
 
@@ -44,10 +46,18 @@ use harness::{HarnessState, PromptResult, Session, SessionError, SessionMsg, Str
 /// subagent finishes its single prompt and return its [`PromptResult`].
 #[must_use = "dropping a TaskHandle detaches the subagent's worker thread"]
 pub struct TaskHandle {
-    handle: JoinHandle<Result<PromptResult, SessionError>>,
+    handle: Retirement<Result<PromptResult, SessionError>>,
+    cancel: Cancellation,
 }
 
 impl TaskHandle {
+    /// Request stop, retaining the worker until its actual join is observed.
+    pub fn request_stop(&self) { self.cancel.request(); }
+    pub fn cancellation(&self) -> Cancellation { self.cancel.clone() }
+    pub fn try_join(&mut self) -> JoinPoll<Result<PromptResult, SessionError>> {
+        self.handle.try_join()
+    }
+
     /// Block until the subagent finishes. Returns the final `PromptResult`
     /// or a `SessionError`. Panics propagated from the worker thread are
     /// surfaced as `SessionError::Mailbox` (the actor's mailbox closed
@@ -99,19 +109,27 @@ pub fn spawn_task(
     prompt: String,
     role_system: Option<String>,
 ) -> TaskHandle {
-    let handle = thread::spawn(move || {
+    try_spawn_task(parent_state, prompt, role_system).expect("subagent worker creation failed")
+}
+
+pub fn try_spawn_task(
+    parent_state: Arc<HarnessState>, prompt: String, role_system: Option<String>,
+) -> std::io::Result<TaskHandle> {
+    let cancel = Cancellation::default();
+    let worker_cancel = cancel.clone();
+    let handle = thread::Builder::new().spawn(move || {
         let harness = child_state(&parent_state, role_system);
-        let session = spawn(Session::new("subagent", harness));
+        let session = try_spawn_with_cancellation(Session::new("subagent", harness), worker_cancel)
+            .map_err(|_| SessionError::Mailbox)?;
         let result = session
             .addr
             .ask(|reply| SessionMsg::Prompt { text: prompt, structured_output_tag: None, reply })
-            .map_err(|_| SessionError::Mailbox)?;
-        // Drop the Spawned so the actor thread exits cleanly. We don't
-        // surface its join error — the prompt result is the contract.
-        let _ = session.join();
-        result
-    });
-    TaskHandle { handle }
+            .map_err(|_| SessionError::Mailbox);
+        // Always join, including a failed ask. A reply is not retirement.
+        if session.join().is_err() { return Err(SessionError::Mailbox); }
+        result?
+    })?;
+    Ok(TaskHandle { handle: Retirement::new(handle), cancel })
 }
 
 /// Streaming variant. Same construction as [`spawn_task`] but the subagent's
@@ -119,27 +137,78 @@ pub fn spawn_task(
 /// in wire order, with `StreamEvent::Done` (or `Error`/`Cancelled`) as the
 /// terminal event.
 ///
-/// The returned `JoinHandle<()>` resolves when the subagent's actor thread
-/// has exited. Callers typically just consume `events` and let the handle
-/// detach, but joining is available for clean shutdown.
+/// Legacy return type retained for compatibility. The caller must retain and
+/// join it, and must drop its event receiver to cancel at stream boundaries.
+/// New lifecycle owners should use spawn_task_streaming_owned instead.
 pub fn spawn_task_streaming(
     parent_state: Arc<HarnessState>,
     prompt: String,
     role_system: Option<String>,
     events: SyncSender<StreamEvent>,
 ) -> JoinHandle<()> {
-    thread::spawn(move || {
+    try_spawn_task_streaming(parent_state, prompt, role_system, events).expect("subagent streaming worker creation failed")
+}
+
+/// Fallible compatibility-shape streaming admission. The returned worker must
+/// still be retained and joined by its caller.
+pub fn try_spawn_task_streaming(
+    parent_state: Arc<HarnessState>, prompt: String, role_system: Option<String>, events: SyncSender<StreamEvent>,
+) -> std::io::Result<JoinHandle<()>> {
+    streaming_worker(parent_state, prompt, role_system, events, Cancellation::default())
+}
+
+#[must_use = "retain the streaming task until its worker is joined"]
+pub struct StreamingTaskHandle {
+    handle: Retirement<()>,
+    cancel: Cancellation,
+}
+
+impl StreamingTaskHandle {
+    pub fn request_stop(&self) { self.cancel.request(); }
+    pub fn cancellation(&self) -> Cancellation { self.cancel.clone() }
+    pub fn try_join(&mut self) -> JoinPoll<()> { self.handle.try_join() }
+    pub fn join(self) -> thread::Result<()> { self.handle.join() }
+}
+
+pub fn spawn_task_streaming_owned(
+    parent_state: Arc<HarnessState>,
+    prompt: String,
+    role_system: Option<String>,
+    events: SyncSender<StreamEvent>,
+) -> StreamingTaskHandle {
+    try_spawn_task_streaming_owned(parent_state, prompt, role_system, events)
+        .expect("subagent streaming worker creation failed")
+}
+
+pub fn try_spawn_task_streaming_owned(
+    parent_state: Arc<HarnessState>, prompt: String, role_system: Option<String>, events: SyncSender<StreamEvent>,
+) -> std::io::Result<StreamingTaskHandle> {
+    let cancel = Cancellation::default();
+    let handle = streaming_worker(parent_state, prompt, role_system, events, cancel.clone())?;
+    Ok(StreamingTaskHandle { handle: Retirement::new(handle), cancel })
+}
+
+fn streaming_worker(
+    parent_state: Arc<HarnessState>,
+    prompt: String,
+    role_system: Option<String>,
+    events: SyncSender<StreamEvent>,
+    cancel: Cancellation,
+) -> std::io::Result<JoinHandle<()>> {
+    thread::Builder::new().spawn(move || {
         let harness = child_state(&parent_state, role_system);
-        let session = spawn(Session::new("subagent", harness));
-        // Best-effort send: if it fails the actor stays idle and we fall
-        // through to join. The streaming consumer will see no events.
-        let _ = session.addr.send(SessionMsg::PromptStream {
+        let session = match try_spawn_with_cancellation(Session::new("subagent", harness), cancel) {
+            Ok(session) => session,
+            Err(error) => panic!("subagent session creation failed: {error}"),
+        };
+        let sent = session.addr.send(SessionMsg::PromptStream {
             text: prompt,
             structured_output_tag: None,
             events,
         });
-        // Drop the local ActorRef + wait for the actor thread to drain.
-        let _ = session.join();
+        // Keep the underlying actor panic visible to the worker's join.
+        if let Err(payload) = session.join() { std::panic::resume_unwind(payload); }
+        assert!(sent.is_ok(), "subagent session mailbox closed before admission");
     })
 }
 
@@ -819,6 +888,58 @@ mod tests {
         assert_eq!(seen[0].messages[0].role, Role::User);
         assert_eq!(seen[0].messages[0].content, vec![ContentBlock::Text("the only prompt".into())],);
 
+        instance.join().unwrap();
+    }
+
+    struct PanickingModel;
+    impl Model for PanickingModel {
+        fn stream(&self, _: harness::ModelRequest) -> Box<dyn Iterator<Item = Result<ModelEvent, harness::ModelError>> + Send> {
+            panic!("provider failure");
+        }
+    }
+
+    #[test]
+    fn task_surfaces_actor_failure_after_join() {
+        let (instance, mut state, _model, _sandbox) = parent_rig(vec![], vec![]);
+        Arc::get_mut(&mut state).unwrap().model = Arc::new(PanickingModel);
+        assert!(matches!(spawn_task(state, "fail".into(), None).join(), Err(SessionError::Mailbox)));
+        instance.join().unwrap();
+    }
+
+    #[test]
+    fn streaming_worker_does_not_swallow_actor_panic() {
+        let (instance, mut state, _model, _sandbox) = parent_rig(vec![], vec![]);
+        Arc::get_mut(&mut state).unwrap().model = Arc::new(PanickingModel);
+        let (tx, _rx) = sync_channel(1);
+        assert!(spawn_task_streaming_owned(state, "fail".into(), None, tx).join().is_err());
+        instance.join().unwrap();
+    }
+
+    #[test]
+    fn stop_does_not_claim_a_blocked_provider_has_retired() {
+        struct GatedModel {
+            entered: SyncSender<()>,
+            release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl Model for GatedModel {
+            fn stream(&self, _: harness::ModelRequest) -> Box<dyn Iterator<Item = Result<ModelEvent, harness::ModelError>> + Send> {
+                self.entered.send(()).unwrap();
+                self.release.lock().unwrap().recv().unwrap();
+                Box::new(std::iter::empty())
+            }
+        }
+        let (instance, mut state, _model, _sandbox) = parent_rig(vec![], vec![]);
+        let (entered_tx, entered_rx) = sync_channel(1);
+        let (release_tx, release_rx) = sync_channel(1);
+        Arc::get_mut(&mut state).unwrap().model = Arc::new(GatedModel {
+            entered: entered_tx, release: std::sync::Mutex::new(release_rx),
+        });
+        let mut task = spawn_task(state, "blocked".into(), None);
+        entered_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        task.request_stop();
+        assert!(matches!(task.try_join(), JoinPoll::Pending));
+        release_tx.send(()).unwrap();
+        assert!(task.join().is_err());
         instance.join().unwrap();
     }
 }

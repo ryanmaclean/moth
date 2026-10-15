@@ -165,6 +165,7 @@ dependencies = [
  "anthropic",
  "curl-sys",
  "harness",
+ "vshell",
  "wire",
 ]
 
