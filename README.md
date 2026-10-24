@@ -98,6 +98,10 @@ suite with measured numbers; cross-crate integration suite (16 default
 | `harness/` | Instance + Session actors. `Model` / `Sandbox` / `Tool` / `SessionStore` traits. `AnthropicModel`, `OpenAiModel`, `AuditedShell<S>`, `BashTool`. Iteration loop with tool-use, completion signal, structured output, 16-turn cap, optional persistence hook. | `actor`, `wire`, `anthropic`, `openai`, `audit`, `vshell` |
 | `cli/` | `agent run` / `agent serve` binary. Wires every other crate. | all of the above |
 
+`contrib/vibecode/` is not a crate. It holds non-workspace code moved from
+ryanmaclean/vibecode-webgui (a Python SDK, a Ralph-loop runner and TypeScript CLI wrappers).
+See [contrib/vibecode/README.md](contrib/vibecode/README.md).
+
 ## Dependencies & supply chain
 
 One direct external dep: `curl-sys 0.4` with `static-curl` + `static-ssl`
