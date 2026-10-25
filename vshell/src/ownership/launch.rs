@@ -11,6 +11,7 @@ pub enum OwnedRedirect {
     Error { path: PathBuf, append: bool }, ErrorToOutput,
 }
 #[derive(Debug)]
+#[cfg_attr(not(target_os = "freebsd"), allow(dead_code))]
 struct Plan { redirects: Vec<OwnedRedirect>, program: OsString, args: Vec<OsString> }
 impl Plan {
     fn parse(args: Vec<OsString>) -> io::Result<Self> {
@@ -73,7 +74,7 @@ fn install(file: std::fs::File, target: libc::c_int) -> io::Result<()> {
 pub fn private_launch(args: Vec<OsString>) -> i32 {
     let plan = match Plan::parse(args) { Ok(plan) => plan, Err(_) => return 2 };
     #[cfg(not(target_os = "freebsd"))]
-    { let _ = plan; return 2; }
+    { let _ = plan; 2 }
     #[cfg(target_os = "freebsd")]
     {
         use std::fs::OpenOptions;

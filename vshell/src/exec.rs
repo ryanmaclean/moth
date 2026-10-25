@@ -505,13 +505,12 @@ impl VShell {
                     }
                 }
             }
-            if let RunState::Retired(result) = run.poll() {
-                if out_eof && err_eof {
-                    return Ok(Flow::Done(match result.reason {
-                        0 => result.payload_exit_code.unwrap_or_else(|| 128 + result.payload_signal.unwrap_or(0)),
-                        1 => 130, 2 => 124, _ => 1,
-                    }));
-                }
+            if let RunState::Retired(result) = run.poll()
+                && out_eof && err_eof {
+                return Ok(Flow::Done(match result.reason {
+                    0 => result.payload_exit_code.unwrap_or_else(|| 128 + result.payload_signal.unwrap_or(0)),
+                    1 => 130, 2 => 124, _ => 1,
+                }));
             }
             if stop_waiting.is_none_or(|deadline| Instant::now() >= deadline) {
                 run.cancel();

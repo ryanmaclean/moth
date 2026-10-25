@@ -245,8 +245,9 @@ impl Client {
     }
     fn state(&self) -> RunState {
         if !self.protocol_failure && self.eof && self.incoming.is_empty()
-            && self.owner_status.is_some_and(|s| s.success()) {
-            if let Some(result) = &self.terminal { return RunState::Retired(result.clone()); }
+            && self.owner_status.is_some_and(|s| s.success())
+            && let Some(result) = &self.terminal {
+            return RunState::Retired(result.clone());
         }
         if self.protocol_failure || self.owner_status.is_some_and(|s| !s.success())
             || (self.owner_status.is_some() && self.terminal.is_none()) {
@@ -271,9 +272,8 @@ impl Client {
         match kind {
             READY if !self.ready && bytes == b"MOTHOWN1" => {
                 self.ready = true;
-                if !self.cancelled {
-                    if self.queue(START, &[]).is_err() { self.broken("start queue overflow"); }
-
+                if !self.cancelled && self.queue(START, &[]).is_err() {
+                    self.broken("start queue overflow");
                 }
             }
             STARTED if self.ready && self.start_sent && !self.started && bytes.is_empty() => {
@@ -333,8 +333,9 @@ impl Client {
             // the registry still retains the actual child as Unknown.
             self.input.take(); self.queue.clear(); self.queued = 0; self.offset = 0;
         }
-        if self.started && self.want_eof && !self.eof_sent && !self.cancelled {
-            if self.queue(INPUT_EOF, &[]).is_ok() { self.eof_sent = true; }
+        if self.started && self.want_eof && !self.eof_sent && !self.cancelled
+            && self.queue(INPUT_EOF, &[]).is_ok() {
+            self.eof_sent = true;
         }
         for _ in 0..8 {
             let Some(front) = self.queue.front() else { break; };
