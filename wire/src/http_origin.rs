@@ -32,7 +32,7 @@ fn parse(url: &str) -> Result<Origin, &'static str> {
     } else {
         return Err("URL is not HTTP(S)");
     };
-    let authority = rest.split(|ch| matches!(ch, '/' | '?' | '#')).next().unwrap_or("");
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
     if authority.is_empty()
         || authority.bytes().any(|b| b <= 0x20 || b >= 0x7f || b == b'@' || b == b'%' || b == b'\\')
     {

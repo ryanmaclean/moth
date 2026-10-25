@@ -630,6 +630,7 @@ fn render_session_error(e: &SessionError) -> String {
         SessionError::Model(s) => format!("model: {s}"),
         SessionError::Mailbox => "mailbox closed".into(),
         SessionError::TurnLimitExceeded => "turn limit exceeded".into(),
+        SessionError::Cancelled => "cancelled".into(),
     }
 }
 
