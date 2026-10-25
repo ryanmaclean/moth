@@ -817,7 +817,7 @@ mod prompt_stdin_reader_tests {
                 out[..4].copy_from_slice(b"part");
                 Ok(4)
             } else {
-                Err(io::Error::new(io::ErrorKind::Other, "injected read failure"))
+                Err(io::Error::other("injected read failure"))
             }
         }
     }
@@ -1154,7 +1154,6 @@ fn run_cmd_with_output(mut args: Vec<String>, out: &mut dyn std::io::Write) -> E
         };
         // A failed admission still reaches the common retirement barrier.
         let send_error = sess.addr.send(stream_msg).err().map(|e| e.to_string());
-        use std::io::Write as _;
         let mut completed = false;
         let mut turns = 0usize;
         let mut last_was_newline = true;
@@ -1200,14 +1199,14 @@ fn run_cmd_with_output(mut args: Vec<String>, out: &mut dyn std::io::Write) -> E
                     }
                 }
                 harness::StreamEvent::ToolUseStart { name, .. } => {
-                    if !last_was_newline {
-                        if let Err(e) = write_newline(out) {
-                            lifecycle_diagnostic!("stdout: {e}");
-                            break (
-                                ExitCode::from(1),
-                                AgentStatus::Failure(format!("stdout: {e}")),
-                            );
-                        }
+                    if !last_was_newline
+                        && let Err(e) = write_newline(out)
+                    {
+                        lifecycle_diagnostic!("stdout: {e}");
+                        break (
+                            ExitCode::from(1),
+                            AgentStatus::Failure(format!("stdout: {e}")),
+                        );
                     }
                     lifecycle_diagnostic!("[tool: {name}]");
                     last_was_newline = true;
@@ -1221,14 +1220,14 @@ fn run_cmd_with_output(mut args: Vec<String>, out: &mut dyn std::io::Write) -> E
                     turns = turn;
                 }
                 harness::StreamEvent::Done(pr) => {
-                    if !last_was_newline {
-                        if let Err(e) = write_newline(out) {
-                            lifecycle_diagnostic!("stdout: {e}");
-                            break (
-                                ExitCode::from(1),
-                                AgentStatus::Failure(format!("stdout: {e}")),
-                            );
-                        }
+                    if !last_was_newline
+                        && let Err(e) = write_newline(out)
+                    {
+                        lifecycle_diagnostic!("stdout: {e}");
+                        break (
+                            ExitCode::from(1),
+                            AgentStatus::Failure(format!("stdout: {e}")),
+                        );
                     }
                     completed = pr.completed;
                     turns = pr.turns;
@@ -1312,7 +1311,6 @@ fn run_cmd_with_output(mut args: Vec<String>, out: &mut dyn std::io::Write) -> E
             exit = ExitCode::from(1);
             agent_status = AgentStatus::Failure(format!("instance retirement: {error}"));
         }
-        drop(observe_signal);
         drop(task_tool);
         for client in &mcp_clients {
             client.request_stop();
@@ -1338,14 +1336,13 @@ fn run_cmd_with_output(mut args: Vec<String>, out: &mut dyn std::io::Write) -> E
         // No successful terminal audit record before the actual worker barrier
         // and strategy finalization. Native registry retirement is checked above;
         // its source API still requires independent integration/native admission.
-        if successful {
-            if let Err(error) =
+        if successful
+            && let Err(error) =
                 commit_done_after_retirement(runlog_handle.as_deref(), pending_done, Ok(()))
-            {
-                lifecycle_diagnostic!("{error}");
-                successful = false;
-                exit = ExitCode::from(1);
-            }
+        {
+            lifecycle_diagnostic!("{error}");
+            successful = false;
+            exit = ExitCode::from(1);
         }
         if successful && completed {
             lifecycle_diagnostic!("[completion signal fired after {turns} turn(s)]");
