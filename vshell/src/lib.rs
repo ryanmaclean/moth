@@ -763,7 +763,10 @@ mod native_owner_tests {
             let mut run = owner.spawn(spec(mode, 0)).unwrap();
             let (result, out, _) = finish(&mut run, &[]);
             assert!(result.success());
-            assert!(out.windows(16).any(|w| w == b"DESCENDANT-READY!"));
+            assert!(
+                out.windows(b"DESCENDANT-READY!".len())
+                    .any(|w| w == b"DESCENDANT-READY!")
+            );
             assert!(owner.retire_until(Instant::now() + Duration::from_secs(2)));
             assert!(matches!(sentinel.poll(), RunState::Running), "sibling owner was affected");
         }
