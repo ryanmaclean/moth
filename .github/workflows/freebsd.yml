@@ -46,7 +46,7 @@ jobs:
           #   git    — the `git` crate's tests shell out to git(1).
           #   curl + ca_root_nss — fetch rustup over TLS.
           prepare: |
-            pkg install -y curl ca_root_nss gmake perl5 git
+            pkg install -y curl ca_root_nss gmake perl5 git coreutils
           # rustup honours rust-toolchain.toml (channel 1.94.1), so the
           # FreeBSD build uses the exact toolchain Linux CI does. cargo
           # stays --offline against vendor/; only rustup hits the network.
@@ -70,3 +70,50 @@ jobs:
             # (process exec), wire (SIMD vs scalar dispatch). Full-workspace
             # test is skipped here — too slow under VM emulation.
             cargo test --locked --frozen --offline -p fstools -p git -p vshell -p wire
+            # This disposable VM is the outer owner for the selected native
+            # owner/FIFO fixtures. Each exact test has a separate watchdog;
+            # the private owner_fixture_entry must only run as a child.
+            command -v gtimeout
+            test -x "$PWD/target/debug/agent"
+            export MOTH_OWNER_TEST_AGENT="$PWD/target/debug/agent"
+            echo "owner fixture agent sha256: $(sha256 -q "$MOTH_OWNER_TEST_AGENT")"
+            for owner_test in \
+              exec::owned_redirect_tests::fifo_writer_open_waits_for_reader_but_observes_cancel \
+              exec::owned_redirect_tests::owned_fifo_open_precedes_real_payload_and_overrides_pipeline_input \
+              exec::owned_redirect_tests::fifo_writer_retains_partial_data_while_reader_progresses \
+              exec::owned_redirect_tests::fifo_full_output_pipe_observes_deadline_without_blocking_write_all \
+              exec::owned_redirect_tests::external_fifo_stdout_backpressure_does_not_starve_stderr_or_input \
+              native_owner_tests::shell_prefix_reader_preserves_success_but_default_requires_full_input \
+              native_owner_tests::zero_input_fast_exit_and_full_unicode_input_preserve_receipts \
+              native_owner_tests::separate_session_and_nested_reaper_retire_without_touching_sibling_owner \
+              native_owner_tests::cancel_stalled_input_does_not_wait_for_credit_or_discard_cancel \
+              native_owner_tests::dropped_lease_and_failed_spawn_remain_owned_until_native_receipt \
+              native_owner_tests::output_overflow_is_failure_with_confirmed_cleanup \
+              native_owner_tests::owned_redirect_order_append_and_malformed_request_controls
+            do
+              echo "::group::native owner fixture $owner_test"
+              fixture_log="$(mktemp)"
+              if gtimeout --signal=TERM --kill-after=10s 90s \
+                cargo test --locked --frozen --offline -p vshell --lib -- \
+                --ignored --exact "$owner_test" --nocapture --test-threads=1 \
+                > "$fixture_log" 2>&1; then
+                cat "$fixture_log"
+              else
+                fixture_status=$?
+                cat "$fixture_log"
+                rm -f "$fixture_log"
+                echo "native owner fixture failed or timed out: $owner_test ($fixture_status)" >&2
+                exit "$fixture_status"
+              fi
+              grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$fixture_log"
+              rm -f "$fixture_log"
+              # A passing test must not leave its agent owner or detached
+              # same-binary payload alive for the next selected fixture.
+              sleep 1
+              if pgrep -x agent >/dev/null || \
+                pgrep -f "$PWD/target/debug/deps/vshell-[[:xdigit:]]+" >/dev/null; then
+                echo "native owner fixture left a process behind: $owner_test" >&2
+                exit 1
+              fi
+              echo "::endgroup::"
+            done
