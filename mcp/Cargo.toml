@@ -2,6 +2,7 @@
 name = "mcp"
 version = "0.0.1"
 edition = "2024"
+license.workspace = true
 publish = false
 description = "Model Context Protocol client. Stdio + streamable-HTTP transports. Exposes remote tools as harness::Tool impls."
 

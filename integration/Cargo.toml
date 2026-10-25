@@ -2,6 +2,7 @@
 name = "integration"
 version = "0.0.1"
 edition = "2024"
+license.workspace = true
 publish = false
 description = "Cross-crate integration tests. Wires real vshell + fstools + audit + persist + mcp through the harness with scripted MockModel."
 

@@ -2,6 +2,7 @@
 name = "actor"
 version = "0.0.1"
 edition = "2024"
+license.workspace = true
 publish = false
 description = "Minimal actor primitive: OS threads, std::sync::mpsc, no dependencies."
 
