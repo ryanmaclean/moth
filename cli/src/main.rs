@@ -1199,14 +1199,9 @@ fn run_cmd_with_output(mut args: Vec<String>, out: &mut dyn std::io::Write) -> E
                     }
                 }
                 harness::StreamEvent::ToolUseStart { name, .. } => {
-                    if !last_was_newline
-                        && let Err(e) = write_newline(out)
-                    {
+                    if !last_was_newline && let Err(e) = write_newline(out) {
                         lifecycle_diagnostic!("stdout: {e}");
-                        break (
-                            ExitCode::from(1),
-                            AgentStatus::Failure(format!("stdout: {e}")),
-                        );
+                        break (ExitCode::from(1), AgentStatus::Failure(format!("stdout: {e}")));
                     }
                     lifecycle_diagnostic!("[tool: {name}]");
                     last_was_newline = true;
@@ -1220,14 +1215,9 @@ fn run_cmd_with_output(mut args: Vec<String>, out: &mut dyn std::io::Write) -> E
                     turns = turn;
                 }
                 harness::StreamEvent::Done(pr) => {
-                    if !last_was_newline
-                        && let Err(e) = write_newline(out)
-                    {
+                    if !last_was_newline && let Err(e) = write_newline(out) {
                         lifecycle_diagnostic!("stdout: {e}");
-                        break (
-                            ExitCode::from(1),
-                            AgentStatus::Failure(format!("stdout: {e}")),
-                        );
+                        break (ExitCode::from(1), AgentStatus::Failure(format!("stdout: {e}")));
                     }
                     completed = pr.completed;
                     turns = pr.turns;
