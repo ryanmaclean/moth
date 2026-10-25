@@ -391,7 +391,7 @@ unsafe fn run_easy_with_hook<F: FnMut(usize)>(
         {
             return Err(Error::Http("cross-origin OpenAI HTTP redirect refused".into()));
         }
-        use_post = use_post && !matches!(outcome.status, 301 | 302 | 303);
+        use_post = use_post && !matches!(outcome.status, 301..=303);
         current = CString::new(next).map_err(|_| Error::Http("redirect URL contains NUL".into()))?;
         after_redirect(hop);
     }
@@ -412,6 +412,7 @@ unsafe fn run_easy_once(
 
 // The proxy override is used only by the local CONNECT fixture; production
 // leaves libcurl's existing proxy selection untouched.
+#[allow(clippy::too_many_arguments)]
 unsafe fn run_easy_once_with_proxy(
     url: &CString,
     auth_header: &CString,
@@ -438,7 +439,7 @@ unsafe fn run_easy_once_with_proxy(
         setopt_ptr(easy, c::CURLOPT_URL, url.as_ptr() as *const c_void, "URL")?;
         if let Some(proxy) = proxy {
             setopt_ptr(easy, c::CURLOPT_PROXY, proxy.as_ptr() as *const c_void, "PROXY")?;
-            setopt_ptr(easy, c::CURLOPT_NOPROXY, b"\0".as_ptr() as *const c_void, "NOPROXY")?;
+            setopt_ptr(easy, c::CURLOPT_NOPROXY, c"".as_ptr() as *const c_void, "NOPROXY")?;
             setopt_long(easy, c::CURLOPT_HTTPPROXYTUNNEL, 1, "HTTPPROXYTUNNEL")?;
         }
         if use_post {

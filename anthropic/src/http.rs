@@ -301,6 +301,7 @@ unsafe fn run_easy(
     unsafe { run_easy_with_hook(url, key_header, version_header, content_type, accept, body, ctx, |_| {}) }
 }
 
+#[allow(clippy::too_many_arguments)]
 unsafe fn run_easy_with_hook<F: FnMut(usize)>(
     url: &CString,
     key_header: &CString,
@@ -335,13 +336,14 @@ unsafe fn run_easy_with_hook<F: FnMut(usize)>(
         {
             return Err(Error::Http("cross-origin Anthropic HTTP redirect refused".into()));
         }
-        use_post = use_post && !matches!(outcome.status, 301 | 302 | 303);
+        use_post = use_post && !matches!(outcome.status, 301..=303);
         current = CString::new(next).map_err(|_| Error::Http("redirect URL contains NUL".into()))?;
         after_redirect(hop);
     }
     unreachable!("bounded redirect loop returns")
 }
 
+#[allow(clippy::too_many_arguments)]
 unsafe fn run_easy_once(
     url: &CString,
     key_header: &CString,
