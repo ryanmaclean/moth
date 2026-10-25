@@ -351,10 +351,8 @@ impl Session {
         let emit = |evs: Option<&SyncSender<StreamEvent>>, ev: StreamEvent| -> bool {
             if cancel.is_requested() {
                 // Terminal notification is best effort and never blocks cleanup.
-                if matches!(&ev, StreamEvent::Cancelled) {
-                    if let Some(tx) = evs {
-                        let _ = tx.try_send(ev);
-                    }
+                if matches!(&ev, StreamEvent::Cancelled) && let Some(tx) = evs {
+                    let _ = tx.try_send(ev);
                 }
                 return false;
             }
