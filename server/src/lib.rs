@@ -192,19 +192,27 @@ impl Server {
                     // Per-connection I/O failures retain their existing local
                     // failure semantics. A worker panic is a server failure.
                     if worker.join().is_err() {
-                        failure.get_or_insert_with(|| io::Error::other("connection worker panicked"));
+                        failure
+                            .get_or_insert_with(|| io::Error::other("connection worker panicked"));
                         shutdown.store(true, Ordering::Release);
                     }
-                } else { index += 1; }
+                } else {
+                    index += 1;
+                }
             }
-            if shutdown.load(Ordering::Acquire) { break; }
+            if shutdown.load(Ordering::Acquire) {
+                break;
+            }
             let stream = match listener.accept() {
                 Ok((stream, _)) => stream,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(20));
                     continue;
                 }
-                Err(error) => { failure = Some(error); break; }
+                Err(error) => {
+                    failure = Some(error);
+                    break;
+                }
             };
             // Only this loop admits workers; the retained handle count is
             // the connection capacity until actual join, including panics.
@@ -212,7 +220,8 @@ impl Server {
                 let _ = stream.shutdown(std::net::Shutdown::Both);
                 continue;
             }
-            if let Err(error) = stream.set_read_timeout(Some(cfg.read_timeout))
+            if let Err(error) = stream
+                .set_read_timeout(Some(cfg.read_timeout))
                 .and_then(|()| stream.set_write_timeout(Some(cfg.write_timeout)))
             {
                 failure = Some(error);
@@ -221,9 +230,14 @@ impl Server {
             let server = shared.clone();
             let worker_cfg = cfg.clone();
             let worker_shutdown = shutdown.clone();
-            match thread::Builder::new().spawn(move || server.handle_connection_with_shutdown(stream, &worker_cfg, Some(&worker_shutdown))) {
+            match thread::Builder::new().spawn(move || {
+                server.handle_connection_with_shutdown(stream, &worker_cfg, Some(&worker_shutdown))
+            }) {
                 Ok(worker) => workers.push(worker),
-                Err(error) => { failure = Some(error); break; }
+                Err(error) => {
+                    failure = Some(error);
+                    break;
+                }
             }
         }
         // Close admission before the join barrier. Publish this on every
@@ -235,13 +249,21 @@ impl Server {
             while index < workers.len() {
                 if workers[index].is_finished() {
                     if workers.swap_remove(index).join().is_err() {
-                        failure.get_or_insert_with(|| io::Error::other("connection worker panicked"));
+                        failure
+                            .get_or_insert_with(|| io::Error::other("connection worker panicked"));
                     }
-                } else { index += 1; }
+                } else {
+                    index += 1;
+                }
             }
-            if !workers.is_empty() { thread::sleep(Duration::from_millis(10)); }
+            if !workers.is_empty() {
+                thread::sleep(Duration::from_millis(10));
+            }
         }
-        match failure { Some(error) => Err(error), None => Ok(()) }
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     fn handle_connection_with_shutdown(
@@ -251,7 +273,9 @@ impl Server {
         shutdown: Option<&AtomicBool>,
     ) -> io::Result<()> {
         loop {
-            if shutdown.is_some_and(|signal| signal.load(Ordering::Acquire)) { return Ok(()); }
+            if shutdown.is_some_and(|signal| signal.load(Ordering::Acquire)) {
+                return Ok(());
+            }
             // Each iteration handles one request. We must clone the stream
             // for buffered reads because BufReader takes ownership, but the
             // raw stream stays here for writing the response and (on
@@ -265,7 +289,9 @@ impl Server {
             let outcome = parse_request(&mut reader);
             // A blocked read may complete after shutdown. Do not dispatch the
             // newly parsed request or admit another keep-alive request then.
-            if shutdown.is_some_and(|signal| signal.load(Ordering::Acquire)) { return Ok(()); }
+            if shutdown.is_some_and(|signal| signal.load(Ordering::Acquire)) {
+                return Ok(());
+            }
 
             let keep_alive = match outcome {
                 Ok(req) => {
@@ -1418,7 +1444,13 @@ mod tests {
     fn shutdown_waits_for_actual_worker_retirement() {
         struct Held(std::sync::mpsc::Sender<()>, Mutex<std::sync::mpsc::Receiver<()>>);
         impl AgentHandler for Held {
-            fn handle(&self, _: &str, _: &str, _: &[u8], _: &mut EventSink) -> Result<(), HandlerError> {
+            fn handle(
+                &self,
+                _: &str,
+                _: &str,
+                _: &[u8],
+                _: &mut EventSink,
+            ) -> Result<(), HandlerError> {
                 self.0.send(()).unwrap();
                 self.1.lock().unwrap().recv().unwrap();
                 Ok(())
@@ -1434,7 +1466,8 @@ mod tests {
         let signal = shutdown.clone();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let owner = thread::spawn(move || {
-            let result = server.serve_listener_with_shutdown(listener, ServerConfig::default(), signal);
+            let result =
+                server.serve_listener_with_shutdown(listener, ServerConfig::default(), signal);
             done_tx.send(result).unwrap();
         });
         let mut socket = TcpStream::connect(addr).unwrap();
@@ -1445,8 +1478,13 @@ mod tests {
         // Release before asserting, so even a regression does not strand the fixture worker.
         release_tx.send(()).unwrap();
         let completed = match before_release {
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => done_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
-            _ => { owner.join().unwrap(); panic!("server returned before worker retirement"); }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                done_rx.recv_timeout(Duration::from_secs(5)).unwrap()
+            }
+            _ => {
+                owner.join().unwrap();
+                panic!("server returned before worker retirement");
+            }
         };
         owner.join().unwrap();
         assert!(completed.is_ok());
@@ -1456,7 +1494,13 @@ mod tests {
     fn worker_panic_is_a_failed_server_retirement() {
         struct Panics;
         impl AgentHandler for Panics {
-            fn handle(&self, _: &str, _: &str, _: &[u8], _: &mut EventSink) -> Result<(), HandlerError> {
+            fn handle(
+                &self,
+                _: &str,
+                _: &str,
+                _: &[u8],
+                _: &mut EventSink,
+            ) -> Result<(), HandlerError> {
                 panic!("finite worker failure")
             }
         }
@@ -1468,7 +1512,13 @@ mod tests {
         let stop = signal.clone();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let owner = thread::spawn(move || {
-            done_tx.send(server.serve_listener_with_shutdown(listener, ServerConfig::default(), signal)).unwrap();
+            done_tx
+                .send(server.serve_listener_with_shutdown(
+                    listener,
+                    ServerConfig::default(),
+                    signal,
+                ))
+                .unwrap();
         });
         let mut socket = TcpStream::connect(addr).unwrap();
         socket.write_all(b"POST /agents/panic/x HTTP/1.1\r\nContent-Length: 0\r\n\r\n").unwrap();
@@ -1482,7 +1532,13 @@ mod tests {
     fn shutdown_stops_dispatch_on_an_existing_connection() {
         struct Count(Arc<AtomicUsize>);
         impl AgentHandler for Count {
-            fn handle(&self, _: &str, _: &str, _: &[u8], _: &mut EventSink) -> Result<(), HandlerError> {
+            fn handle(
+                &self,
+                _: &str,
+                _: &str,
+                _: &[u8],
+                _: &mut EventSink,
+            ) -> Result<(), HandlerError> {
                 self.0.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             }
@@ -1496,9 +1552,13 @@ mod tests {
         server.register("count", Box::new(Count(count.clone())));
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = stop.clone();
-        let worker = thread::spawn(move || server.handle_connection_with_shutdown(
-            socket, &ServerConfig::default(), Some(&worker_stop),
-        ));
+        let worker = thread::spawn(move || {
+            server.handle_connection_with_shutdown(
+                socket,
+                &ServerConfig::default(),
+                Some(&worker_stop),
+            )
+        });
         // This socket was already accepted. Shutdown precedes arrival of a
         // dispatchable request, whether the worker is about to read or in read.
         stop.store(true, Ordering::Release);

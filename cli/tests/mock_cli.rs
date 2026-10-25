@@ -161,7 +161,15 @@ fn prompt_stdin_preserves_utf8_newlines_and_opens_requested_runlog() {
     let logs = dir.join("logs");
     let input = "first line\nsecond  café\n";
     let (code, stdout, stderr) = run_agent_stdin(
-        &["run", "--mock", "--prompt-stdin", "--runlog", logs.to_str().unwrap(), "--run-id", "pipe-1"],
+        &[
+            "run",
+            "--mock",
+            "--prompt-stdin",
+            "--runlog",
+            logs.to_str().unwrap(),
+            "--run-id",
+            "pipe-1",
+        ],
         input.as_bytes(),
     );
     assert_eq!(code, Some(0), "stdout={stdout:?} stderr={stderr:?}");
@@ -178,7 +186,15 @@ fn prompt_stdin_invalid_and_empty_input_precede_audit() {
         let dir = tempdir("prompt_stdin_bad");
         let logs = dir.join("logs");
         let (code, stdout, stderr) = run_agent_stdin(
-            &["run", "--mock", "--prompt-stdin", "--runlog", logs.to_str().unwrap(), "--run-id", "pipe-bad"],
+            &[
+                "run",
+                "--mock",
+                "--prompt-stdin",
+                "--runlog",
+                logs.to_str().unwrap(),
+                "--run-id",
+                "pipe-bad",
+            ],
             input,
         );
         assert_eq!(code, Some(2), "stdout={stdout:?} stderr={stderr:?}");
@@ -429,8 +445,14 @@ fn cleanup(p: &std::path::Path) {
 fn mock_task_tool_releases_parent_state_and_finishes_receipt() {
     let dir = tempdir("task_tool_cycle");
     let (code, stdout, stderr) = run_agent(&[
-        "run", "--mock", "--task-tool", "--runlog", dir.to_str().unwrap(),
-        "--run-id", "task-cycle", "synthetic parent state cycle",
+        "run",
+        "--mock",
+        "--task-tool",
+        "--runlog",
+        dir.to_str().unwrap(),
+        "--run-id",
+        "task-cycle",
+        "synthetic parent state cycle",
     ]);
     assert_eq!(code, Some(0), "stdout={stdout:?} stderr={stderr:?}");
     let lines = runlog_lines(&dir, "task-cycle");

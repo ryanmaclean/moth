@@ -209,7 +209,8 @@ fn post_with_budget(
     let started = std::time::Instant::now();
     let mut current = url.to_string();
     for hop in 0..=10 {
-        let remaining = budget.checked_sub(started.elapsed())
+        let remaining = budget
+            .checked_sub(started.elapsed())
             .filter(|time| !time.is_zero())
             .ok_or_else(|| "MCP HTTP redirect deadline exceeded".to_string())?;
         let (response, redirect) = post_once(&current, body, bearer, session, remaining)?;
@@ -278,9 +279,19 @@ fn post_once(
         setopt_long(easy, c::CURLOPT_POSTFIELDSIZE, body.len() as i64, "POSTFIELDSIZE")?;
         setopt_ptr(easy, c::CURLOPT_HTTPHEADER, headers as *const c_void, "HTTPHEADER")?;
         setopt_ptr(easy, c::CURLOPT_WRITEFUNCTION, write_cb as *const c_void, "WRITEFUNCTION")?;
-        setopt_ptr(easy, c::CURLOPT_WRITEDATA, (&mut body_buf as *mut Vec<u8>) as *const c_void, "WRITEDATA")?;
+        setopt_ptr(
+            easy,
+            c::CURLOPT_WRITEDATA,
+            (&mut body_buf as *mut Vec<u8>) as *const c_void,
+            "WRITEDATA",
+        )?;
         setopt_ptr(easy, c::CURLOPT_HEADERFUNCTION, header_cb as *const c_void, "HEADERFUNCTION")?;
-        setopt_ptr(easy, c::CURLOPT_HEADERDATA, (&mut header_buf as *mut Vec<u8>) as *const c_void, "HEADERDATA")?;
+        setopt_ptr(
+            easy,
+            c::CURLOPT_HEADERDATA,
+            (&mut header_buf as *mut Vec<u8>) as *const c_void,
+            "HEADERDATA",
+        )?;
         setopt_long(easy, c::CURLOPT_NOPROGRESS, 1, "NOPROGRESS")?;
         setopt_long(easy, c::CURLOPT_FOLLOWLOCATION, 0, "FOLLOWLOCATION")?;
         setopt_long(easy, c::CURLOPT_CONNECTTIMEOUT, 10, "CONNECTTIMEOUT")?;
@@ -296,8 +307,12 @@ fn post_once(
         let mut redirect_ptr: *mut std::os::raw::c_char = ptr::null_mut();
         let info_rc = c::curl_easy_getinfo(easy, c::CURLINFO_REDIRECT_URL, &mut redirect_ptr);
         let redirect = if info_rc == c::CURLE_OK && !redirect_ptr.is_null() {
-            Some(std::ffi::CStr::from_ptr(redirect_ptr).to_str()
-                .map_err(|_| "redirect URL is not UTF-8")?.to_owned())
+            Some(
+                std::ffi::CStr::from_ptr(redirect_ptr)
+                    .to_str()
+                    .map_err(|_| "redirect URL is not UTF-8")?
+                    .to_owned(),
+            )
         } else {
             None
         };
@@ -311,12 +326,15 @@ fn post_once(
         (status, redirect)
     };
     let (content_type_sse, session_id) = parse_headers(&header_buf);
-    Ok((Response {
-        status: perform_status.clamp(0, u16::MAX as i64) as u16,
-        body: body_buf,
-        content_type_sse,
-        session_id,
-    }, redirect))
+    Ok((
+        Response {
+            status: perform_status.clamp(0, u16::MAX as i64) as u16,
+            body: body_buf,
+            content_type_sse,
+            session_id,
+        },
+        redirect,
+    ))
 }
 
 /// Read only the final HTTP response block. libcurl may deliver an interim
@@ -333,7 +351,8 @@ fn parse_headers(buf: &[u8]) -> (bool, Option<String>) {
             // including an interim 100 or proxy CONNECT block.
             sse = false;
             session = None;
-            in_headers = std::str::from_utf8(line).ok()
+            in_headers = std::str::from_utf8(line)
+                .ok()
                 .and_then(|text| text.split_ascii_whitespace().nth(1))
                 .and_then(|digits| digits.parse::<u16>().ok())
                 .is_some_and(|code| (100..600).contains(&code));
@@ -974,7 +993,8 @@ mod tests {
                 Reply::json(status, Vec::<u8>::new()).with_location(target.addr.clone()),
             ]);
             let err = post(&source.addr, b"{}", Some("bearer-sentinel"), Some("session-sentinel"))
-                .err().expect("cross-origin redirect must be refused before transfer");
+                .err()
+                .expect("cross-origin redirect must be refused before transfer");
             assert!(err.contains("cross-origin"), "unexpected error: {err}");
             let original = source.captured.lock().unwrap();
             assert_eq!(original.len(), 1);
@@ -1017,7 +1037,8 @@ mod tests {
                 Reply::json(200, br#"{"unexpected":true}"#.to_vec()),
             ]);
             let err = post(&source.addr, b"{}", Some("bearer-sentinel"), Some("session-sentinel"))
-                .err().expect("MCP POST must reject method-changing redirect");
+                .err()
+                .expect("MCP POST must reject method-changing redirect");
             assert!(err.contains("method-changing"), "{err}");
             let requests = source.captured.lock().unwrap();
             assert_eq!(requests.len(), 1);
@@ -1058,12 +1079,12 @@ mod tests {
 
     #[test]
     fn same_origin_redirect_loop_hits_hop_cap() {
-        let replies = (0..11).map(|_| {
-            Reply::json(307, Vec::<u8>::new()).with_location("/mcp")
-        }).collect();
+        let replies =
+            (0..11).map(|_| Reply::json(307, Vec::<u8>::new()).with_location("/mcp")).collect();
         let source = start_mock(replies);
         let err = post(&source.addr, b"{}", None, Some("session-sentinel"))
-            .err().expect("redirect loop must stop");
+            .err()
+            .expect("redirect loop must stop");
         assert!(err.contains("limit"), "{err}");
         assert_eq!(source.captured.lock().unwrap().len(), 11);
     }
@@ -1072,8 +1093,14 @@ mod tests {
     fn exhausted_deadline_starts_no_transfer() {
         let source = start_mock(vec![Reply::json(200, b"{}".to_vec())]);
         let err = post_with_budget(
-            &source.addr, b"{}", None, Some("session-sentinel"), std::time::Duration::ZERO
-        ).err().expect("zero budget must fail before transfer");
+            &source.addr,
+            b"{}",
+            None,
+            Some("session-sentinel"),
+            std::time::Duration::ZERO,
+        )
+        .err()
+        .expect("zero budget must fail before transfer");
         assert!(err.contains("deadline"), "{err}");
         assert!(source.captured.lock().unwrap().is_empty());
     }

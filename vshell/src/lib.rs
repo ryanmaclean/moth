@@ -11,9 +11,9 @@
 //! arithmetic, arrays, backticks, job control) deliberately error out.
 
 mod exec;
+mod lex;
 #[doc(hidden)]
 pub mod ownership;
-mod lex;
 mod parse;
 
 pub use exec::{ExecResult, VShell};
@@ -582,35 +582,53 @@ mod native_owner_tests {
     //! Authored native acceptance controls; never executed in this source packet.
     //! Run only on an admitted FreeBSD target, inside the independently owned
     //! outer fixture, with MOTH_OWNER_TEST_AGENT naming the exact selected agent.
+    use crate::ownership::{CommandSpec, Limits, OwnedRun, OwnerRegistry, Retirement, RunState};
     use std::ffi::OsString;
     use std::io::{self, BufRead, Read, Write};
     use std::path::PathBuf;
     use std::process::{Command, Stdio};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
-    use crate::ownership::{CommandSpec, Limits, OwnedRun, OwnerRegistry, Retirement, RunState};
-    
+
     fn registry() -> Arc<OwnerRegistry> {
-        let agent = PathBuf::from(std::env::var_os("MOTH_OWNER_TEST_AGENT").expect("explicit admitted agent path required"));
+        let agent = PathBuf::from(
+            std::env::var_os("MOTH_OWNER_TEST_AGENT")
+                .expect("explicit admitted agent path required"),
+        );
         OwnerRegistry::new(agent).unwrap()
     }
     fn spec(mode: &str, input_bytes: u64) -> CommandSpec {
         CommandSpec {
             program: std::env::current_exe().unwrap().into_os_string(),
-            args: ["--ignored", "--exact", "native_owner_tests::owner_fixture_entry", "--nocapture", "--test-threads=1"].map(OsString::from).to_vec(),
-            cwd: None, env: vec![("MOTH_OWNER_FIXTURE_MODE".into(), mode.into())],
-            limits: Limits { deadline: Duration::from_secs(20), capture_bytes: 1024 * 1024, input_bytes },
+            args: [
+                "--ignored",
+                "--exact",
+                "native_owner_tests::owner_fixture_entry",
+                "--nocapture",
+                "--test-threads=1",
+            ]
+            .map(OsString::from)
+            .to_vec(),
+            cwd: None,
+            env: vec![("MOTH_OWNER_FIXTURE_MODE".into(), mode.into())],
+            limits: Limits {
+                deadline: Duration::from_secs(20),
+                capture_bytes: 1024 * 1024,
+                input_bytes,
+            },
         }
     }
     fn finish(run: &mut OwnedRun, input: &[u8]) -> (Retirement, Vec<u8>, Vec<u8>) {
         let deadline = Instant::now() + Duration::from_secs(30);
-        let mut sent = 0; let mut out = Vec::new(); let mut err = Vec::new();
+        let mut sent = 0;
+        let mut out = Vec::new();
+        let mut err = Vec::new();
         let mut buffer = [0u8; 16_384];
         loop {
             if sent < input.len() {
                 match run.write(&input[sent..]) {
                     Ok(n) => sent += n,
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {},
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
                     Err(e) => panic!("fixture input failed: {e}"),
                 }
             }
@@ -618,10 +636,17 @@ mod native_owner_tests {
             // actual paired protocol and the fast-exit closure race.
             for error in [false, true] {
                 loop {
-                    let result = if error { run.read_stderr(&mut buffer) } else { run.read(&mut buffer) };
+                    let result =
+                        if error { run.read_stderr(&mut buffer) } else { run.read(&mut buffer) };
                     match result {
                         Ok(0) => break,
-                        Ok(n) => if error { err.extend_from_slice(&buffer[..n]); } else { out.extend_from_slice(&buffer[..n]); },
+                        Ok(n) => {
+                            if error {
+                                err.extend_from_slice(&buffer[..n]);
+                            } else {
+                                out.extend_from_slice(&buffer[..n]);
+                            }
+                        }
                         Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                         Err(e) => panic!("fixture output failed: {e}"),
                     }
@@ -632,7 +657,13 @@ mod native_owner_tests {
                 // A final poll can have captured new buffered data; drain after
                 // retirement too, before comparing the complete payload.
                 run.read_to_end(&mut out).unwrap();
-                loop { let n = run.read_stderr(&mut buffer).unwrap(); if n == 0 { break; } err.extend_from_slice(&buffer[..n]); }
+                loop {
+                    let n = run.read_stderr(&mut buffer).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    err.extend_from_slice(&buffer[..n]);
+                }
                 return (result, out, err);
             }
             assert!(Instant::now() < deadline, "retirement unconfirmed: {:?}", run.poll());
@@ -646,32 +677,43 @@ mod native_owner_tests {
         for shell_policy in [false, true] {
             let owner = registry();
             let command = spec("prefix", input.len() as u64);
-            let mut run = if shell_policy { owner.spawn_redirected(command, &[]).unwrap() }
-                else { owner.spawn_cleared(command).unwrap() };
+            let mut run = if shell_policy {
+                owner.spawn_redirected(command, &[]).unwrap()
+            } else {
+                owner.spawn_cleared(command).unwrap()
+            };
             let deadline = Instant::now() + Duration::from_secs(30);
-            let mut sent = 0; let mut stopped = false; let mut buffer = [0u8; 16_384];
+            let mut sent = 0;
+            let mut stopped = false;
+            let mut buffer = [0u8; 16_384];
             let outcome = loop {
                 if !stopped && sent < input.len() && matches!(run.poll(), RunState::Running) {
                     match run.write(&input[sent..]) {
                         Ok(n) => sent += n,
-                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {},
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
                         Err(e) if e.kind() == io::ErrorKind::BrokenPipe => stopped = true,
                         Err(e) => panic!("{e}"),
                     }
                 }
                 for error in [false, true] {
                     match if error { run.read_stderr(&mut buffer) } else { run.read(&mut buffer) } {
-                        Ok(_) => {}, Err(e) if e.kind() == io::ErrorKind::WouldBlock => {},
+                        Ok(_) => {}
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
                         Err(e) => panic!("{e}"),
                     }
                 }
-                if let RunState::Retired(result) = run.poll() { break result; }
+                if let RunState::Retired(result) = run.poll() {
+                    break result;
+                }
                 assert!(Instant::now() < deadline, "unconfirmed: {:?}", run.poll());
                 std::thread::sleep(Duration::from_millis(5));
             };
             assert!(sent < input.len(), "fixture failed to establish a prefix consumer");
-            if shell_policy { assert!(outcome.success(), "{outcome:?}"); }
-            else { assert_eq!(outcome.reason, 4, "strict full-input policy was weakened"); }
+            if shell_policy {
+                assert!(outcome.success(), "{outcome:?}");
+            } else {
+                assert_eq!(outcome.reason, 4, "strict full-input policy was weakened");
+            }
             assert!(owner.retire_until(Instant::now() + Duration::from_secs(2)));
         }
     }
@@ -681,14 +723,14 @@ mod native_owner_tests {
         loop {
             match run.poll() {
                 RunState::Running => return,
-                RunState::Starting => {},
+                RunState::Starting => {}
                 other => panic!("did not start: {other:?}"),
             }
             assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(5));
         }
     }
-    
+
     #[test]
     #[ignore = "requires admitted FreeBSD native target and exact agent; unrun"]
     fn zero_input_fast_exit_and_full_unicode_input_preserve_receipts() {
@@ -696,16 +738,20 @@ mod native_owner_tests {
         for _ in 0..16 {
             let mut run = owner.spawn(spec("fast", 0)).unwrap();
             let (result, out, _) = finish(&mut run, &[]);
-            assert!(result.success()); assert!(out.windows(10).any(|w| w == b"FAST-OWNED"));
+            assert!(result.success());
+            assert!(out.windows(10).any(|w| w == b"FAST-OWNED"));
         }
         let input = "full-prompt-♥-🂡\n".repeat(8192).into_bytes();
         let mut run = owner.spawn(spec("echo", input.len() as u64)).unwrap();
         let (result, out, _) = finish(&mut run, &input);
         assert!(result.success());
-        assert!(out.windows(input.len()).any(|w| w == input.as_slice()), "full input lost or truncated");
+        assert!(
+            out.windows(input.len()).any(|w| w == input.as_slice()),
+            "full input lost or truncated"
+        );
         assert!(owner.retire_until(Instant::now() + Duration::from_secs(2)));
     }
-    
+
     #[test]
     #[ignore = "requires admitted FreeBSD native target and exact agent; unrun"]
     fn separate_session_and_nested_reaper_retire_without_touching_sibling_owner() {
@@ -724,7 +770,7 @@ mod native_owner_tests {
         sentinel.cancel();
         assert!(sentinel_owner.retire_until(Instant::now() + Duration::from_secs(10)));
     }
-    
+
     #[test]
     #[ignore = "requires admitted FreeBSD native target and exact agent; unrun"]
     fn cancel_stalled_input_does_not_wait_for_credit_or_discard_cancel() {
@@ -733,30 +779,40 @@ mod native_owner_tests {
         wait_running(&run);
         let bytes = [0u8; 16_384];
         let deadline = Instant::now() + Duration::from_secs(5);
-        let mut accepted = 0; let mut blocked = 0;
+        let mut accepted = 0;
+        let mut blocked = 0;
         loop {
             match run.write(&bytes) {
-                Ok(n) => { accepted += n; blocked = 0; },
+                Ok(n) => {
+                    accepted += n;
+                    blocked = 0;
+                }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => blocked += 1,
                 Err(e) => panic!("{e}"),
             }
-            if accepted >= 32_768 && blocked >= 20 { break; }
+            if accepted >= 32_768 && blocked >= 20 {
+                break;
+            }
             assert!(Instant::now() < deadline, "did not establish actual input backpressure");
             std::thread::sleep(Duration::from_millis(5));
         }
         // Repetition specifically guards the former unsent-Cancel deletion bug.
-        run.cancel(); run.cancel(); owner.cancel_all(); owner.cancel_all();
+        run.cancel();
+        run.cancel();
+        owner.cancel_all();
+        owner.cancel_all();
         let (result, _, _) = finish(&mut run, &[]);
         assert_eq!(result.reason, 1);
         assert!(owner.retire_until(Instant::now() + Duration::from_secs(2)));
     }
-    
+
     #[test]
     #[ignore = "requires admitted FreeBSD native target and exact agent; unrun"]
     fn dropped_lease_and_failed_spawn_remain_owned_until_native_receipt() {
         let owner = registry();
         let run = owner.spawn(spec("leaf", 0)).unwrap();
-        wait_running(&run); drop(run);
+        wait_running(&run);
+        drop(run);
         assert!(owner.retire_until(Instant::now() + Duration::from_secs(10)));
         assert!(owner.spawn(spec("fast", 0)).is_err(), "closed admission reopened");
         let owner = registry();
@@ -764,105 +820,199 @@ mod native_owner_tests {
         missing.program = "/__moth_owner_fixture_missing__/no-program".into();
         let mut run = owner.spawn(missing).unwrap();
         let (result, _, _) = finish(&mut run, &[]);
-        assert_eq!(result.reason, 5); assert!(!result.success());
+        assert_eq!(result.reason, 5);
+        assert!(!result.success());
         assert_eq!(result.payload_exit_code, None);
         assert!(owner.retire_until(Instant::now() + Duration::from_secs(2)));
     }
-    
+
     #[test]
     #[ignore = "requires admitted FreeBSD native target and exact agent; unrun"]
     fn output_overflow_is_failure_with_confirmed_cleanup() {
         let owner = registry();
         let mut run = owner.spawn(spec("flood", 0)).unwrap();
         let (result, _, _) = finish(&mut run, &[]);
-        assert_eq!(result.reason, 3); assert!(!result.success());
+        assert_eq!(result.reason, 3);
+        assert!(!result.success());
         assert!(owner.retire_until(Instant::now() + Duration::from_secs(2)));
     }
-    
+
     fn spawn_fixture(mode: &str) -> std::process::Child {
         let mut child = Command::new(std::env::current_exe().unwrap())
-            .args(["--ignored", "--exact", "native_owner_tests::owner_fixture_entry", "--nocapture", "--test-threads=1"])
-            .env("MOTH_OWNER_FIXTURE_MODE", mode).stdin(Stdio::null())
-            .stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn().unwrap();
+            .args([
+                "--ignored",
+                "--exact",
+                "native_owner_tests::owner_fixture_entry",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("MOTH_OWNER_FIXTURE_MODE", mode)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
         // Confirm the descendant established its separate session/reaper before
         // allowing the direct payload to exit. Its inherited stderr keeps a
         // captured native endpoint open until actual descendant retirement.
         let mut reader = io::BufReader::new(child.stdout.take().unwrap());
         let mut line = String::new();
         loop {
-            line.clear(); assert_ne!(reader.read_line(&mut line).unwrap(), 0);
-            if line.contains("OWNED-CHILD-READY") { break; }
+            line.clear();
+            assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+            if line.contains("OWNED-CHILD-READY") {
+                break;
+            }
         }
         child
     }
-    
+
     #[test]
     #[ignore = "private payload entry; invoke only through admitted owner fixture"]
     fn owner_fixture_entry() {
-        let Some(mode) = std::env::var_os("MOTH_OWNER_FIXTURE_MODE") else { return; };
+        let Some(mode) = std::env::var_os("MOTH_OWNER_FIXTURE_MODE") else {
+            return;
+        };
         let mode = mode.to_str().expect("selected fixture mode must be UTF-8");
         match mode {
             "fast" => println!("FAST-OWNED"),
             "announce-echo" => {
-            std::fs::write(std::env::var_os("MOTH_OWNER_MARKER").unwrap(), b"started").unwrap();
-            let mut input = Vec::new(); io::stdin().read_to_end(&mut input).unwrap(); io::stdout().write_all(&input).unwrap();
-        }
-        "streams" => { io::stdout().write_all(b"PAYLOAD-STDOUT\n").unwrap(); io::stderr().write_all(b"PAYLOAD-STDERR\n").unwrap(); }
-        "prefix" => { let mut byte = [0u8; 1]; io::stdin().read_exact(&mut byte).unwrap(); assert_eq!(byte[0], 0x61); }
-        "echo" => { let mut input = Vec::new(); io::stdin().read_to_end(&mut input).unwrap(); io::stdout().write_all(&input).unwrap(); }
-        "duplex" => {
-            std::thread::scope(|scope| {
-                scope.spawn(|| { io::stdout().write_all(&vec![0xff; 2 * 1024 * 1024]).unwrap(); });
-                io::stderr().write_all(b"DUPLEX-STDERR-READY\n").unwrap(); io::stderr().flush().unwrap();
-                let mut input = Vec::new(); io::stdin().read_to_end(&mut input).unwrap();
-                assert_eq!(input, b"duplex-input");
-            });
-        }
+                std::fs::write(std::env::var_os("MOTH_OWNER_MARKER").unwrap(), b"started").unwrap();
+                let mut input = Vec::new();
+                io::stdin().read_to_end(&mut input).unwrap();
+                io::stdout().write_all(&input).unwrap();
+            }
+            "streams" => {
+                io::stdout().write_all(b"PAYLOAD-STDOUT\n").unwrap();
+                io::stderr().write_all(b"PAYLOAD-STDERR\n").unwrap();
+            }
+            "prefix" => {
+                let mut byte = [0u8; 1];
+                io::stdin().read_exact(&mut byte).unwrap();
+                assert_eq!(byte[0], 0x61);
+            }
+            "echo" => {
+                let mut input = Vec::new();
+                io::stdin().read_to_end(&mut input).unwrap();
+                io::stdout().write_all(&input).unwrap();
+            }
+            "duplex" => {
+                std::thread::scope(|scope| {
+                    scope.spawn(|| {
+                        io::stdout().write_all(&vec![0xff; 2 * 1024 * 1024]).unwrap();
+                    });
+                    io::stderr().write_all(b"DUPLEX-STDERR-READY\n").unwrap();
+                    io::stderr().flush().unwrap();
+                    let mut input = Vec::new();
+                    io::stdin().read_to_end(&mut input).unwrap();
+                    assert_eq!(input, b"duplex-input");
+                });
+            }
             "spawn-session" | "spawn-nested" => {
-                let child = spawn_fixture(if mode == "spawn-session" { "session-leaf" } else { "nested" });
+                let child =
+                    spawn_fixture(if mode == "spawn-session" { "session-leaf" } else { "nested" });
                 println!("DESCENDANT-READY!");
                 // The private owner, not Child::drop, retains native authority.
                 drop(child);
             }
             "session-leaf" | "nested" | "leaf" => {
-                unsafe { assert_ne!(libc::signal(libc::SIGTERM, libc::SIG_IGN), libc::SIG_ERR); }
-                if mode == "session-leaf" { assert!(unsafe { libc::setsid() } > 0); }
+                unsafe {
+                    assert_ne!(libc::signal(libc::SIGTERM, libc::SIG_IGN), libc::SIG_ERR);
+                }
+                if mode == "session-leaf" {
+                    assert!(unsafe { libc::setsid() } > 0);
+                }
                 let child = if mode == "nested" {
-                    assert_eq!(unsafe { libc::procctl(libc::P_PID, 0, libc::PROC_REAP_ACQUIRE, std::ptr::null_mut()) }, 0);
+                    assert_eq!(
+                        unsafe {
+                            libc::procctl(
+                                libc::P_PID,
+                                0,
+                                libc::PROC_REAP_ACQUIRE,
+                                std::ptr::null_mut(),
+                            )
+                        },
+                        0
+                    );
                     Some(spawn_fixture("leaf"))
-                } else { None };
-                println!("OWNED-CHILD-READY"); io::stdout().flush().unwrap();
-                std::thread::sleep(Duration::from_secs(60)); drop(child);
+                } else {
+                    None
+                };
+                println!("OWNED-CHILD-READY");
+                io::stdout().flush().unwrap();
+                std::thread::sleep(Duration::from_secs(60));
+                drop(child);
             }
-            "flood" => { let bytes = [b'x'; 16_384]; loop { if io::stdout().write_all(&bytes).is_err() { break; } } }
+            "flood" => {
+                let bytes = [b'x'; 16_384];
+                loop {
+                    if io::stdout().write_all(&bytes).is_err() {
+                        break;
+                    }
+                }
+            }
             _ => panic!("invalid fixture mode"),
         }
     }
-    
+
     #[test]
     #[ignore = "requires admitted FreeBSD native target and exact agent; unrun"]
     fn owned_redirect_order_append_and_malformed_request_controls() {
         use crate::ownership::OwnedRedirect as R;
-        let root = std::env::temp_dir().join(format!("moth-launch-order-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
-        std::fs::create_dir(&root).unwrap(); let path = root.join("output"); let untouched = root.join("must-not-exist");
+        let root = std::env::temp_dir().join(format!(
+            "moth-launch-order-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("output");
+        let untouched = root.join("must-not-exist");
         let owner = registry();
-        let mut run = owner.spawn_redirected(spec("streams", 0), &[R::ErrorToOutput, R::Output { path: path.clone(), append: false }]).unwrap();
-        let (result, out, err) = finish(&mut run, &[]); assert!(result.success());
+        let mut run = owner
+            .spawn_redirected(
+                spec("streams", 0),
+                &[R::ErrorToOutput, R::Output { path: path.clone(), append: false }],
+            )
+            .unwrap();
+        let (result, out, err) = finish(&mut run, &[]);
+        assert!(result.success());
         let file = std::fs::read(&path).unwrap();
         assert!(out.windows(14).any(|w| w == b"PAYLOAD-STDERR"));
-        assert!(!out.windows(14).any(|w| w == b"PAYLOAD-STDOUT")); assert!(err.is_empty());
+        assert!(!out.windows(14).any(|w| w == b"PAYLOAD-STDOUT"));
+        assert!(err.is_empty());
         assert!(file.windows(14).any(|w| w == b"PAYLOAD-STDOUT"));
         assert!(!file.windows(14).any(|w| w == b"PAYLOAD-STDERR"));
-        let mut run = owner.spawn_redirected(spec("streams", 0), &[R::Output { path: path.clone(), append: false }, R::ErrorToOutput]).unwrap();
-        let (result, out, err) = finish(&mut run, &[]); assert!(result.success()); assert!(out.is_empty() && err.is_empty());
-        let before = std::fs::read(&path).unwrap(); assert!(before.windows(14).any(|w| w == b"PAYLOAD-STDOUT")); assert!(before.windows(14).any(|w| w == b"PAYLOAD-STDERR"));
-        let mut run = owner.spawn_redirected(spec("streams", 0), &[R::Output { path: path.clone(), append: true }, R::ErrorToOutput]).unwrap();
-        assert!(finish(&mut run, &[]).0.success()); let after = std::fs::read(&path).unwrap(); assert!(after.starts_with(&before) && after.len() > before.len());
-        let mut bad = spec("fast", 0); bad.args.push(OsString::from("bad\0argument"));
-        assert!(owner.spawn_redirected(bad, &[R::Output { path: untouched.clone(), append: false }]).is_err());
+        let mut run = owner
+            .spawn_redirected(
+                spec("streams", 0),
+                &[R::Output { path: path.clone(), append: false }, R::ErrorToOutput],
+            )
+            .unwrap();
+        let (result, out, err) = finish(&mut run, &[]);
+        assert!(result.success());
+        assert!(out.is_empty() && err.is_empty());
+        let before = std::fs::read(&path).unwrap();
+        assert!(before.windows(14).any(|w| w == b"PAYLOAD-STDOUT"));
+        assert!(before.windows(14).any(|w| w == b"PAYLOAD-STDERR"));
+        let mut run = owner
+            .spawn_redirected(
+                spec("streams", 0),
+                &[R::Output { path: path.clone(), append: true }, R::ErrorToOutput],
+            )
+            .unwrap();
+        assert!(finish(&mut run, &[]).0.success());
+        let after = std::fs::read(&path).unwrap();
+        assert!(after.starts_with(&before) && after.len() > before.len());
+        let mut bad = spec("fast", 0);
+        bad.args.push(OsString::from("bad\0argument"));
+        assert!(
+            owner
+                .spawn_redirected(bad, &[R::Output { path: untouched.clone(), append: false }])
+                .is_err()
+        );
         assert!(!untouched.exists(), "malformed request caused filesystem effects");
         assert!(owner.retire_until(Instant::now() + Duration::from_secs(2)));
-        std::fs::remove_file(path).unwrap(); std::fs::remove_dir(root).unwrap();
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(root).unwrap();
     }
-
 }

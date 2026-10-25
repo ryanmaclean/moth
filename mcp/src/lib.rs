@@ -79,16 +79,26 @@ impl McpInner {
         self.transport.request_stop();
     }
 
-    fn acquire_request(&self, deadline: std::time::Instant) -> Result<std::sync::MutexGuard<'_, ()>, McpError> {
+    fn acquire_request(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<std::sync::MutexGuard<'_, ()>, McpError> {
         loop {
             if self.stopped.load(Ordering::Acquire) || std::time::Instant::now() >= deadline {
                 self.stop();
-                return Err(McpError::Transport("MCP request cancelled or timed out while queued".into()));
+                return Err(McpError::Transport(
+                    "MCP request cancelled or timed out while queued".into(),
+                ));
             }
             match self.request_gate.try_lock() {
                 Ok(guard) => return Ok(guard),
-                Err(std::sync::TryLockError::WouldBlock) => std::thread::sleep(std::time::Duration::from_millis(10)),
-                Err(std::sync::TryLockError::Poisoned(_)) => { self.stop(); return Err(McpError::Transport("MCP request lock poisoned".into())); }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10))
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    self.stop();
+                    return Err(McpError::Transport("MCP request lock poisoned".into()));
+                }
             }
         }
     }
@@ -111,11 +121,18 @@ impl McpInner {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let _request = self.acquire_request(deadline)?;
         let result = self.request_locked(method, params, deadline);
-        if matches!(&result, Err(McpError::Transport(_)) | Err(McpError::Protocol(_))) { self.stop(); }
+        if matches!(&result, Err(McpError::Transport(_)) | Err(McpError::Protocol(_))) {
+            self.stop();
+        }
         result
     }
 
-    fn request_locked(&self, method: &str, params: Option<&str>, deadline: std::time::Instant) -> Result<Json, McpError> {
+    fn request_locked(
+        &self,
+        method: &str,
+        params: Option<&str>,
+        deadline: std::time::Instant,
+    ) -> Result<Json, McpError> {
         let id = self.next_id();
         let body = jsonrpc::build_request(id, method, params);
         self.transport.send_line_until(body.as_bytes(), deadline).map_err(McpError::Transport)?;
@@ -190,14 +207,18 @@ impl McpClient {
     /// retains registry authority even if handshake or later requests fail.
     pub fn stdio_owned(
         registry: Arc<vshell::ownership::OwnerRegistry>,
-        command: &str, args: &[&str],
+        command: &str,
+        args: &[&str],
     ) -> Result<Self, McpError> {
-        let transport = OwnedStdioTransport::spawn(registry, command, args).map_err(McpError::Transport)?;
+        let transport =
+            OwnedStdioTransport::spawn(registry, command, args).map_err(McpError::Transport)?;
         Self::with_transport(Box::new(transport))
     }
 
     /// Request cancellation without claiming that the transport has retired.
-    pub fn request_stop(&self) { self.inner.stop(); }
+    pub fn request_stop(&self) {
+        self.inner.stop();
+    }
 
     /// Connect to a remote MCP server over streamable HTTP. Performs the
     /// `initialize` → `notifications/initialized` → `tools/list` handshake
@@ -220,7 +241,13 @@ impl McpClient {
     /// Build a client from an arbitrary transport. Public for tests; in
     /// production, prefer [`McpClient::stdio`].
     pub fn with_transport(transport: Box<dyn Transport>) -> Result<Self, McpError> {
-        let mut inner = McpInner { transport, next_id: AtomicU64::new(1), request_gate: std::sync::Mutex::new(()), stopped: AtomicBool::new(false), tools: Vec::new() };
+        let mut inner = McpInner {
+            transport,
+            next_id: AtomicU64::new(1),
+            request_gate: std::sync::Mutex::new(()),
+            stopped: AtomicBool::new(false),
+            tools: Vec::new(),
+        };
 
         // ---- initialize ----
         // Per spec, params include protocolVersion, capabilities, and
@@ -883,7 +910,13 @@ mod tests {
         assert!(mock.try_pop_sent().is_none());
     }
     fn request_only_inner(transport: Box<dyn Transport>) -> McpInner {
-        McpInner { transport, next_id: AtomicU64::new(1), request_gate: Mutex::new(()), stopped: AtomicBool::new(false), tools: Vec::new() }
+        McpInner {
+            transport,
+            next_id: AtomicU64::new(1),
+            request_gate: Mutex::new(()),
+            stopped: AtomicBool::new(false),
+            tools: Vec::new(),
+        }
     }
 
     #[test]
@@ -893,7 +926,9 @@ mod tests {
         let held = inner.request_gate.lock().unwrap();
         let other = inner.clone();
         let (done_tx, done_rx) = channel();
-        let worker = std::thread::spawn(move || { done_tx.send(other.request("tools/call", None).map(|_| ())).unwrap(); });
+        let worker = std::thread::spawn(move || {
+            done_tx.send(other.request("tools/call", None).map(|_| ())).unwrap();
+        });
         inner.stop();
         let observed = done_rx.recv_timeout(std::time::Duration::from_secs(2));
         // Release on assertion failure too, so the regression never strands its worker.
@@ -917,12 +952,24 @@ mod tests {
 
     #[test]
     fn request_passes_one_deadline_through_send_and_every_notification() {
-        struct DeadlineTransport { deadline: Mutex<Option<std::time::Instant>>, reads: AtomicU64 }
+        struct DeadlineTransport {
+            deadline: Mutex<Option<std::time::Instant>>,
+            reads: AtomicU64,
+        }
         impl Transport for DeadlineTransport {
-            fn send_line(&self, _: &[u8]) -> Result<(), String> { panic!("legacy send selected") }
-            fn recv_line(&self) -> Result<Vec<u8>, String> { panic!("legacy receive selected") }
-            fn send_line_until(&self, _: &[u8], deadline: std::time::Instant) -> Result<(), String> {
-                *self.deadline.lock().unwrap() = Some(deadline); Ok(())
+            fn send_line(&self, _: &[u8]) -> Result<(), String> {
+                panic!("legacy send selected")
+            }
+            fn recv_line(&self) -> Result<Vec<u8>, String> {
+                panic!("legacy receive selected")
+            }
+            fn send_line_until(
+                &self,
+                _: &[u8],
+                deadline: std::time::Instant,
+            ) -> Result<(), String> {
+                *self.deadline.lock().unwrap() = Some(deadline);
+                Ok(())
             }
             fn recv_line_until(&self, deadline: std::time::Instant) -> Result<Vec<u8>, String> {
                 assert_eq!(*self.deadline.lock().unwrap(), Some(deadline));
@@ -933,8 +980,10 @@ mod tests {
                 }
             }
         }
-        let inner = request_only_inner(Box::new(DeadlineTransport { deadline: Mutex::new(None), reads: AtomicU64::new(0) }));
+        let inner = request_only_inner(Box::new(DeadlineTransport {
+            deadline: Mutex::new(None),
+            reads: AtomicU64::new(0),
+        }));
         assert!(inner.request("tools/call", None).is_ok());
     }
-
 }

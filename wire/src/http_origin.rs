@@ -84,21 +84,33 @@ mod tests {
 
     #[test]
     fn same_origin_normalizes_case_and_default_port() {
-        assert_eq!(same_http_origin("https://Example.com/a", "https://example.com:443/b"), Ok(true));
+        assert_eq!(
+            same_http_origin("https://Example.com/a", "https://example.com:443/b"),
+            Ok(true)
+        );
         assert_eq!(same_http_origin("http://[::1]/a", "http://[0:0:0:0:0:0:0:1]:80/b"), Ok(true));
     }
 
     #[test]
     fn different_origin_rejects_port_host_and_downgrade() {
-        assert_eq!(same_http_origin("http://127.0.0.1:1001/a", "http://127.0.0.1:1002/b"), Ok(false));
+        assert_eq!(
+            same_http_origin("http://127.0.0.1:1001/a", "http://127.0.0.1:1002/b"),
+            Ok(false)
+        );
         assert_eq!(same_http_origin("https://a.example/a", "https://b.example/b"), Ok(false));
         assert_eq!(same_http_origin("https://a.example/a", "http://a.example/b"), Ok(false));
     }
 
     #[test]
     fn ambiguous_authority_fails_closed() {
-        for url in ["https://u@a.example/", "https://a.example%2f.evil/", "ftp://a.example/",
-            "https://a.example:0/", "https://a.example:65536/", "https://a.example\\.evil/"] {
+        for url in [
+            "https://u@a.example/",
+            "https://a.example%2f.evil/",
+            "ftp://a.example/",
+            "https://a.example:0/",
+            "https://a.example:65536/",
+            "https://a.example\\.evil/",
+        ] {
             assert!(valid_http_origin(url).is_err(), "{url}");
         }
     }

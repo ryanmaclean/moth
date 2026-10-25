@@ -8,10 +8,10 @@
 //! thing that lets one piece of state own its mailbox and process messages
 //! in order. We add more only when a real workload forces it.
 
-use std::sync::mpsc::{self, Receiver, SendError, Sender, SyncSender, sync_channel};
-use std::thread::{self, JoinHandle};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, SendError, Sender, SyncSender, sync_channel};
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 /// Cooperative stop request. A request is not a worker-retirement receipt.
@@ -19,15 +19,21 @@ use std::time::Duration;
 pub struct Cancellation(Arc<AtomicBool>);
 
 impl Cancellation {
-    pub fn request(&self) { self.0.store(true, Ordering::Release); }
-    pub fn is_requested(&self) -> bool { self.0.load(Ordering::Acquire) }
+    pub fn request(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+    pub fn is_requested(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
 }
 
 /// Polling retains the handle while its main function is running. Keep this
 /// owner until Joined. is_finished + join is the standard polling idiom; it
 /// is not a hard wall-clock bound on final OS/thread-local cleanup.
 #[must_use = "dropping Retirement detaches the still-owned thread"]
-pub struct Retirement<T> { handle: Option<JoinHandle<T>> }
+pub struct Retirement<T> {
+    handle: Option<JoinHandle<T>>,
+}
 
 pub enum JoinPoll<T> {
     Pending,
@@ -36,7 +42,9 @@ pub enum JoinPoll<T> {
 }
 
 impl<T> Retirement<T> {
-    pub fn new(handle: JoinHandle<T>) -> Self { Self { handle: Some(handle) } }
+    pub fn new(handle: JoinHandle<T>) -> Self {
+        Self { handle: Some(handle) }
+    }
     pub fn try_join(&mut self) -> JoinPoll<T> {
         match self.handle.as_ref() {
             None => JoinPoll::AlreadyJoined,
@@ -49,7 +57,6 @@ impl<T> Retirement<T> {
         self.handle.take().expect("retirement already joined").join()
     }
 }
-
 
 pub trait Actor: Send + 'static {
     type Msg: Send + 'static;
@@ -107,8 +114,12 @@ pub struct Spawned<M: Send + 'static> {
 }
 
 impl<M: Send + 'static> Spawned<M> {
-    pub fn cancellation(&self) -> Cancellation { self.cancel.clone() }
-    pub fn request_stop(&self) { self.cancel.request(); }
+    pub fn cancellation(&self) -> Cancellation {
+        self.cancel.clone()
+    }
+    pub fn request_stop(&self) {
+        self.cancel.request();
+    }
     /// Close this owner's address; other clones remain live until stopped.
     /// This does not request cancellation: queued work normally drains.
     pub fn into_retirement(self) -> Retirement<()> {
@@ -142,12 +153,16 @@ pub fn spawn_with_cancellation<A: Actor>(actor: A, cancel: Cancellation) -> Spaw
     try_spawn_with_cancellation(actor, cancel).expect("actor thread creation failed")
 }
 
-pub fn try_spawn_with_cancellation<A: Actor>(actor: A, cancel: Cancellation) -> std::io::Result<Spawned<A::Msg>> {
+pub fn try_spawn_with_cancellation<A: Actor>(
+    actor: A,
+    cancel: Cancellation,
+) -> std::io::Result<Spawned<A::Msg>> {
     try_spawn_using(actor, cancel, |work| thread::Builder::new().spawn(work))
 }
 
 fn try_spawn_using<A: Actor>(
-    mut actor: A, cancel: Cancellation,
+    mut actor: A,
+    cancel: Cancellation,
     launch: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<JoinHandle<()>>,
 ) -> std::io::Result<Spawned<A::Msg>> {
     actor.set_cancellation(cancel.clone());
@@ -178,16 +193,24 @@ fn run_loop<A: Actor>(mut actor: A, rx: Receiver<A::Msg>, cancel: Cancellation) 
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
-        if cancel.is_requested() { break; }
-        if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| actor.handle(msg))) {
+        if cancel.is_requested() {
+            break;
+        }
+        if let Err(payload) =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| actor.handle(msg)))
+        {
             log_panic(&payload);
             failure = Some(payload);
             break;
         }
     }
     let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| actor.stopped()));
-    if let Some(payload) = failure { std::panic::resume_unwind(payload); }
-    if let Err(payload) = stopped { std::panic::resume_unwind(payload); }
+    if let Some(payload) = failure {
+        std::panic::resume_unwind(payload);
+    }
+    if let Err(payload) = stopped {
+        std::panic::resume_unwind(payload);
+    }
 }
 
 fn log_panic(payload: &Box<dyn std::any::Any + Send>) {
@@ -220,8 +243,12 @@ pub struct SpawnedSync<M: Send + 'static> {
 }
 
 impl<M: Send + 'static> SpawnedSync<M> {
-    pub fn cancellation(&self) -> Cancellation { self.cancel.clone() }
-    pub fn request_stop(&self) { self.cancel.request(); }
+    pub fn cancellation(&self) -> Cancellation {
+        self.cancel.clone()
+    }
+    pub fn request_stop(&self) {
+        self.cancel.request();
+    }
     pub fn into_retirement(self) -> Retirement<()> {
         let Self { addr, handle, .. } = self;
         drop(addr);
@@ -393,8 +420,12 @@ mod tests {
         struct Fails(Arc<AtomicUsize>);
         impl Actor for Fails {
             type Msg = ();
-            fn handle(&mut self, _: ()) { panic!("handler failure"); }
-            fn stopped(&mut self) { self.0.fetch_add(1, Ordering::SeqCst); }
+            fn handle(&mut self, _: ()) {
+                panic!("handler failure");
+            }
+            fn stopped(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
         }
         let stopped = Arc::new(AtomicUsize::new(0));
         let worker = spawn(Fails(stopped.clone()));
@@ -405,7 +436,11 @@ mod tests {
 
     #[test]
     fn stop_retains_inflight_worker_and_discards_queued_work() {
-        struct Gated { entered: SyncSender<()>, release: Receiver<()>, calls: Arc<AtomicUsize> }
+        struct Gated {
+            entered: SyncSender<()>,
+            release: Receiver<()>,
+            calls: Arc<AtomicUsize>,
+        }
         impl Actor for Gated {
             type Msg = ();
             fn handle(&mut self, _: ()) {
@@ -417,7 +452,8 @@ mod tests {
         let (entered_tx, entered_rx) = sync_channel(1);
         let (release_tx, release_rx) = sync_channel(1);
         let calls = Arc::new(AtomicUsize::new(0));
-        let worker = spawn(Gated { entered: entered_tx, release: release_rx, calls: calls.clone() });
+        let worker =
+            spawn(Gated { entered: entered_tx, release: release_rx, calls: calls.clone() });
         let kept_address = worker.addr.clone();
         worker.addr.send(()).unwrap();
         entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -437,7 +473,9 @@ mod tests {
         impl Actor for StopsBadly {
             type Msg = ();
             fn handle(&mut self, _: ()) {}
-            fn stopped(&mut self) { panic!("stopped failure"); }
+            fn stopped(&mut self) {
+                panic!("stopped failure");
+            }
         }
         assert!(spawn_bounded(StopsBadly, 1).join().is_err());
     }
@@ -449,32 +487,49 @@ mod tests {
             fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
                 Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
             }
-            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
         }
         let payload: Box<dyn std::any::Any + Send> = Box::new("original failure");
-        assert_eq!(write_panic(&mut Broken, &payload).unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
+        assert_eq!(
+            write_panic(&mut Broken, &payload).unwrap_err().kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
         assert_eq!(payload.downcast_ref::<&str>(), Some(&"original failure"));
     }
     #[test]
     fn rejected_thread_creation_drops_unstarted_actor_and_returns_error() {
-        struct NeverStarted { handled: Arc<AtomicUsize>, dropped: Arc<AtomicUsize> }
+        struct NeverStarted {
+            handled: Arc<AtomicUsize>,
+            dropped: Arc<AtomicUsize>,
+        }
         impl Actor for NeverStarted {
             type Msg = ();
-            fn handle(&mut self, _: ()) { self.handled.fetch_add(1, Ordering::SeqCst); }
+            fn handle(&mut self, _: ()) {
+                self.handled.fetch_add(1, Ordering::SeqCst);
+            }
         }
         impl Drop for NeverStarted {
-            fn drop(&mut self) { self.dropped.fetch_add(1, Ordering::SeqCst); }
+            fn drop(&mut self) {
+                self.dropped.fetch_add(1, Ordering::SeqCst);
+            }
         }
         let handled = Arc::new(AtomicUsize::new(0));
         let dropped = Arc::new(AtomicUsize::new(0));
-        let result = try_spawn_using(NeverStarted { handled: handled.clone(), dropped: dropped.clone() },
-            Cancellation::default(), |work| {
+        let result = try_spawn_using(
+            NeverStarted { handled: handled.clone(), dropped: dropped.clone() },
+            Cancellation::default(),
+            |work| {
                 drop(work); // The failed native launcher never ran the closure.
-                Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "injected thread creation failure"))
-            });
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "injected thread creation failure",
+                ))
+            },
+        );
         assert!(matches!(result, Err(error) if error.kind() == std::io::ErrorKind::WouldBlock));
         assert_eq!(handled.load(Ordering::SeqCst), 0);
         assert_eq!(dropped.load(Ordering::SeqCst), 1);
     }
-
 }

@@ -106,14 +106,17 @@ extern "C" fn write_cb(ptr: *mut c_char, size: usize, nmemb: usize, user: *mut c
 
 extern "C" fn header_cb(ptr: *mut c_char, size: usize, nmemb: usize, user: *mut c_void) -> usize {
     let total = size.saturating_mul(nmemb);
-    if total == 0 { return 0; }
+    if total == 0 {
+        return 0;
+    }
     let line = unsafe { std::slice::from_raw_parts(ptr as *const u8, total) };
     let ctx = unsafe { &*(user as *const Ctx) };
     if line.starts_with(b"HTTP/") {
         // libcurl delivers a complete status line before any body callback.
         // Unknown status syntax aborts the transfer while body forwarding
         // remains disabled; it must never be treated as a non-redirect.
-        let status = std::str::from_utf8(line).ok()
+        let status = std::str::from_utf8(line)
+            .ok()
             .and_then(|text| text.split_ascii_whitespace().nth(1))
             .and_then(|digits| digits.parse::<u16>().ok());
         match status {
@@ -126,7 +129,8 @@ extern "C" fn header_cb(ptr: *mut c_char, size: usize, nmemb: usize, user: *mut 
             }
         }
     } else if line.starts_with(b"HTTP")
-        || (!line.iter().all(u8::is_ascii_whitespace) && !line.contains(&b':')) {
+        || (!line.iter().all(u8::is_ascii_whitespace) && !line.contains(&b':'))
+    {
         // Any other non-header line could be an unrecognized status line.
         ctx.header_error.store(true, Ordering::Release);
         return 0;
@@ -298,7 +302,9 @@ unsafe fn run_easy(
     body: &[u8],
     ctx: *const Ctx,
 ) -> Result<PerformOutcome, Error> {
-    unsafe { run_easy_with_hook(url, key_header, version_header, content_type, accept, body, ctx, |_| {}) }
+    unsafe {
+        run_easy_with_hook(url, key_header, version_header, content_type, accept, body, ctx, |_| {})
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -322,7 +328,16 @@ unsafe fn run_easy_with_hook<F: FnMut(usize)>(
             return Err(Error::Http("stream cancelled".into()));
         }
         let (outcome, redirect) = unsafe {
-            run_easy_once(&current, key_header, version_header, content_type, accept, body, ctx, use_post)?
+            run_easy_once(
+                &current,
+                key_header,
+                version_header,
+                content_type,
+                accept,
+                body,
+                ctx,
+                use_post,
+            )?
         };
         if outcome.rc != c::CURLE_OK || !matches!(outcome.status, 301 | 302 | 303 | 307 | 308) {
             return Ok(outcome);
@@ -330,14 +345,16 @@ unsafe fn run_easy_with_hook<F: FnMut(usize)>(
         if hop == 10 {
             return Err(Error::Http("Anthropic HTTP redirect limit exceeded".into()));
         }
-        let next = redirect.ok_or_else(|| Error::Http("Anthropic HTTP redirect lacks Location".into()))?;
+        let next =
+            redirect.ok_or_else(|| Error::Http("Anthropic HTTP redirect lacks Location".into()))?;
         if !wire::http_origin::same_http_origin(original, &next)
             .map_err(|e| Error::Http(format!("invalid Anthropic HTTP redirect origin: {e}")))?
         {
             return Err(Error::Http("cross-origin Anthropic HTTP redirect refused".into()));
         }
         use_post = use_post && !matches!(outcome.status, 301..=303);
-        current = CString::new(next).map_err(|_| Error::Http("redirect URL contains NUL".into()))?;
+        current =
+            CString::new(next).map_err(|_| Error::Http("redirect URL contains NUL".into()))?;
         after_redirect(hop);
     }
     unreachable!("bounded redirect loop returns")
@@ -411,8 +428,12 @@ unsafe fn run_easy_once(
         let mut redirect_ptr: *mut c_char = ptr::null_mut();
         let info_rc = c::curl_easy_getinfo(easy, c::CURLINFO_REDIRECT_URL, &mut redirect_ptr);
         let redirect = if info_rc == c::CURLE_OK && !redirect_ptr.is_null() {
-            Some(std::ffi::CStr::from_ptr(redirect_ptr).to_str()
-                .map_err(|_| Error::Http("redirect URL is not UTF-8".into()))?.to_owned())
+            Some(
+                std::ffi::CStr::from_ptr(redirect_ptr)
+                    .to_str()
+                    .map_err(|_| Error::Http("redirect URL is not UTF-8".into()))?
+                    .to_owned(),
+            )
         } else {
             None
         };
@@ -800,7 +821,9 @@ mod tests {
                         contacted_in_server.store(true, Ordering::Release);
                         let mut buf = [0u8; 1024];
                         let _ = stream.read(&mut buf);
-                        let _ = stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                        );
                         break;
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -834,7 +857,9 @@ mod tests {
         };
         let error = unsafe {
             run_easy(&url, &key_header, &version_header, &content_type, &accept, b"{}", &ctx)
-        }.err().expect("cross-origin redirect must fail");
+        }
+        .err()
+        .expect("cross-origin redirect must fail");
         let message = match error {
             Error::Http(message) => message,
             other => panic!("unexpected error: {other:?}"),
@@ -860,7 +885,10 @@ mod tests {
         let user = &ctx as *const Ctx as *mut c_void;
         for status in [307, 308] {
             let interim = b"HTTP/1.1 100 Continue\r\n";
-            assert_eq!(header_cb(interim.as_ptr() as *mut c_char, 1, interim.len(), user), interim.len());
+            assert_eq!(
+                header_cb(interim.as_ptr() as *mut c_char, 1, interim.len(), user),
+                interim.len()
+            );
             let line = format!("HTTP/2 {status}\r\n");
             assert_eq!(header_cb(line.as_ptr() as *mut c_char, 1, line.len(), user), line.len());
             let body = b"redirect-body";
@@ -869,7 +897,10 @@ mod tests {
             assert!(!ctx.delivered.load(Ordering::Acquire));
         }
         let success = b"HTTP/2 200\r\n";
-        assert_eq!(header_cb(success.as_ptr() as *mut c_char, 1, success.len(), user), success.len());
+        assert_eq!(
+            header_cb(success.as_ptr() as *mut c_char, 1, success.len(), user),
+            success.len()
+        );
         let answer = b"ok";
         assert_eq!(write_cb(answer.as_ptr() as *mut c_char, 1, answer.len(), user), answer.len());
         match rx.try_recv() {
@@ -920,7 +951,8 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::sync_channel::<Chunk>(1);
         let aborted = Arc::new(AtomicBool::new(false));
         let ctx = Ctx {
-            tx, aborted: Arc::clone(&aborted),
+            tx,
+            aborted: Arc::clone(&aborted),
             delivered: AtomicBool::new(false),
             redirecting: AtomicBool::new(true),
             header_error: AtomicBool::new(false),
@@ -929,7 +961,9 @@ mod tests {
             run_easy_with_hook(&url, &key, &version, &content_type, &accept, b"{}", &ctx, |_| {
                 aborted.store(true, Ordering::Release);
             })
-        }.err().expect("cancelled redirect must stop");
+        }
+        .err()
+        .expect("cancelled redirect must stop");
         assert!(error.to_string().contains("cancelled"), "{error}");
         stop.store(true, Ordering::Release);
         server.join().unwrap();

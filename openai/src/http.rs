@@ -129,8 +129,7 @@ extern "C" fn header_cb(ptr: *mut c_char, size: usize, nmemb: usize, user: *mut 
     if line.starts_with(b"HTTP/") {
         // A new status line may follow a completed interim or proxy response,
         // but never interrupt the current header block.
-        if ctx.status_seen.load(Ordering::Acquire)
-            && !ctx.headers_complete.load(Ordering::Acquire)
+        if ctx.status_seen.load(Ordering::Acquire) && !ctx.headers_complete.load(Ordering::Acquire)
         {
             ctx.header_error.store(true, Ordering::Release);
             return 0;
@@ -176,9 +175,10 @@ extern "C" fn header_cb(ptr: *mut c_char, size: usize, nmemb: usize, user: *mut 
         ctx.redirecting.store(code < 200 || (300..400).contains(&code), Ordering::Release);
     } else if !ctx.status_seen.load(Ordering::Acquire)
         || !line.split(|&b| b == b':').next().is_some_and(|name| {
-            !name.is_empty() && name.iter().all(|&b| {
-                b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
-            })
+            !name.is_empty()
+                && name
+                    .iter()
+                    .all(|&b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
         })
         || !line.contains(&b':')
     {
@@ -385,14 +385,16 @@ unsafe fn run_easy_with_hook<F: FnMut(usize)>(
         if hop == 10 {
             return Err(Error::Http("OpenAI HTTP redirect limit exceeded".into()));
         }
-        let next = redirect.ok_or_else(|| Error::Http("OpenAI HTTP redirect lacks Location".into()))?;
+        let next =
+            redirect.ok_or_else(|| Error::Http("OpenAI HTTP redirect lacks Location".into()))?;
         if !wire::http_origin::same_http_origin(original, &next)
             .map_err(|e| Error::Http(format!("invalid OpenAI HTTP redirect origin: {e}")))?
         {
             return Err(Error::Http("cross-origin OpenAI HTTP redirect refused".into()));
         }
         use_post = use_post && !matches!(outcome.status, 301..=303);
-        current = CString::new(next).map_err(|_| Error::Http("redirect URL contains NUL".into()))?;
+        current =
+            CString::new(next).map_err(|_| Error::Http("redirect URL contains NUL".into()))?;
         after_redirect(hop);
     }
     unreachable!("bounded redirect loop returns")
@@ -407,7 +409,9 @@ unsafe fn run_easy_once(
     ctx: *const Ctx,
     use_post: bool,
 ) -> Result<(PerformOutcome, Option<String>), Error> {
-    unsafe { run_easy_once_with_proxy(url, auth_header, content_type, accept, body, ctx, use_post, None) }
+    unsafe {
+        run_easy_once_with_proxy(url, auth_header, content_type, accept, body, ctx, use_post, None)
+    }
 }
 
 // The proxy override is used only by the local CONNECT fixture; production
@@ -489,8 +493,12 @@ unsafe fn run_easy_once_with_proxy(
         let mut redirect_ptr: *mut c_char = ptr::null_mut();
         let info_rc = c::curl_easy_getinfo(easy, c::CURLINFO_REDIRECT_URL, &mut redirect_ptr);
         let redirect = if info_rc == c::CURLE_OK && !redirect_ptr.is_null() {
-            Some(std::ffi::CStr::from_ptr(redirect_ptr).to_str()
-                .map_err(|_| Error::Http("redirect URL is not UTF-8".into()))?.to_owned())
+            Some(
+                std::ffi::CStr::from_ptr(redirect_ptr)
+                    .to_str()
+                    .map_err(|_| Error::Http("redirect URL is not UTF-8".into()))?
+                    .to_owned(),
+            )
         } else {
             None
         };
@@ -584,13 +592,19 @@ mod tests {
             let n = stream.read(&mut buf).expect("HTTP request read");
             assert!(n > 0, "connection closed before complete request");
             data.extend_from_slice(&buf[..n]);
-            if let Some(end) = data.windows(4).position(|window| window == b"\r\n\r\n").map(|i| i + 4) {
+            if let Some(end) =
+                data.windows(4).position(|window| window == b"\r\n\r\n").map(|i| i + 4)
+            {
                 let headers = String::from_utf8_lossy(&data[..end]);
-                let body_len = headers.lines()
-                    .find_map(|line| line.split_once(':').and_then(|(name, value)| {
-                        name.eq_ignore_ascii_case("content-length")
-                            .then(|| value.trim().parse::<usize>().ok()).flatten()
-                    }))
+                let body_len = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.split_once(':').and_then(|(name, value)| {
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                    })
                     .unwrap_or(0);
                 if data.len() >= end + body_len {
                     return data;
@@ -608,8 +622,9 @@ mod tests {
                     stream.set_nonblocking(false).unwrap();
                     return stream;
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
-                    && std::time::Instant::now() < deadline =>
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
                 {
                     std::thread::sleep(std::time::Duration::from_millis(1));
                 }
@@ -620,16 +635,19 @@ mod tests {
 
     fn header_fixture() -> (Ctx, Receiver<Chunk>) {
         let (tx, rx) = std::sync::mpsc::sync_channel(4);
-        (Ctx {
-            tx,
-            aborted: Arc::new(AtomicBool::new(false)),
-            delivered: AtomicBool::new(false),
-            redirecting: AtomicBool::new(true),
-            header_error: AtomicBool::new(false),
-            status_seen: AtomicBool::new(false),
-            headers_complete: AtomicBool::new(false),
-            response_status: AtomicU16::new(0),
-        }, rx)
+        (
+            Ctx {
+                tx,
+                aborted: Arc::new(AtomicBool::new(false)),
+                delivered: AtomicBool::new(false),
+                redirecting: AtomicBool::new(true),
+                header_error: AtomicBool::new(false),
+                status_seen: AtomicBool::new(false),
+                headers_complete: AtomicBool::new(false),
+                response_status: AtomicU16::new(0),
+            },
+            rx,
+        )
     }
 
     fn feed_header(ctx: &Ctx, line: &[u8]) -> usize {
@@ -702,8 +720,14 @@ mod tests {
             let mut stream = accept_with_deadline(&listener);
             let connect = read_http_request(&mut stream);
             assert!(connect.starts_with(b"CONNECT 127.0.0.1:9 HTTP/1.1\r\n"));
-            assert!(!String::from_utf8_lossy(&connect).to_ascii_lowercase().contains("authorization: bearer"));
-            stream.write_all(b"HTTP/1.1 200 Connection established\r\nProxy-Agent: fixture\r\n\r\n").unwrap();
+            assert!(
+                !String::from_utf8_lossy(&connect)
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer")
+            );
+            stream
+                .write_all(b"HTTP/1.1 200 Connection established\r\nProxy-Agent: fixture\r\n\r\n")
+                .unwrap();
             let post = read_http_request(&mut stream);
             assert!(post.starts_with(b"POST /v1/chat/completions HTTP/1.1\r\n"));
             assert!(String::from_utf8_lossy(&post).contains("Authorization: Bearer fixture-key"));
@@ -728,7 +752,13 @@ mod tests {
             let accept = CString::new("Accept: text/event-stream").unwrap();
             unsafe {
                 run_easy_once_with_proxy(
-                    &url, &auth, &content_type, &accept, b"{}", Arc::as_ptr(&worker_ctx), true,
+                    &url,
+                    &auth,
+                    &content_type,
+                    &accept,
+                    b"{}",
+                    Arc::as_ptr(&worker_ctx),
+                    true,
                     Some(&proxy_url),
                 )
             }
@@ -1004,7 +1034,8 @@ mod tests {
         let accept = CString::new("Accept: text/event-stream").unwrap();
         let (tx, rx) = std::sync::mpsc::sync_channel::<Chunk>(2);
         let ctx = Ctx {
-            tx, aborted: Arc::new(AtomicBool::new(false)),
+            tx,
+            aborted: Arc::new(AtomicBool::new(false)),
             delivered: AtomicBool::new(false),
             redirecting: AtomicBool::new(true),
             header_error: AtomicBool::new(false),
@@ -1012,9 +1043,10 @@ mod tests {
             headers_complete: AtomicBool::new(false),
             response_status: AtomicU16::new(0),
         };
-        let error = unsafe {
-            run_easy(&url, &auth, &content_type, &accept, b"body-sentinel", &ctx)
-        }.err().expect("foreign-origin redirect must fail");
+        let error =
+            unsafe { run_easy(&url, &auth, &content_type, &accept, b"body-sentinel", &ctx) }
+                .err()
+                .expect("foreign-origin redirect must fail");
         assert!(error.to_string().contains("cross-origin"), "{error}");
         first_thread.join().unwrap();
         // Leave the listener polling long enough to observe an already queued
@@ -1044,7 +1076,11 @@ mod tests {
                 drop(first);
                 let mut second = accept_with_deadline(&listener);
                 let replay = read_http_request(&mut second);
-                second.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok").unwrap();
+                second
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+                    )
+                    .unwrap();
                 (initial, replay)
             });
             let url = CString::new(format!("http://{addr}/v1/chat/completions")).unwrap();
@@ -1053,7 +1089,8 @@ mod tests {
             let accept = CString::new("Accept: text/event-stream").unwrap();
             let (tx, rx) = std::sync::mpsc::sync_channel::<Chunk>(2);
             let ctx = Ctx {
-                tx, aborted: Arc::new(AtomicBool::new(false)),
+                tx,
+                aborted: Arc::new(AtomicBool::new(false)),
                 delivered: AtomicBool::new(false),
                 redirecting: AtomicBool::new(true),
                 header_error: AtomicBool::new(false),
@@ -1061,16 +1098,19 @@ mod tests {
                 headers_complete: AtomicBool::new(false),
                 response_status: AtomicU16::new(0),
             };
-            let outcome = unsafe {
-                run_easy(&url, &auth, &content_type, &accept, b"body-sentinel", &ctx)
-            }.expect("same-origin redirect");
+            let outcome =
+                unsafe { run_easy(&url, &auth, &content_type, &accept, b"body-sentinel", &ctx) }
+                    .expect("same-origin redirect");
             assert_eq!(outcome.rc, c::CURLE_OK);
             assert_eq!(outcome.status, 200);
             let (initial, replay) = server.join().unwrap();
             for request in [&initial, &replay] {
                 assert!(request.starts_with(b"POST "), "redirect must retain POST");
-                assert!(request.windows(b"authorization: bearer key-sentinel".len())
-                    .any(|w| w.eq_ignore_ascii_case(b"authorization: bearer key-sentinel")));
+                assert!(
+                    request
+                        .windows(b"authorization: bearer key-sentinel".len())
+                        .any(|w| w.eq_ignore_ascii_case(b"authorization: bearer key-sentinel"))
+                );
                 assert!(request.windows(b"body-sentinel".len()).any(|w| w == b"body-sentinel"));
             }
             assert!(replay.starts_with(b"POST /again "));
@@ -1119,7 +1159,8 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::sync_channel::<Chunk>(1);
         let aborted = Arc::new(AtomicBool::new(false));
         let ctx = Ctx {
-            tx, aborted: Arc::clone(&aborted),
+            tx,
+            aborted: Arc::clone(&aborted),
             delivered: AtomicBool::new(false),
             redirecting: AtomicBool::new(true),
             header_error: AtomicBool::new(false),
@@ -1131,7 +1172,9 @@ mod tests {
             run_easy_with_hook(&url, &auth, &content_type, &accept, b"{}", &ctx, |_| {
                 aborted.store(true, Ordering::Release);
             })
-        }.err().expect("cancelled redirect must stop");
+        }
+        .err()
+        .expect("cancelled redirect must stop");
         assert!(error.to_string().contains("cancelled"), "{error}");
         // The server polls every millisecond; drain a bounded interval before
         // concluding that no follow-up connection was queued.

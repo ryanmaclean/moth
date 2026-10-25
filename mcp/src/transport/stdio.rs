@@ -162,8 +162,13 @@ impl OwnedReaderState {
         let mut bytes = [0_u8; 16384];
         for _ in 0..4 {
             match self.run.read(&mut bytes) {
-                Ok(0) => { self.stdout_eof = true; break; }
-                Ok(n) => self.splitter.push(&bytes[..n])
+                Ok(0) => {
+                    self.stdout_eof = true;
+                    break;
+                }
+                Ok(n) => self
+                    .splitter
+                    .push(&bytes[..n])
                     .map_err(|e| format!("MCP stdout buffer exceeds 4 MiB: {e}"))?,
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -186,9 +191,13 @@ impl OwnedReaderState {
             }
         }
         match self.run.poll() {
-            vshell::ownership::RunState::Unknown(reason) => Err(format!("MCP cleanup unconfirmed: {reason}")),
-            vshell::ownership::RunState::Retired(result) if !result.success() =>
-                Err(format!("MCP owned server failed (reason {}, exit {:?}, signal {:?})", result.reason, result.payload_exit_code, result.payload_signal)),
+            vshell::ownership::RunState::Unknown(reason) => {
+                Err(format!("MCP cleanup unconfirmed: {reason}"))
+            }
+            vshell::ownership::RunState::Retired(result) if !result.success() => Err(format!(
+                "MCP owned server failed (reason {}, exit {:?}, signal {:?})",
+                result.reason, result.payload_exit_code, result.payload_signal
+            )),
             _ => Ok(()),
         }
     }
@@ -199,45 +208,73 @@ impl OwnedStdioTransport {
     /// total-capture policy are explicit: one day, 64 MiB per stream. Individual
     /// send/receive waits and the enclosing JSON-RPC request each have 30 s
     /// budgets. Limits cause cancellation/failure, never partial success.
-    pub fn spawn(registry: std::sync::Arc<vshell::ownership::OwnerRegistry>, command: &str, args: &[&str]) -> Result<Self, String> {
-        let run = registry.spawn(vshell::ownership::CommandSpec {
-            program: command.into(),
-            args: args.iter().map(|arg| (*arg).into()).collect(),
-            cwd: None,
-            env: Vec::new(),
-            limits: vshell::ownership::Limits {
-                deadline: std::time::Duration::from_secs(86400),
-                capture_bytes: 64 * 1024 * 1024,
-                input_bytes: u64::MAX,
-            },
-        }).map_err(|e| format!("owned MCP spawn {command}: {e}"))?;
+    pub fn spawn(
+        registry: std::sync::Arc<vshell::ownership::OwnerRegistry>,
+        command: &str,
+        args: &[&str],
+    ) -> Result<Self, String> {
+        let run = registry
+            .spawn(vshell::ownership::CommandSpec {
+                program: command.into(),
+                args: args.iter().map(|arg| (*arg).into()).collect(),
+                cwd: None,
+                env: Vec::new(),
+                limits: vshell::ownership::Limits {
+                    deadline: std::time::Duration::from_secs(86400),
+                    capture_bytes: 64 * 1024 * 1024,
+                    input_bytes: u64::MAX,
+                },
+            })
+            .map_err(|e| format!("owned MCP spawn {command}: {e}"))?;
         Ok(Self {
-            state: Mutex::new(OwnedReaderState { run, splitter: NdjsonSplitter::new(), diagnostics: Vec::new(), stdout_eof: false }),
+            state: Mutex::new(OwnedReaderState {
+                run,
+                splitter: NdjsonSplitter::new(),
+                diagnostics: Vec::new(),
+                stdout_eof: false,
+            }),
             stopped: std::sync::atomic::AtomicBool::new(false),
             _registry: registry,
         })
     }
 
-    fn lock_until(&self, deadline: std::time::Instant) -> Result<std::sync::MutexGuard<'_, OwnedReaderState>, String> {
+    fn lock_until(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<std::sync::MutexGuard<'_, OwnedReaderState>, String> {
         loop {
-            if self.stopped.load(std::sync::atomic::Ordering::Acquire) || std::time::Instant::now() >= deadline {
+            if self.stopped.load(std::sync::atomic::Ordering::Acquire)
+                || std::time::Instant::now() >= deadline
+            {
                 self.request_stop();
                 return Err("MCP operation cancelled or timed out while queued".into());
             }
             match self.state.try_lock() {
                 Ok(state) => return Ok(state),
-                Err(std::sync::TryLockError::WouldBlock) => std::thread::sleep(std::time::Duration::from_millis(10)),
-                Err(std::sync::TryLockError::Poisoned(_)) => { self.request_stop(); return Err("MCP owner lock poisoned".into()); }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10))
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    self.request_stop();
+                    return Err("MCP owner lock poisoned".into());
+                }
             }
         }
     }
 
-    fn check_wait(&self, state: &mut OwnedReaderState, deadline: std::time::Instant) -> Result<(), String> {
+    fn check_wait(
+        &self,
+        state: &mut OwnedReaderState,
+        deadline: std::time::Instant,
+    ) -> Result<(), String> {
         if self.stopped.load(std::sync::atomic::Ordering::Acquire)
-            || std::time::Instant::now() >= deadline {
+            || std::time::Instant::now() >= deadline
+        {
             self.stopped.store(true, std::sync::atomic::Ordering::Release);
             state.run.cancel();
-            return Err("MCP operation cancelled or timed out; retirement remains registry-owned".into());
+            return Err(
+                "MCP operation cancelled or timed out; retirement remains registry-owned".into()
+            );
         }
         if let Err(error) = state.pump() {
             self.stopped.store(true, std::sync::atomic::Ordering::Release);
@@ -269,11 +306,21 @@ impl Transport for OwnedStdioTransport {
             while position < part.len() {
                 self.check_wait(&mut state, deadline)?;
                 match state.run.write(&part[position..]) {
-                    Ok(0) => { state.run.cancel(); self.stopped.store(true, std::sync::atomic::Ordering::Release); return Err("MCP owned input closed".into()); }
+                    Ok(0) => {
+                        state.run.cancel();
+                        self.stopped.store(true, std::sync::atomic::Ordering::Release);
+                        return Err("MCP owned input closed".into());
+                    }
                     Ok(n) => position += n,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(std::time::Duration::from_millis(10)),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(10))
+                    }
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(e) => { state.run.cancel(); self.stopped.store(true, std::sync::atomic::Ordering::Release); return Err(format!("MCP owned input: {e}")); }
+                    Err(e) => {
+                        state.run.cancel();
+                        self.stopped.store(true, std::sync::atomic::Ordering::Release);
+                        return Err(format!("MCP owned input: {e}"));
+                    }
                 }
             }
         }
@@ -284,7 +331,9 @@ impl Transport for OwnedStdioTransport {
         let mut state = self.lock_until(deadline)?;
         loop {
             self.check_wait(&mut state, deadline)?;
-            if let Some(line) = state.splitter.pop_line() { return Ok(line); }
+            if let Some(line) = state.splitter.pop_line() {
+                return Ok(line);
+            }
             if state.stdout_eof {
                 state.run.cancel();
                 self.stopped.store(true, std::sync::atomic::Ordering::Release);
@@ -298,6 +347,8 @@ impl Transport for OwnedStdioTransport {
         self.stopped.store(true, std::sync::atomic::Ordering::Release);
         // Never wait behind an operation holding state. That operation checks
         // the atomic request on every bounded polling iteration.
-        if let Ok(mut state) = self.state.try_lock() { state.run.cancel(); }
+        if let Ok(mut state) = self.state.try_lock() {
+            state.run.cancel();
+        }
     }
 }
