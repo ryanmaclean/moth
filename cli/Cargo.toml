@@ -2,6 +2,7 @@
 name = "cli"
 version = "0.0.1"
 edition = "2024"
+license.workspace = true
 publish = false
 description = "One-shot agent runner. Wires anthropic + vshell + audit through the harness."
 

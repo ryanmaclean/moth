@@ -2,6 +2,7 @@
 name = "openai"
 version = "0.0.1"
 edition = "2024"
+license.workspace = true
 publish = false
 description = "Streaming client for OpenAI-compatible chat-completions endpoints. libcurl + OpenSSL via FFI, tiny hand-rolled JSON."
 

@@ -1,3 +1,6 @@
 [workspace]
 resolver = "2"
 members = ["actor", "anthropic", "audit", "benches", "cli", "compact", "fstools", "git", "harness", "integration", "mcp", "metrics", "openai", "persist", "runlog", "server", "subagent", "tmpl", "vshell", "wire"]
+
+[workspace.package]
+license = "MIT"

@@ -2,6 +2,7 @@
 name = "metrics"
 version = "0.0.1"
 edition = "2024"
+license.workspace = true
 publish = false
 description = "DogStatsD-over-UDP emitter. Counters / gauges / histograms / timers. std::net::UdpSocket only — no external deps."
 
