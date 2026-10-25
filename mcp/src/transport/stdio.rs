@@ -102,42 +102,6 @@ impl Drop for StdioTransport {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn stdio_echo_round_trip() {
-        // `cat` echoes whatever we send. Useful for verifying the
-        // line-buffering wiring without any MCP-specific framing.
-        let t = StdioTransport::spawn("cat", &[]).unwrap();
-        t.send_line(b"hello").unwrap();
-        let line = t.recv_line().unwrap();
-        assert_eq!(line, b"hello");
-    }
-
-    #[test]
-    fn stdio_multiple_lines_in_one_read() {
-        // `printf` writes both lines in one go; the splitter has to peel
-        // them apart on the read side.
-        let t = StdioTransport::spawn("sh", &["-c", "printf 'one\\ntwo\\n'"]).unwrap();
-        assert_eq!(t.recv_line().unwrap(), b"one");
-        assert_eq!(t.recv_line().unwrap(), b"two");
-        // Third read hits EOF.
-        let err = t.recv_line().unwrap_err();
-        assert!(err.contains("closed"), "got: {err}");
-    }
-
-    #[test]
-    fn stdio_spawn_failure_surfaces_inline() {
-        let err = match StdioTransport::spawn("definitely-not-a-real-binary-xyzzy", &[]) {
-            Err(e) => e,
-            Ok(_) => panic!("expected spawn failure"),
-        };
-        assert!(err.contains("spawn"), "got: {err}");
-    }
-}
-
 /// Native-owned MCP stream. The caller retains the registry until its explicit
 /// cleanup barrier; dropping this transport requests cancellation, not proof.
 /// This transport intentionally has no blocking Drop or background thread.
@@ -347,8 +311,44 @@ impl Transport for OwnedStdioTransport {
         self.stopped.store(true, std::sync::atomic::Ordering::Release);
         // Never wait behind an operation holding state. That operation checks
         // the atomic request on every bounded polling iteration.
-        if let Ok(mut state) = self.state.try_lock() {
+        if let Ok(state) = self.state.try_lock() {
             state.run.cancel();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stdio_echo_round_trip() {
+        // `cat` echoes whatever we send. Useful for verifying the
+        // line-buffering wiring without any MCP-specific framing.
+        let t = StdioTransport::spawn("cat", &[]).unwrap();
+        t.send_line(b"hello").unwrap();
+        let line = t.recv_line().unwrap();
+        assert_eq!(line, b"hello");
+    }
+
+    #[test]
+    fn stdio_multiple_lines_in_one_read() {
+        // `printf` writes both lines in one go; the splitter has to peel
+        // them apart on the read side.
+        let t = StdioTransport::spawn("sh", &["-c", "printf 'one\\ntwo\\n'"]).unwrap();
+        assert_eq!(t.recv_line().unwrap(), b"one");
+        assert_eq!(t.recv_line().unwrap(), b"two");
+        // Third read hits EOF.
+        let err = t.recv_line().unwrap_err();
+        assert!(err.contains("closed"), "got: {err}");
+    }
+
+    #[test]
+    fn stdio_spawn_failure_surfaces_inline() {
+        let err = match StdioTransport::spawn("definitely-not-a-real-binary-xyzzy", &[]) {
+            Err(e) => e,
+            Ok(_) => panic!("expected spawn failure"),
+        };
+        assert!(err.contains("spawn"), "got: {err}");
     }
 }

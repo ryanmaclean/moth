@@ -214,7 +214,7 @@ fn post_with_budget(
             .filter(|time| !time.is_zero())
             .ok_or_else(|| "MCP HTTP redirect deadline exceeded".to_string())?;
         let (response, redirect) = post_once(&current, body, bearer, session, remaining)?;
-        if matches!(response.status, 301 | 302 | 303) {
+        if matches!(response.status, 301..=303) {
             return Err(format!(
                 "method-changing MCP HTTP redirect {} refused (MCP requires POST)",
                 response.status
