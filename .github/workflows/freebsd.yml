@@ -1357,6 +1357,8 @@ jobs:
           import hashlib
           import os
           from pathlib import Path
+          import posixpath
+          import re
           import tarfile
 
           private = Path(os.environ['RUNNER_TEMP']) / 'moth-base-custody'
@@ -1389,6 +1391,87 @@ jobs:
               data = path.read_bytes()
               require(len(data) <= 100 * 1024 * 1024)
               return ('file', len(data), hashlib.sha256(data).hexdigest())
+          def package_shape(path, base):
+              # Diagnostic only: no package bill or legal conclusion is inferred.
+              records = {}
+              sums = {}
+              links = {}
+              with tarfile.open(path, 'r:') as archive:
+                  for member in archive:
+                      name = member.name.removeprefix('./').lstrip('/')
+                      if member.issym():
+                          require(len(member.linkname) <= 4096)
+                          links[name] = member.linkname
+                      if not member.isfile() or not name.startswith('var/lib/dpkg/status.d/'):
+                          continue
+                      require(member.size <= 1048576)
+                      stream = archive.extractfile(member)
+                      require(stream is not None)
+                      data = stream.read(1048577)
+                      require(len(data) == member.size)
+                      leaf = name.removeprefix('var/lib/dpkg/status.d/')
+                      require('/' not in leaf and leaf and len(records) + len(sums) < 4096)
+                      if leaf.endswith('.md5sums'):
+                          package = leaf.removesuffix('.md5sums')
+                          require(package not in sums)
+                          sums[package] = data
+                      else:
+                          require(leaf not in records)
+                          records[leaf] = data
+              require(0 < len(records) <= 2048 and len(sums) <= 2048)
+              require(set(records) == set(sums))
+              package_bill = []
+              owned = set()
+              direct = shared = missing = 0
+              for package in sorted(records):
+                  require(re.fullmatch(r'[a-z0-9][a-z0-9+.-]{0,127}', package) is not None)
+                  fields = {}
+                  try:
+                      control = records[package].decode('utf-8')
+                      listing = sums[package].decode('ascii')
+                  except UnicodeError:
+                      require(False)
+                  for line in control.splitlines():
+                      if line.startswith((' ', '\t')):
+                          continue
+                      if ':' not in line:
+                          require(False)
+                      key, value = line.split(':', 1)
+                      require(key not in fields)
+                      fields[key] = value.strip()
+                  require(fields.get('Package') == package)
+                  require(fields.get('Version') and fields.get('Architecture'))
+                  require(len(fields['Version']) <= 256 and len(fields['Architecture']) <= 32)
+                  require(re.fullmatch(r'[A-Za-z0-9.+:~_-]+', fields['Version']) is not None)
+                  require(re.fullmatch(r'[a-z0-9-]+', fields['Architecture']) is not None)
+                  package_bill.append((package, fields['Version'], fields['Architecture']))
+                  for line in listing.splitlines():
+                      match = re.fullmatch(r'([0-9a-fA-F]{32})  (\S[^\r\n]*)', line)
+                      require(match is not None)
+                      member_path = match.group(2).removeprefix('./').lstrip('/')
+                      require(len(member_path) <= 4096 and '..' not in member_path.split('/'))
+                      require(member_path not in owned and base.get(member_path, ('',))[0] == 'file')
+                      owned.add(member_path)
+                  copyright_path = f'usr/share/doc/{package}/copyright'
+                  if base.get(copyright_path, ('',))[0] == 'file':
+                      direct += 1
+                  elif f'usr/share/doc/{package}' in links:
+                      target = links[f'usr/share/doc/{package}']
+                      candidate = posixpath.normpath(
+                          target.lstrip('/') if target.startswith('/') else
+                          posixpath.join('usr/share/doc', target))
+                      require(candidate != '..' and not candidate.startswith('../'))
+                      if base.get(f'{candidate}/copyright', ('',))[0] == 'file':
+                          shared += 1
+                      else:
+                          missing += 1
+                  else:
+                      missing += 1
+              bill = '\n'.join('\t'.join(row) for row in package_bill).encode('utf-8')
+              unowned = sum(value[0] == 'file' and name not in owned
+                            for name, value in base.items())
+              return (len(records), len(sums), direct, shared, missing,
+                      unowned, len(links), hashlib.sha256(bill).hexdigest())
           try:
               require(len(manifest) == len(set(manifest)) == 14)
               with Path('base-receipt/custody.txt').open('w', encoding='ascii') as out:
@@ -1431,12 +1514,19 @@ jobs:
                       require(0 < len(notice) <= 4096 and 0 < len(package_meta) <= 4096)
                       require(all(image.get(k) == v for k, v in notice.items()))
                       require(all(image.get(k) == v for k, v in package_meta.items()))
+                      shape = package_shape(private / f'base-{arch}.tar', base)
+                      for label, value in zip(('package_records', 'md5sum_records',
+                                               'direct_notice_routes', 'shared_symlink_routes',
+                                               'missing_notice_routes', 'unlisted_regular_files',
+                                               'symlink_paths', 'package_bill_sha256'), shape):
+                          print(f'{arch}_{label}={value}', file=out)
                       print(f'{arch}_agent_sha256={local(payload / "agent")[2]}', file=out)
                       print(f'{arch}_native_notice_files=15', file=out)
                       print(f'{arch}_base_notice_paths_inherited={len(notice)}', file=out)
                       print(f'{arch}_base_package_metadata_paths_inherited={len(package_meta)}', file=out)
                   print('base_notice_inheritance=EXACT_PATH_BYTES_FOR_OBSERVED_FILES', file=out)
                   print('base_package_notice_coverage=UNPROVEN', file=out)
+                  print('non_debian_file_coverage=UNPROVEN', file=out)
                   print('pushed_image_parity=UNPROVEN', file=out)
           except Exception:
               raise SystemExit('base custody private data invalid') from None
