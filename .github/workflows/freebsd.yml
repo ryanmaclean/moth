@@ -1295,10 +1295,12 @@ jobs:
           capture "$private/builder.log" 4194304 docker build --target builder -t moth-base-custody-builder:local .
           for pair in amd64:x86_64-unknown-linux-gnu arm64:aarch64-unknown-linux-gnu; do
             arch="${pair%%:*}" target="${pair#*:}"
-            printf '%s\n' BUILD > base-receipt/stage.txt
+            case "$arch" in amd64) suffix=AMD64 ;; arm64) suffix=ARM64 ;; *) exit 1 ;; esac
+            printf 'BUILD_%s\n' "$suffix" > base-receipt/stage.txt
             capture "$private/build-$arch.log" 16777216 timeout 45m docker run --rm -v "$PWD:/work" -w /work moth-base-custody-builder:local \
               cargo build --release --locked --frozen --offline -p cli --target "$target"
             if test "$arch" = arm64; then strip_cmd='aarch64-linux-gnu-strip'; else strip_cmd='strip'; fi
+            printf 'STRIP_%s\n' "$suffix" > base-receipt/stage.txt
             capture "$private/strip-$arch.log" 1048576 docker run --rm -v "$PWD:/work" -w /work moth-base-custody-builder:local \
               "$strip_cmd" "target/$target/release/agent"
             mkdir -p "release-payload/$arch/native" "$private/stage-$arch/THIRD_PARTY_NOTICES/native"
@@ -1316,11 +1318,13 @@ jobs:
               cp "$source" "release-payload/$arch/native/$source"
               cp "$source" "$private/stage-$arch/THIRD_PARTY_NOTICES/native/$source"
             done < packaging/native-notice-files.txt
+            printf 'TAR_%s\n' "$suffix" > base-receipt/stage.txt
             capture_archive "$private/candidate-$arch.tar.gz" 134217728 tar -C "$private" -czf - "stage-$arch"
-            printf '%s\n' LOCAL_IMAGE > base-receipt/stage.txt
+            printf 'IMAGE_BUILD_%s\n' "$suffix" > base-receipt/stage.txt
             capture "$private/image-$arch.log" 4194304 docker build --platform "linux/$arch" --file Dockerfile.release \
               --build-arg TARGETARCH="$arch" --build-arg SOURCE_REVISION="$GITHUB_SHA" \
               -t "moth-base-custody-$arch:local" .
+            printf 'BASE_MANIFEST_%s\n' "$suffix" > base-receipt/stage.txt
             digest=$(jq -er --arg arch "$arch" '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == $arch) | .digest] | if length == 1 then .[0] else empty end' "$private/base-index.json")
             [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
             if test "$arch" = amd64; then
@@ -1329,10 +1333,15 @@ jobs:
               test "$digest" = sha256:4bed9c8eff0e70bf6547aa04a3b1ea5bba63fb910707b3f94f45556edc2a9238
             fi
             printf '%s_base_manifest=%s\n' "$arch" "$digest" >> base-receipt/identity.txt
+            printf 'BASE_PULL_%s\n' "$suffix" > base-receipt/stage.txt
             capture "$private/pull-$arch.log" 1048576 docker pull --platform "linux/$arch" "gcr.io/distroless/cc-debian12@$digest"
+            printf 'BASE_CREATE_%s\n' "$suffix" > base-receipt/stage.txt
             capture "$private/create-base-$arch.log" 1048576 docker create --name "moth-base-custody-base-$arch" --platform "linux/$arch" "gcr.io/distroless/cc-debian12@$digest"
+            printf 'IMAGE_CREATE_%s\n' "$suffix" > base-receipt/stage.txt
             capture "$private/create-image-$arch.log" 1048576 docker create --name "moth-base-custody-image-$arch" --platform "linux/$arch" "moth-base-custody-$arch:local"
+            printf 'BASE_EXPORT_%s\n' "$suffix" > base-receipt/stage.txt
             capture_archive "$private/base-$arch.tar" 268435456 docker export "moth-base-custody-base-$arch"
+            printf 'IMAGE_EXPORT_%s\n' "$suffix" > base-receipt/stage.txt
             capture_archive "$private/image-$arch.tar" 268435456 docker export "moth-base-custody-image-$arch"
           done
 
@@ -1476,6 +1485,10 @@ jobs:
             test -s "$path"
             if LC_ALL=C grep -qvE '^[A-Za-z0-9_=/:-]+$' "$path"; then exit 1; fi
           done < <(find base-receipt -type f -print)
+          case "$(cat base-receipt/stage.txt)" in
+            FETCH|BASE_INDEX|BUILDER|BUILD_AMD64|BUILD_ARM64|STRIP_AMD64|STRIP_ARM64|TAR_AMD64|TAR_ARM64|IMAGE_BUILD_AMD64|IMAGE_BUILD_ARM64|BASE_MANIFEST_AMD64|BASE_MANIFEST_ARM64|BASE_PULL_AMD64|BASE_PULL_ARM64|BASE_CREATE_AMD64|BASE_CREATE_ARM64|IMAGE_CREATE_AMD64|IMAGE_CREATE_ARM64|BASE_EXPORT_AMD64|BASE_EXPORT_ARM64|IMAGE_EXPORT_AMD64|IMAGE_EXPORT_ARM64|CUSTODY|VERIFIED|COMPLETE) ;;
+            *) exit 1 ;;
+          esac
           test "$(du -sk base-receipt | cut -f1)" -le 16
 
       - name: Retain bounded base custody receipt
