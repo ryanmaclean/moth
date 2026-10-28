@@ -586,18 +586,25 @@ jobs:
         if: always()
         shell: bash
         run: |
-          set -euo pipefail
+          set -uo pipefail
+          cleanup_ok=1
           if test -s "$RUNNER_TEMP/moth-parity/container-id"; then
-            docker rm -f "$(cat "$RUNNER_TEMP/moth-parity/container-id")" >/dev/null
+            docker rm -f "$(cat "$RUNNER_TEMP/moth-parity/container-id")" >/dev/null || cleanup_ok=0
           fi
-          rm -rf "$RUNNER_TEMP/moth-parity" "$GITHUB_WORKSPACE/release-payload"
-          rm -f agent-native-link.map target/x86_64-unknown-linux-gnu/release/agent
-          rm -f "$RUNNER_TEMP/moth-parity-builder.log" "$RUNNER_TEMP/moth-parity-rustc-version.log" "$RUNNER_TEMP/moth-parity-rustc-identity.log" "$RUNNER_TEMP/moth-parity-linker-identity.log" "$RUNNER_TEMP/moth-parity-cargo.log" "$RUNNER_TEMP/moth-parity-oci.log"
-          for private in agent-native-link.map target/x86_64-unknown-linux-gnu/release/agent \
+          sudo -n rm -rf -- "$RUNNER_TEMP/moth-parity" "$GITHUB_WORKSPACE/release-payload" "$GITHUB_WORKSPACE/target" || cleanup_ok=0
+          rm -f -- agent-native-link.map || cleanup_ok=0
+          rm -f -- "$RUNNER_TEMP/moth-parity-builder.log" "$RUNNER_TEMP/moth-parity-rustc-version.log" "$RUNNER_TEMP/moth-parity-rustc-identity.log" "$RUNNER_TEMP/moth-parity-linker-identity.log" "$RUNNER_TEMP/moth-parity-cargo.log" "$RUNNER_TEMP/moth-parity-oci.log" || cleanup_ok=0
+          for private in agent-native-link.map "$GITHUB_WORKSPACE/target" \
             "$RUNNER_TEMP/moth-parity" "$GITHUB_WORKSPACE/release-payload" \
             "$RUNNER_TEMP/moth-parity-builder.log" "$RUNNER_TEMP/moth-parity-rustc-version.log" "$RUNNER_TEMP/moth-parity-rustc-identity.log" "$RUNNER_TEMP/moth-parity-linker-identity.log" "$RUNNER_TEMP/moth-parity-cargo.log" "$RUNNER_TEMP/moth-parity-oci.log"; do
-            test ! -e "$private" && test ! -L "$private"
+            { test ! -e "$private" && test ! -L "$private"; } || cleanup_ok=0
           done
+          if test "$cleanup_ok" -ne 1; then
+            if test -d parity && test ! -L parity; then
+              printf '%s\n' 'INCOMPLETE' 'release_admission=NO' 'legal_admission=NO' > parity/status.txt
+            fi
+            exit 1
+          fi
 
       - name: Bound text-only parity receipt
         id: bound-parity
