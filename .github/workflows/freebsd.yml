@@ -1477,21 +1477,32 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test -d base-receipt && test ! -L base-receipt
-          test -f base-receipt/status.txt && test ! -L base-receipt/status.txt
-          test "$(find base-receipt -type f | wc -l)" -le 4
-          test -z "$(find base-receipt ! -type f ! -type d -print -quit)"
+          refuse() { echo 'base receipt bounds failure' >&2; exit 1; }
+          test -d base-receipt && test ! -L base-receipt || refuse
+          test -f base-receipt/status.txt && test ! -L base-receipt/status.txt || refuse
+          test -f base-receipt/stage.txt && test ! -L base-receipt/stage.txt || refuse
+          test -z "$(find base-receipt ! -type f ! -type d -print -quit)" || refuse
+          file_count=0
+          total_bytes=0
           while IFS= read -r path; do
-            case "$path" in base-receipt/status.txt|base-receipt/stage.txt|base-receipt/identity.txt|base-receipt/custody.txt) ;; *) exit 1 ;; esac
-            test "$(wc -c < "$path")" -le 2048
-            test -s "$path"
-            if LC_ALL=C grep -qvE '^[A-Za-z0-9_=/:-]+$' "$path"; then exit 1; fi
+            case "$path" in base-receipt/status.txt|base-receipt/stage.txt|base-receipt/identity.txt|base-receipt/custody.txt) ;; *) refuse ;; esac
+            bytes=$(wc -c < "$path") || refuse
+            test "$bytes" -gt 0 && test "$bytes" -le 2048 || refuse
+            if LC_ALL=C grep -qvE '^[A-Za-z0-9_=/:-]+$' "$path"; then
+              refuse
+            else
+              grep_status=$?
+              test "$grep_status" -eq 1 || refuse
+            fi
+            file_count=$((file_count + 1))
+            total_bytes=$((total_bytes + bytes))
           done < <(find base-receipt -type f -print)
+          test "$file_count" -ge 2 && test "$file_count" -le 4 || refuse
+          test "$total_bytes" -le 8192 || refuse
           case "$(cat base-receipt/stage.txt)" in
             FETCH|BASE_INDEX|BUILDER|BUILD_AMD64|BUILD_ARM64|STRIP_AMD64|STRIP_ARM64|TAR_AMD64|TAR_ARM64|IMAGE_BUILD_AMD64|IMAGE_BUILD_ARM64|BASE_MANIFEST_AMD64|BASE_MANIFEST_ARM64|BASE_PULL_AMD64|BASE_PULL_ARM64|BASE_CREATE_AMD64|BASE_CREATE_ARM64|IMAGE_CREATE_AMD64|IMAGE_CREATE_ARM64|BASE_EXPORT_AMD64|BASE_EXPORT_ARM64|IMAGE_EXPORT_AMD64|IMAGE_EXPORT_ARM64|CUSTODY|VERIFIED|COMPLETE) ;;
-            *) exit 1 ;;
+            *) refuse ;;
           esac
-          test "$(du -sk base-receipt | cut -f1)" -le 16
 
       - name: Retain bounded base custody receipt
         if: ${{ always() && steps.bound-base.outcome == 'success' }}
