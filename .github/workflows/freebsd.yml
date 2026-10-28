@@ -22,9 +22,15 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      notice_head_sha:
+        description: 'Full independently reviewed PR8 head for notice placement diagnostic'
+        required: false
+        type: string
 
 jobs:
   freebsd:
+    if: github.event_name != 'workflow_dispatch' || github.ref != 'refs/heads/fix/native-notice-packaging-pr5'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -117,3 +123,174 @@ jobs:
               fi
               echo "::endgroup::"
             done
+
+  notice-placement-linux:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/fix/native-notice-packaging-pr5'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 75
+    permissions:
+      contents: read
+    steps:
+      - name: Fetch reviewed PR8 source without submodules
+        shell: bash
+        env:
+          REVIEWED_SHA: ${{ inputs.notice_head_sha }}
+          GIT_TERMINAL_PROMPT: '0'
+          GIT_ASKPASS: /bin/false
+        run: |
+          set -euo pipefail
+          mkdir -p notice-audit
+          printf '%s\n' 'INCOMPLETE' 'release_admission=NO' 'legal_admission=NO' > notice-audit/status.txt
+          printf '%s\n' "$GITHUB_SHA" > notice-audit/workflow-head.txt
+          [[ "$REVIEWED_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$REVIEWED_SHA" = "$GITHUB_SHA"
+          test -z "$(find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 ! -name notice-audit -print -quit)"
+          git init -q "$GITHUB_WORKSPACE"
+          git remote add origin https://github.com/ryanmaclean/moth.git
+          git -c credential.helper= fetch --no-tags --no-recurse-submodules --depth=10 origin refs/pull/8/head
+          test "$(git rev-parse FETCH_HEAD)" = "$REVIEWED_SHA"
+          git -c submodule.recurse=false checkout --detach --force "$REVIEWED_SHA"
+          test "$(git rev-parse HEAD)" = "$REVIEWED_SHA"
+          git cat-file -e '2ad30129a9af231b687b8821f2b9d062e41992f9^{commit}'
+          test "$(git merge-base HEAD 2ad30129a9af231b687b8821f2b9d062e41992f9)" = '2ad30129a9af231b687b8821f2b9d062e41992f9'
+          git diff --name-only 2ad30129a9af231b687b8821f2b9d062e41992f9 HEAD | sort > notice-audit/changed-paths.txt
+          printf '%s\n' '.github/workflows/freebsd.yml' '.github/workflows/release.yml' 'Dockerfile' 'packaging/native-notice-files.txt' | sort | diff -u - notice-audit/changed-paths.txt
+          printf '%s\n' \
+            'befd91e188696989d415870792acb3f9fa5a5d3bd79fe8823989264714b6fe51  Cargo.lock' \
+            '392a5a80e863151504fa05add58ea97b98a4a7a57e36cd26436734a95465650a  Dockerfile' \
+            '3ea7cd527c66f01d96c3961ddb41897e34877c814cd7372b7f5e037ade7f7396  .github/workflows/release.yml' \
+            '6321279cc4a58259e29638a1f7c6621184b07576e8a70728b2b5bb48d761d83c  packaging/native-notice-files.txt' \
+            '59d5f1cb240a41f1a4acea088ca1f964b0e9d81c6afea1cc748988f5bdb1a533  .dockerignore' \
+            | sha256sum --check --status
+          test -z "$(git status --porcelain --untracked-files=no)"
+          printf 'head=%s\nbase=%s\ntarget=x86_64-unknown-linux-gnu\n' "$REVIEWED_SHA" 2ad30129a9af231b687b8821f2b9d062e41992f9 > notice-audit/identity.txt
+
+      - name: Build tar candidate using release staging layout
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build --target builder -t moth-notice-builder:diagnostic . > /tmp/moth-notice-builder.log 2>&1
+          docker image inspect --format 'builder_image={{.Id}}' moth-notice-builder:diagnostic > notice-audit/images.txt
+          docker run --rm moth-notice-builder:diagnostic rustc -V > notice-audit/toolchain.txt
+          grep -Eq '^rustc 1\.94\.1 ' notice-audit/toolchain.txt
+          docker run --rm -v "$PWD:/work" -w /work moth-notice-builder:diagnostic \
+            cargo build --release --locked --frozen --offline -p cli --target x86_64-unknown-linux-gnu \
+            > /tmp/moth-notice-cargo.log 2>&1
+          stage=agent-notice-diagnostic-x86_64-unknown-linux-gnu
+          mkdir -p "/tmp/moth-notice-audit/dist/$stage"
+          docker run --rm -v "$PWD:/work" -w /work moth-notice-builder:diagnostic \
+            strip target/x86_64-unknown-linux-gnu/release/agent
+          cp target/x86_64-unknown-linux-gnu/release/agent "/tmp/moth-notice-audit/dist/$stage/agent"
+          cp LICENSE README.md CHANGELOG.md "/tmp/moth-notice-audit/dist/$stage/"
+          notice_root="/tmp/moth-notice-audit/dist/$stage/THIRD_PARTY_NOTICES/native"
+          mkdir -p "$notice_root"
+          test "$(wc -l < packaging/native-notice-files.txt)" -eq 14
+          test "$(sort -u packaging/native-notice-files.txt | wc -l)" -eq 14
+          : > notice-audit/source-text-sha256.txt
+          while IFS= read -r source; do
+            case "$source" in vendor/*) ;; *) exit 1 ;; esac
+            case "$source" in *..*|*//*) exit 1 ;; esac
+            test -f "$source" && test ! -L "$source"
+            target="$notice_root/$source"
+            mkdir -p "$(dirname "$target")"
+            cp "$source" "$target"
+            cmp -s "$source" "$target"
+            sha256sum "$source" >> notice-audit/source-text-sha256.txt
+          done < packaging/native-notice-files.txt
+          cp packaging/native-notice-files.txt "$notice_root/FILES.txt"
+          tar -C /tmp/moth-notice-audit/dist -czf /tmp/moth-notice-audit/candidate.tar.gz "$stage"
+          tar -tzf /tmp/moth-notice-audit/candidate.tar.gz > notice-audit/tar-members.txt
+          test "$(grep -Ec "^$stage/THIRD_PARTY_NOTICES/native/.*[^/]$" notice-audit/tar-members.txt)" -eq 15
+          : > notice-audit/tar-text-sha256.txt
+          while IFS= read -r source; do
+            member="$stage/THIRD_PARTY_NOTICES/native/$source"
+            test "$(grep -Fxc "$member" notice-audit/tar-members.txt)" -eq 1
+            source_hash=$(sha256sum "$source" | cut -d' ' -f1)
+            member_hash=$(tar -xOzf /tmp/moth-notice-audit/candidate.tar.gz "$member" | sha256sum | cut -d' ' -f1)
+            test "$member_hash" = "$source_hash"
+            printf '%s  %s\n' "$member_hash" "$member" >> notice-audit/tar-text-sha256.txt
+          done < packaging/native-notice-files.txt
+          test "$(grep -Fxc "$stage/THIRD_PARTY_NOTICES/native/FILES.txt" notice-audit/tar-members.txt)" -eq 1
+          test "$(tar -xOzf /tmp/moth-notice-audit/candidate.tar.gz "$stage/THIRD_PARTY_NOTICES/native/FILES.txt" | sha256sum | cut -d' ' -f1)" = "$(sha256sum packaging/native-notice-files.txt | cut -d' ' -f1)"
+          test "$(tar -xOzf /tmp/moth-notice-audit/candidate.tar.gz "$stage/LICENSE" | sha256sum | cut -d' ' -f1)" = "$(sha256sum LICENSE | cut -d' ' -f1)"
+          test "$(tar -xOzf /tmp/moth-notice-audit/candidate.tar.gz "$stage/agent" | sha256sum | cut -d' ' -f1)" = "$(sha256sum target/x86_64-unknown-linux-gnu/release/agent | cut -d' ' -f1)"
+          printf 'tar_agent_sha256=%s\ntar_archive_sha256=%s\n' \
+            "$(tar -xOzf /tmp/moth-notice-audit/candidate.tar.gz "$stage/agent" | sha256sum | cut -d' ' -f1)" \
+            "$(sha256sum /tmp/moth-notice-audit/candidate.tar.gz | cut -d' ' -f1)" \
+            > notice-audit/binary-identities.txt
+
+      - name: Build actual OCI runtime and compare exported notice bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build --target runtime -t moth-notice-runtime:diagnostic . > /tmp/moth-notice-oci.log 2>&1
+          {
+            docker image inspect --format 'runtime_image={{.Id}}' moth-notice-runtime:diagnostic
+            docker image inspect --format 'runtime_rootfs_layers={{len .RootFS.Layers}}' moth-notice-runtime:diagnostic
+            docker image inspect --format 'oci_license_label={{index .Config.Labels "org.opencontainers.image.licenses"}}' moth-notice-runtime:diagnostic
+          } >> notice-audit/images.txt
+          container=$(docker create moth-notice-runtime:diagnostic)
+          trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
+          docker export "$container" > /tmp/moth-notice-audit/oci-rootfs.tar
+          tar -tf /tmp/moth-notice-audit/oci-rootfs.tar > /tmp/moth-notice-audit/oci-members.txt
+          test "$(awk '{name=$0; sub(/^\.\//,"",name); if(name ~ /^usr\/share\/doc\/moth\/THIRD_PARTY_NOTICES\/native\// && name !~ /\/$/) print name}' /tmp/moth-notice-audit/oci-members.txt | wc -l)" -eq 15
+          : > notice-audit/oci-text-sha256.txt
+          while IFS= read -r source; do
+            path="usr/share/doc/moth/THIRD_PARTY_NOTICES/native/$source"
+            member=$(awk -v wanted="$path" '{name=$0; sub(/^\.\//,"",name); if(name==wanted) print $0}' /tmp/moth-notice-audit/oci-members.txt)
+            test "$(printf '%s\n' "$member" | sed '/^$/d' | wc -l)" -eq 1
+            source_hash=$(sha256sum "$source" | cut -d' ' -f1)
+            member_hash=$(tar -xOf /tmp/moth-notice-audit/oci-rootfs.tar "$member" | sha256sum | cut -d' ' -f1)
+            test "$member_hash" = "$source_hash"
+            printf '%s  %s\n' "$member_hash" "$path" >> notice-audit/oci-text-sha256.txt
+          done < packaging/native-notice-files.txt
+          for relative in usr/share/doc/moth/THIRD_PARTY_NOTICES/native/FILES.txt usr/share/licenses/moth/LICENSE usr/local/bin/agent; do
+            member=$(awk -v wanted="$relative" '{name=$0; sub(/^\.\//,"",name); if(name==wanted) print $0}' /tmp/moth-notice-audit/oci-members.txt)
+            test "$(printf '%s\n' "$member" | sed '/^$/d' | wc -l)" -eq 1
+            case "$relative" in
+              */FILES.txt) test "$(tar -xOf /tmp/moth-notice-audit/oci-rootfs.tar "$member" | sha256sum | cut -d' ' -f1)" = "$(sha256sum packaging/native-notice-files.txt | cut -d' ' -f1)" ;;
+              */LICENSE) test "$(tar -xOf /tmp/moth-notice-audit/oci-rootfs.tar "$member" | sha256sum | cut -d' ' -f1)" = "$(sha256sum LICENSE | cut -d' ' -f1)" ;;
+              */agent) printf 'oci_agent_sha256=%s\n' "$(tar -xOf /tmp/moth-notice-audit/oci-rootfs.tar "$member" | sha256sum | cut -d' ' -f1)" >> notice-audit/binary-identities.txt ;;
+            esac
+          done
+          tar_hash=$(sed -n 's/^tar_agent_sha256=//p' notice-audit/binary-identities.txt)
+          oci_hash=$(sed -n 's/^oci_agent_sha256=//p' notice-audit/binary-identities.txt)
+          if test "$tar_hash" = "$oci_hash"; then echo 'tar_oci_binary_identity=yes' >> notice-audit/binary-identities.txt; else echo 'tar_oci_binary_identity=no' >> notice-audit/binary-identities.txt; fi
+
+      - name: Complete notice-placement diagnostic only
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(wc -l < notice-audit/source-text-sha256.txt)" -eq 14
+          test "$(wc -l < notice-audit/tar-text-sha256.txt)" -eq 14
+          test "$(wc -l < notice-audit/oci-text-sha256.txt)" -eq 14
+          test -s notice-audit/binary-identities.txt
+          printf '%s\n' 'NATIVE_NOTICE_PLACEMENT_CANDIDATE_ONLY' 'release_admission=NO' 'legal_admission=NO' 'native_link_retention=UNPROVEN' 'base_image_notice_coverage=UNPROVEN' > notice-audit/status.txt
+
+      - name: Bound safe notice receipts even on failure
+        id: bound-notices
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -d notice-audit && test ! -L notice-audit
+          test -f notice-audit/status.txt
+          test "$(find notice-audit -type f | wc -l)" -le 11
+          test -z "$(find notice-audit ! -type f ! -type d -print -quit)"
+          while IFS= read -r path; do
+            case "$path" in
+              notice-audit/status.txt|notice-audit/workflow-head.txt|notice-audit/changed-paths.txt|notice-audit/identity.txt|notice-audit/images.txt|notice-audit/toolchain.txt|notice-audit/source-text-sha256.txt|notice-audit/tar-members.txt|notice-audit/tar-text-sha256.txt|notice-audit/oci-text-sha256.txt|notice-audit/binary-identities.txt) ;;
+              *) exit 1 ;;
+            esac
+            test "$(wc -c < "$path")" -le 131072
+          done < <(find notice-audit -type f -print)
+          test "$(du -sk notice-audit | cut -f1)" -le 1024
+
+      - name: Retain notice placement diagnostic receipt
+        if: ${{ always() && steps.bound-notices.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: moth-pr8-native-notice-placement-${{ github.sha }}
+          path: notice-audit/
+          if-no-files-found: error
+          retention-days: 7
