@@ -860,18 +860,28 @@ jobs:
               raise SystemExit('native rlib map path ambiguous')
           root = Path.cwd()
           def linked_path(raw):
-              if raw.startswith('/work/'):
-                  return (root / raw.removeprefix('/work/')).resolve()
-              if not raw.startswith('/'):
-                  return (root / raw).resolve()
-              return None
+              try:
+                  if raw.startswith('/work/'):
+                      return (root / raw.removeprefix('/work/')).resolve()
+                  if not raw.startswith('/'):
+                      return (root / raw).resolve()
+                  return None
+              except (OSError, RuntimeError, ValueError):
+                  raise SystemExit('native extraction path invalid') from None
           stats_file = Path('agent-native-archive-stats.txt')
           why_file = Path('agent-native-why-extract.txt')
-          if any(not path.is_file() or path.is_symlink() or not 0 < path.stat().st_size <= cap
-                 for path, cap in ((stats_file, 1048576), (why_file, 16777216))):
+          try:
+              diagnostics_in_bounds = all(path.is_file() and not path.is_symlink() and 0 < path.stat().st_size <= cap
+                                          for path, cap in ((stats_file, 1048576), (why_file, 16777216)))
+          except (OSError, RuntimeError, ValueError):
+              raise SystemExit('native extraction diagnostics bounds') from None
+          if not diagnostics_in_bounds:
               raise SystemExit('native extraction diagnostics bounds')
-          stats_lines = stats_file.read_text(encoding='utf-8').splitlines()
-          why_lines = why_file.read_text(encoding='utf-8').splitlines()
+          try:
+              stats_lines = stats_file.read_text(encoding='utf-8').splitlines()
+              why_lines = why_file.read_text(encoding='utf-8').splitlines()
+          except (OSError, UnicodeError, RuntimeError, ValueError):
+              raise SystemExit('native extraction diagnostics unreadable') from None
           if not 1 < len(stats_lines) <= 8192 or stats_lines[0] != 'members\textracted\tarchive':
               raise SystemExit('native rlib stats header')
           if not 1 < len(why_lines) <= 50000 or why_lines[0] != 'reference\textracted\tsymbol':
