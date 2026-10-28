@@ -96,11 +96,27 @@ jobs:
 
       # --------------- Common: stage + checksum + upload ---------------
       - name: Stage tarball
+        shell: bash
         run: |
+          set -euo pipefail
           STAGE="agent-${{ github.ref_name }}-${{ matrix.target }}"
           mkdir -p "dist/$STAGE"
           cp target/${{ matrix.target }}/release/agent "dist/$STAGE/"
           cp LICENSE README.md CHANGELOG.md "dist/$STAGE/"
+          NOTICE_ROOT="dist/$STAGE/THIRD_PARTY_NOTICES/native"
+          mkdir -p "$NOTICE_ROOT"
+          test "$(wc -l < packaging/native-notice-files.txt)" -eq 14
+          test "$(sort -u packaging/native-notice-files.txt | wc -l)" -eq 14
+          while IFS= read -r source; do
+            case "$source" in vendor/*) ;; *) exit 1 ;; esac
+            case "$source" in *..*|*//*) exit 1 ;; esac
+            test -f "$source" && test ! -L "$source"
+            target="$NOTICE_ROOT/$source"
+            mkdir -p "$(dirname "$target")"
+            cp "$source" "$target"
+            cmp -s "$source" "$target"
+          done < packaging/native-notice-files.txt
+          cp packaging/native-notice-files.txt "$NOTICE_ROOT/FILES.txt"
           tar -C dist -czf "dist/${STAGE}.tar.gz" "$STAGE"
 
       - name: SHA-256
@@ -124,7 +140,7 @@ jobs:
 
   release:
     name: github release
-    needs: build
+    needs: [build, docker]
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -150,6 +166,90 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+      - name: Fetch Linux tar artifacts from this release run
+        uses: actions/download-artifact@v4
+        with:
+          pattern: agent-*-unknown-linux-gnu
+          path: release-dist
+          merge-multiple: true
+      - name: Verify tar artifacts and stage one payload per architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$GITHUB_REF_TYPE" = tag
+          python3 - <<'PY'
+          import hashlib
+          import os
+          from pathlib import Path, PurePosixPath
+          import tarfile
+
+          root = Path.cwd()
+          manifest = (root / 'packaging/native-notice-files.txt').read_text().splitlines()
+          assert len(manifest) == len(set(manifest)) == 14
+          for source in manifest:
+              path = PurePosixPath(source)
+              assert path.parts[0] == 'vendor' and all(p not in ('', '.', '..') for p in path.parts)
+              actual = root / source
+              assert actual.is_file() and not actual.is_symlink()
+
+          expected_archives = {
+              'amd64': 'x86_64-unknown-linux-gnu',
+              'arm64': 'aarch64-unknown-linux-gnu',
+          }
+          dist = root / 'release-dist'
+          expected_dist = {
+              f'agent-{os.environ["GITHUB_REF_NAME"]}-{target}.tar.gz'
+              for target in expected_archives.values()
+          }
+          expected_dist |= {name + '.sha256' for name in expected_dist}
+          assert {p.name for p in dist.iterdir()} == expected_dist
+          payload_root = root / 'release-payload'
+          payload_root.mkdir()
+          for arch, target in expected_archives.items():
+              stage = f'agent-{os.environ["GITHUB_REF_NAME"]}-{target}'
+              archive = dist / (stage + '.tar.gz')
+              digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+              assert (dist / (archive.name + '.sha256')).read_text() == f'{digest}  {archive.name}\n'
+              wanted = {'agent', 'LICENSE', 'README.md', 'CHANGELOG.md'}
+              wanted |= {f'THIRD_PARTY_NOTICES/native/{p}' for p in manifest}
+              wanted.add('THIRD_PARTY_NOTICES/native/FILES.txt')
+              seen = set()
+              outdir = payload_root / arch
+              (outdir / 'native').mkdir(parents=True)
+              with tarfile.open(archive, 'r:gz') as tar:
+                  for member in tar:
+                      name = member.name.rstrip('/')
+                      parts = name.split('/')
+                      assert parts[0] == stage and all(p not in ('', '.', '..') for p in parts)
+                      if member.isdir():
+                          continue
+                      assert member.isfile() and member.size <= 100 * 1024 * 1024
+                      relative = '/'.join(parts[1:])
+                      assert relative in wanted and relative not in seen
+                      seen.add(relative)
+                      if relative == 'agent':
+                          destination = outdir / 'agent'
+                          assert member.mode & 0o111
+                      elif relative == 'LICENSE':
+                          destination = outdir / 'LICENSE'
+                      elif relative.startswith('THIRD_PARTY_NOTICES/native/'):
+                          destination = outdir / 'native' / relative.removeprefix('THIRD_PARTY_NOTICES/native/')
+                      else:
+                          continue
+                      destination.parent.mkdir(parents=True, exist_ok=True)
+                      with tar.extractfile(member) as source_file, destination.open('wb') as output:
+                          while chunk := source_file.read(1024 * 1024):
+                              output.write(chunk)
+                      destination.chmod(0o755 if relative == 'agent' else 0o644)
+              assert seen == wanted
+              assert (outdir / 'LICENSE').read_bytes() == (root / 'LICENSE').read_bytes()
+              assert (outdir / 'native/FILES.txt').read_bytes() == (root / 'packaging/native-notice-files.txt').read_bytes()
+              for source in manifest:
+                  assert (outdir / 'native' / source).read_bytes() == (root / source).read_bytes()
+              binary_hash = hashlib.sha256((outdir / 'agent').read_bytes()).hexdigest()
+              print(f'verified {arch} tar={digest} agent={binary_hash} notices={len(manifest)}')
+          PY
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
@@ -160,17 +260,84 @@ jobs:
       - name: Lowercase image name
         id: img
         run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
-      - uses: docker/build-push-action@v6
+      - name: Push run-scoped candidate for byte verification
+        id: candidate
+        uses: docker/build-push-action@v6
         with:
           context: .
-          file: Dockerfile
+          file: Dockerfile.release
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: |
-            ${{ steps.img.outputs.name }}:${{ github.ref_name }}
-            ${{ steps.img.outputs.name }}:latest
+          tags: ${{ steps.img.outputs.name }}:parity-candidate-${{ github.run_id }}-${{ github.run_attempt }}
           build-args: |
             REPO_SOURCE=https://github.com/${{ github.repository }}
+            SOURCE_REVISION=${{ github.sha }}
           provenance: true
           sbom: true
-          cache-from: type=gha,scope=builder
+      - name: Verify immutable pushed platform digests against tar payloads
+        shell: bash
+        env:
+          IMAGE_NAME: ${{ steps.img.outputs.name }}
+          INDEX_DIGEST: ${{ steps.candidate.outputs.digest }}
+        run: |
+          set -euo pipefail
+          [[ "$INDEX_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          docker buildx imagetools inspect --raw "$IMAGE_NAME@$INDEX_DIGEST" > "$RUNNER_TEMP/moth-candidate-index.json"
+          jq -e '([.manifests[] | select(.platform.os == "linux") | .platform.architecture] | sort) == ["amd64", "arm64"]' \
+            "$RUNNER_TEMP/moth-candidate-index.json"
+          containers=()
+          trap 'for container in "${containers[@]}"; do docker rm -f "$container" >/dev/null 2>&1 || true; done; rm -f "$RUNNER_TEMP"/moth-release-*-rootfs.tar' EXIT
+          for arch in amd64 arm64; do
+            platform_digest=$(jq -er --arg arch "$arch" \
+              '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == $arch) | .digest] | if length == 1 then .[0] else empty end' \
+              "$RUNNER_TEMP/moth-candidate-index.json")
+            [[ "$platform_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+            docker pull --platform "linux/$arch" "$IMAGE_NAME@$platform_digest"
+            container=$(docker create --platform "linux/$arch" "$IMAGE_NAME@$platform_digest")
+            containers+=("$container")
+            docker export "$container" > "$RUNNER_TEMP/moth-release-$arch-rootfs.tar"
+            python3 - "$arch" "$RUNNER_TEMP/moth-release-$arch-rootfs.tar" <<'PY'
+          import hashlib
+          from pathlib import Path
+          import sys
+          import tarfile
+
+          arch, rootfs_name = sys.argv[1:]
+          payload = Path('release-payload') / arch
+          manifest = Path('packaging/native-notice-files.txt').read_text().splitlines()
+          expected = {'usr/local/bin/agent': payload / 'agent',
+                      'usr/share/licenses/moth/LICENSE': payload / 'LICENSE',
+                      'usr/share/doc/moth/THIRD_PARTY_NOTICES/native/FILES.txt': payload / 'native/FILES.txt'}
+          expected.update({f'usr/share/doc/moth/THIRD_PARTY_NOTICES/native/{p}': payload / 'native' / p
+                           for p in manifest})
+          with tarfile.open(rootfs_name, 'r:') as tar:
+              for path, source in expected.items():
+                  matching = [m for m in tar if m.name.removeprefix('./') == path]
+                  assert len(matching) == 1 and matching[0].isfile(), path
+                  observed = hashlib.sha256(tar.extractfile(matching[0]).read()).hexdigest()
+                  assert observed == hashlib.sha256(source.read_bytes()).hexdigest(), path
+              native_prefix = 'usr/share/doc/moth/THIRD_PARTY_NOTICES/native/'
+              native_files = [m for m in tar if m.name.removeprefix('./').startswith(native_prefix) and m.isfile()]
+              assert len(native_files) == 15
+          print(f'verified pushed {arch} OCI agent and 15 native files against release tar payload')
+          PY
+          done
+      - name: Promote verified immutable index to release tags
+        shell: bash
+        env:
+          IMAGE_NAME: ${{ steps.img.outputs.name }}
+          INDEX_DIGEST: ${{ steps.candidate.outputs.digest }}
+        run: |
+          set -euo pipefail
+          [[ "$INDEX_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          docker buildx imagetools create \
+            --tag "$IMAGE_NAME:$GITHUB_REF_NAME" \
+            --tag "$IMAGE_NAME:latest" \
+            --metadata-file "$RUNNER_TEMP/moth-promoted-index.json" \
+            "$IMAGE_NAME@$INDEX_DIGEST"
+          promoted_digest=$(jq -er '."containerimage.descriptor".digest' "$RUNNER_TEMP/moth-promoted-index.json")
+          test "$promoted_digest" = "$INDEX_DIGEST"
+          for tag in "$GITHUB_REF_NAME" latest; do
+            observed_digest=$(docker buildx imagetools inspect --format '{{json .Manifest}}' "$IMAGE_NAME:$tag" | jq -er .digest)
+            test "$observed_digest" = "$INDEX_DIGEST"
+          done

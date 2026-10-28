@@ -1,0 +1,19 @@
+# syntax=docker/dockerfile:1.6
+# Release-only assembly. The payload comes from this workflow run's checked
+# Linux tar artifacts; this Dockerfile does not recompile the agent.
+FROM gcr.io/distroless/cc-debian12@sha256:e5d81ddde149641e2a9ba55be4545bc125c67de07508b03ba4c22e6eb0ded5aa AS runtime
+
+ARG TARGETARCH
+ARG REPO_SOURCE="https://github.com/ryanmaclean/moth"
+ARG SOURCE_REVISION
+LABEL org.opencontainers.image.source="${REPO_SOURCE}"
+LABEL org.opencontainers.image.revision="${SOURCE_REVISION}"
+LABEL org.opencontainers.image.description="Minimal Rust agent harness; vendored deps, libcurl + OpenSSL via curl-sys."
+LABEL org.opencontainers.image.licenses="MIT"
+
+COPY release-payload/${TARGETARCH}/agent /usr/local/bin/agent
+COPY release-payload/${TARGETARCH}/LICENSE /usr/share/licenses/moth/LICENSE
+COPY release-payload/${TARGETARCH}/native/ /usr/share/doc/moth/THIRD_PARTY_NOTICES/native/
+
+ENTRYPOINT ["/usr/local/bin/agent"]
+CMD ["--help"]

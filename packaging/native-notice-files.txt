@@ -1,0 +1,14 @@
+vendor/curl-sys/LICENSE
+vendor/curl-sys/curl/COPYING
+vendor/curl-sys/curl/LICENSES/BSD-4-Clause-UC.txt
+vendor/curl-sys/curl/LICENSES/ISC.txt
+vendor/curl-sys/curl/LICENSES/curl.txt
+vendor/curl-sys/curl/lib/curlx/inet_ntop.c
+vendor/curl-sys/curl/lib/curlx/inet_pton.c
+vendor/openssl-src/LICENSE-APACHE
+vendor/openssl-src/LICENSE-MIT
+vendor/openssl-src/openssl/LICENSE.txt
+vendor/openssl-sys/LICENSE-MIT
+vendor/libz-sys/LICENSE-APACHE
+vendor/libz-sys/LICENSE-MIT
+vendor/libz-sys/src/zlib/LICENSE

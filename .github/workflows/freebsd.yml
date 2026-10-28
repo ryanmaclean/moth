@@ -22,9 +22,25 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      notice_head_sha:
+        description: 'Full independently reviewed PR8 head for selected diagnostic'
+        required: false
+        type: string
+      release_parity:
+        description: 'Run separate no-publish release-layout tar and OCI byte parity diagnostic'
+        required: false
+        type: boolean
+        default: false
+      base_custody:
+        description: 'Run separate no-publish amd64/arm64 base notice and payload custody diagnostic'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   freebsd:
+    if: github.event_name != 'workflow_dispatch' || github.ref != 'refs/heads/fix/native-notice-packaging-pr5'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -117,3 +133,1495 @@ jobs:
               fi
               echo "::endgroup::"
             done
+
+  notice-placement-linux:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/fix/native-notice-packaging-pr5' && !inputs.release_parity && !inputs.base_custody
+    runs-on: ubuntu-22.04
+    timeout-minutes: 75
+    permissions:
+      contents: read
+    steps:
+      - name: Fetch reviewed PR8 source without submodules
+        shell: bash
+        env:
+          REVIEWED_SHA: ${{ inputs.notice_head_sha }}
+          GIT_TERMINAL_PROMPT: '0'
+          GIT_ASKPASS: /bin/false
+        run: |
+          set -euo pipefail
+          mkdir -p notice-audit
+          printf '%s\n' 'INCOMPLETE' 'release_admission=NO' 'legal_admission=NO' > notice-audit/status.txt
+          printf '%s\n' "$GITHUB_SHA" > notice-audit/workflow-head.txt
+          [[ "$REVIEWED_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$REVIEWED_SHA" = "$GITHUB_SHA"
+          test -z "$(find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 ! -name notice-audit -print -quit)"
+          git init -q "$GITHUB_WORKSPACE"
+          git remote add origin https://github.com/ryanmaclean/moth.git
+          git -c credential.helper= fetch --no-tags --no-recurse-submodules --depth=10 origin refs/pull/8/head
+          test "$(git rev-parse FETCH_HEAD)" = "$REVIEWED_SHA"
+          git -c submodule.recurse=false checkout --detach --force "$REVIEWED_SHA"
+          test "$(git rev-parse HEAD)" = "$REVIEWED_SHA"
+          git cat-file -e '2ad30129a9af231b687b8821f2b9d062e41992f9^{commit}'
+          test "$(git merge-base HEAD 2ad30129a9af231b687b8821f2b9d062e41992f9)" = '2ad30129a9af231b687b8821f2b9d062e41992f9'
+          git diff --name-only 2ad30129a9af231b687b8821f2b9d062e41992f9 HEAD | sort > notice-audit/changed-paths.txt
+          printf '%s\n' '.github/workflows/freebsd.yml' '.github/workflows/release.yml' 'Dockerfile' 'Dockerfile.release' 'packaging/native-notice-files.txt' | sort | diff -u - notice-audit/changed-paths.txt
+          printf '%s\n' \
+            'befd91e188696989d415870792acb3f9fa5a5d3bd79fe8823989264714b6fe51  Cargo.lock' \
+            '392a5a80e863151504fa05add58ea97b98a4a7a57e36cd26436734a95465650a  Dockerfile' \
+            'ae3f5acdad3187723f7779ae725467a51d80e2609f6c509c8ab43c935b3f58a6  .github/workflows/release.yml' \
+            '8aecec600179b49cd5a1a8a4feede8e86c1fa2717c75752827201f476bf0ef4a  Dockerfile.release' \
+            '6321279cc4a58259e29638a1f7c6621184b07576e8a70728b2b5bb48d761d83c  packaging/native-notice-files.txt' \
+            '59d5f1cb240a41f1a4acea088ca1f964b0e9d81c6afea1cc748988f5bdb1a533  .dockerignore' \
+            | sha256sum --check --status
+          test -z "$(git status --porcelain --untracked-files=no)"
+          printf 'head=%s\nbase=%s\ntarget=x86_64-unknown-linux-gnu\n' "$REVIEWED_SHA" 2ad30129a9af231b687b8821f2b9d062e41992f9 > notice-audit/identity.txt
+
+      - name: Build tar candidate using release staging layout
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build --target builder -t moth-notice-builder:diagnostic . > /tmp/moth-notice-builder.log 2>&1
+          docker image inspect --format 'builder_image={{.Id}}' moth-notice-builder:diagnostic > notice-audit/images.txt
+          docker run --rm moth-notice-builder:diagnostic rustc -V > notice-audit/toolchain.txt
+          grep -Eq '^rustc 1\.94\.1 ' notice-audit/toolchain.txt
+          docker run --rm -v "$PWD:/work" -w /work moth-notice-builder:diagnostic \
+            cargo build --release --locked --frozen --offline -p cli --target x86_64-unknown-linux-gnu \
+            > /tmp/moth-notice-cargo.log 2>&1
+          stage=agent-notice-diagnostic-x86_64-unknown-linux-gnu
+          mkdir -p "/tmp/moth-notice-audit/dist/$stage"
+          docker run --rm -v "$PWD:/work" -w /work moth-notice-builder:diagnostic \
+            strip target/x86_64-unknown-linux-gnu/release/agent
+          cp target/x86_64-unknown-linux-gnu/release/agent "/tmp/moth-notice-audit/dist/$stage/agent"
+          cp LICENSE README.md CHANGELOG.md "/tmp/moth-notice-audit/dist/$stage/"
+          notice_root="/tmp/moth-notice-audit/dist/$stage/THIRD_PARTY_NOTICES/native"
+          mkdir -p "$notice_root"
+          test "$(wc -l < packaging/native-notice-files.txt)" -eq 14
+          test "$(sort -u packaging/native-notice-files.txt | wc -l)" -eq 14
+          : > notice-audit/source-text-sha256.txt
+          while IFS= read -r source; do
+            case "$source" in vendor/*) ;; *) exit 1 ;; esac
+            case "$source" in *..*|*//*) exit 1 ;; esac
+            test -f "$source" && test ! -L "$source"
+            target="$notice_root/$source"
+            mkdir -p "$(dirname "$target")"
+            cp "$source" "$target"
+            cmp -s "$source" "$target"
+            sha256sum "$source" >> notice-audit/source-text-sha256.txt
+          done < packaging/native-notice-files.txt
+          cp packaging/native-notice-files.txt "$notice_root/FILES.txt"
+          tar -C /tmp/moth-notice-audit/dist -czf /tmp/moth-notice-audit/candidate.tar.gz "$stage"
+          tar -tzf /tmp/moth-notice-audit/candidate.tar.gz > notice-audit/tar-members.txt
+          test "$(grep -Ec "^$stage/THIRD_PARTY_NOTICES/native/.*[^/]$" notice-audit/tar-members.txt)" -eq 15
+          : > notice-audit/tar-text-sha256.txt
+          while IFS= read -r source; do
+            member="$stage/THIRD_PARTY_NOTICES/native/$source"
+            test "$(grep -Fxc "$member" notice-audit/tar-members.txt)" -eq 1
+            source_hash=$(sha256sum "$source" | cut -d' ' -f1)
+            member_hash=$(tar -xOzf /tmp/moth-notice-audit/candidate.tar.gz "$member" | sha256sum | cut -d' ' -f1)
+            test "$member_hash" = "$source_hash"
+            printf '%s  %s\n' "$member_hash" "$member" >> notice-audit/tar-text-sha256.txt
+          done < packaging/native-notice-files.txt
+          test "$(grep -Fxc "$stage/THIRD_PARTY_NOTICES/native/FILES.txt" notice-audit/tar-members.txt)" -eq 1
+          test "$(tar -xOzf /tmp/moth-notice-audit/candidate.tar.gz "$stage/THIRD_PARTY_NOTICES/native/FILES.txt" | sha256sum | cut -d' ' -f1)" = "$(sha256sum packaging/native-notice-files.txt | cut -d' ' -f1)"
+          test "$(tar -xOzf /tmp/moth-notice-audit/candidate.tar.gz "$stage/LICENSE" | sha256sum | cut -d' ' -f1)" = "$(sha256sum LICENSE | cut -d' ' -f1)"
+          test "$(tar -xOzf /tmp/moth-notice-audit/candidate.tar.gz "$stage/agent" | sha256sum | cut -d' ' -f1)" = "$(sha256sum target/x86_64-unknown-linux-gnu/release/agent | cut -d' ' -f1)"
+          printf 'tar_agent_sha256=%s\ntar_archive_sha256=%s\n' \
+            "$(tar -xOzf /tmp/moth-notice-audit/candidate.tar.gz "$stage/agent" | sha256sum | cut -d' ' -f1)" \
+            "$(sha256sum /tmp/moth-notice-audit/candidate.tar.gz | cut -d' ' -f1)" \
+            > notice-audit/binary-identities.txt
+
+      - name: Build actual OCI runtime and compare exported notice bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build --target runtime -t moth-notice-runtime:diagnostic . > /tmp/moth-notice-oci.log 2>&1
+          {
+            docker image inspect --format 'runtime_image={{.Id}}' moth-notice-runtime:diagnostic
+            docker image inspect --format 'runtime_rootfs_layers={{len .RootFS.Layers}}' moth-notice-runtime:diagnostic
+            docker image inspect --format 'oci_license_label={{index .Config.Labels "org.opencontainers.image.licenses"}}' moth-notice-runtime:diagnostic
+          } >> notice-audit/images.txt
+          container=$(docker create moth-notice-runtime:diagnostic)
+          trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
+          docker export "$container" > /tmp/moth-notice-audit/oci-rootfs.tar
+          tar -tf /tmp/moth-notice-audit/oci-rootfs.tar > /tmp/moth-notice-audit/oci-members.txt
+          test "$(awk '{name=$0; sub(/^\.\//,"",name); if(name ~ /^usr\/share\/doc\/moth\/THIRD_PARTY_NOTICES\/native\// && name !~ /\/$/) print name}' /tmp/moth-notice-audit/oci-members.txt | wc -l)" -eq 15
+          : > notice-audit/oci-text-sha256.txt
+          while IFS= read -r source; do
+            path="usr/share/doc/moth/THIRD_PARTY_NOTICES/native/$source"
+            member=$(awk -v wanted="$path" '{name=$0; sub(/^\.\//,"",name); if(name==wanted) print $0}' /tmp/moth-notice-audit/oci-members.txt)
+            test "$(printf '%s\n' "$member" | sed '/^$/d' | wc -l)" -eq 1
+            source_hash=$(sha256sum "$source" | cut -d' ' -f1)
+            member_hash=$(tar -xOf /tmp/moth-notice-audit/oci-rootfs.tar "$member" | sha256sum | cut -d' ' -f1)
+            test "$member_hash" = "$source_hash"
+            printf '%s  %s\n' "$member_hash" "$path" >> notice-audit/oci-text-sha256.txt
+          done < packaging/native-notice-files.txt
+          for relative in usr/share/doc/moth/THIRD_PARTY_NOTICES/native/FILES.txt usr/share/licenses/moth/LICENSE usr/local/bin/agent; do
+            member=$(awk -v wanted="$relative" '{name=$0; sub(/^\.\//,"",name); if(name==wanted) print $0}' /tmp/moth-notice-audit/oci-members.txt)
+            test "$(printf '%s\n' "$member" | sed '/^$/d' | wc -l)" -eq 1
+            case "$relative" in
+              */FILES.txt) test "$(tar -xOf /tmp/moth-notice-audit/oci-rootfs.tar "$member" | sha256sum | cut -d' ' -f1)" = "$(sha256sum packaging/native-notice-files.txt | cut -d' ' -f1)" ;;
+              */LICENSE) test "$(tar -xOf /tmp/moth-notice-audit/oci-rootfs.tar "$member" | sha256sum | cut -d' ' -f1)" = "$(sha256sum LICENSE | cut -d' ' -f1)" ;;
+              */agent) printf 'oci_agent_sha256=%s\n' "$(tar -xOf /tmp/moth-notice-audit/oci-rootfs.tar "$member" | sha256sum | cut -d' ' -f1)" >> notice-audit/binary-identities.txt ;;
+            esac
+          done
+          tar_hash=$(sed -n 's/^tar_agent_sha256=//p' notice-audit/binary-identities.txt)
+          oci_hash=$(sed -n 's/^oci_agent_sha256=//p' notice-audit/binary-identities.txt)
+          if test "$tar_hash" = "$oci_hash"; then echo 'tar_oci_binary_identity=yes' >> notice-audit/binary-identities.txt; else echo 'tar_oci_binary_identity=no' >> notice-audit/binary-identities.txt; fi
+
+      - name: Complete notice-placement diagnostic only
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(wc -l < notice-audit/source-text-sha256.txt)" -eq 14
+          test "$(wc -l < notice-audit/tar-text-sha256.txt)" -eq 14
+          test "$(wc -l < notice-audit/oci-text-sha256.txt)" -eq 14
+          test -s notice-audit/binary-identities.txt
+          printf '%s\n' 'NATIVE_NOTICE_PLACEMENT_CANDIDATE_ONLY' 'release_admission=NO' 'legal_admission=NO' 'native_link_retention=UNPROVEN' 'base_image_notice_coverage=UNPROVEN' > notice-audit/status.txt
+
+      - name: Bound safe notice receipts even on failure
+        id: bound-notices
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -d notice-audit && test ! -L notice-audit
+          test -f notice-audit/status.txt
+          test "$(find notice-audit -type f | wc -l)" -le 11
+          test -z "$(find notice-audit ! -type f ! -type d -print -quit)"
+          while IFS= read -r path; do
+            case "$path" in
+              notice-audit/status.txt|notice-audit/workflow-head.txt|notice-audit/changed-paths.txt|notice-audit/identity.txt|notice-audit/images.txt|notice-audit/toolchain.txt|notice-audit/source-text-sha256.txt|notice-audit/tar-members.txt|notice-audit/tar-text-sha256.txt|notice-audit/oci-text-sha256.txt|notice-audit/binary-identities.txt) ;;
+              *) exit 1 ;;
+            esac
+            test "$(wc -c < "$path")" -le 131072
+          done < <(find notice-audit -type f -print)
+          test "$(du -sk notice-audit | cut -f1)" -le 1024
+
+      - name: Retain notice placement diagnostic receipt
+        if: ${{ always() && steps.bound-notices.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: moth-pr8-native-notice-placement-${{ github.sha }}
+          path: notice-audit/
+          if-no-files-found: error
+          retention-days: 7
+
+  release-parity-linux:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/fix/native-notice-packaging-pr5' && inputs.release_parity && !inputs.base_custody
+    runs-on: ubuntu-22.04
+    timeout-minutes: 75
+    permissions:
+      contents: read
+    steps:
+      - name: Fetch exact reviewed PR8 release-layout source
+        shell: bash
+        env:
+          REVIEWED_SHA: ${{ inputs.notice_head_sha }}
+          GIT_TERMINAL_PROMPT: '0'
+          GIT_ASKPASS: /bin/false
+        run: |
+          set -euo pipefail
+          mkdir -p parity
+          printf '%s\n' 'INCOMPLETE' 'release_admission=NO' 'legal_admission=NO' > parity/status.txt
+          printf 'workflow_head=%s\n' "$GITHUB_SHA" > parity/identity.txt
+          [[ "$REVIEWED_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$REVIEWED_SHA" = "$GITHUB_SHA"
+          test -z "$(find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 ! -name parity -print -quit)"
+          git init -q "$GITHUB_WORKSPACE"
+          git remote add origin https://github.com/ryanmaclean/moth.git
+          git -c credential.helper= fetch --no-tags --no-recurse-submodules --depth=64 origin refs/pull/8/head
+          test "$(git rev-parse FETCH_HEAD)" = "$REVIEWED_SHA"
+          git -c submodule.recurse=false checkout --detach --force "$REVIEWED_SHA"
+          test "$(git rev-parse HEAD)" = "$REVIEWED_SHA"
+          git cat-file -e '2ad30129a9af231b687b8821f2b9d062e41992f9^{commit}'
+          test "$(git merge-base HEAD 2ad30129a9af231b687b8821f2b9d062e41992f9)" = '2ad30129a9af231b687b8821f2b9d062e41992f9'
+          git diff --name-only 2ad30129a9af231b687b8821f2b9d062e41992f9 HEAD | sort | diff -u <(printf '%s\n' '.github/workflows/freebsd.yml' '.github/workflows/release.yml' 'Dockerfile' 'Dockerfile.release' 'packaging/native-notice-files.txt' | sort) -
+          printf '%s\n' \
+            'befd91e188696989d415870792acb3f9fa5a5d3bd79fe8823989264714b6fe51  Cargo.lock' \
+            '392a5a80e863151504fa05add58ea97b98a4a7a57e36cd26436734a95465650a  Dockerfile' \
+            '8aecec600179b49cd5a1a8a4feede8e86c1fa2717c75752827201f476bf0ef4a  Dockerfile.release' \
+            'ae3f5acdad3187723f7779ae725467a51d80e2609f6c509c8ab43c935b3f58a6  .github/workflows/release.yml' \
+            '6321279cc4a58259e29638a1f7c6621184b07576e8a70728b2b5bb48d761d83c  packaging/native-notice-files.txt' \
+            '59d5f1cb240a41f1a4acea088ca1f964b0e9d81c6afea1cc748988f5bdb1a533  .dockerignore' \
+            | sha256sum --check --status
+          test -z "$(git status --porcelain --untracked-files=no)"
+          printf 'source_head=%s\nbase=%s\nlock_sha256=%s\ntarget=x86_64-unknown-linux-gnu\n' \
+            "$REVIEWED_SHA" 2ad30129a9af231b687b8821f2b9d062e41992f9 \
+            "$(sha256sum Cargo.lock | cut -d' ' -f1)" >> parity/identity.txt
+
+      - name: Build and verify release-layout Linux tar candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/moth-parity/dist"
+          printf '%s\n' BUILDER_IMAGE > parity/stage.txt
+          docker build --target builder -t moth-parity-builder:diagnostic . > "$RUNNER_TEMP/moth-parity-builder.log" 2>&1
+          printf '%s\n' RUSTC_IDENTITY > parity/stage.txt
+          docker run --rm moth-parity-builder:diagnostic rustc -V > "$RUNNER_TEMP/moth-parity-rustc-version.log" 2>&1
+          grep -Eq '^rustc 1\.94\.1 ' "$RUNNER_TEMP/moth-parity-rustc-version.log"
+          docker run --rm moth-parity-builder:diagnostic rustc -vV > "$RUNNER_TEMP/moth-parity-rustc-identity.log" 2>&1
+          grep -Fxq 'commit-hash: e408947bfd200af42db322daf0fadfe7e26d3bd1' "$RUNNER_TEMP/moth-parity-rustc-identity.log"
+          printf '%s\n' LINKER_IDENTITY > parity/stage.txt
+          linker_hash="$(docker run --rm moth-parity-builder:diagnostic sh -eu -c 'linker="$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-lld"; test -x "$linker"; version="$("$linker" -flavor gnu --version)"; case "$version" in "LLD 21.1.8 "*) ;; *) exit 1 ;; esac; hash="$(sha256sum "$linker")"; printf "%s\n" "${hash%% *}"' 2> "$RUNNER_TEMP/moth-parity-linker-identity.log")"
+          test "$linker_hash" = c30db53247911b065bf8b279bbbcdf8f516702750233a6e6ef815c1826b7ee53
+          printf '%s\n' CARGO_LINK_MAP > parity/stage.txt
+          rm -f agent-native-link.map agent-native-why-extract.txt agent-native-archive-stats.txt
+          timeout 45m docker run --rm --cidfile "$RUNNER_TEMP/moth-parity/cargo-container-id" -v "$PWD:/work" -w /work moth-parity-builder:diagnostic \
+            cargo rustc --release --locked --frozen --offline -p cli --bin agent \
+              --target x86_64-unknown-linux-gnu -- \
+              -C link-arg=-Wl,-Map=/work/agent-native-link.map \
+              -C link-arg=-Wl,--why-extract=/work/agent-native-why-extract.txt \
+              -C link-arg=-Wl,--print-archive-stats=/work/agent-native-archive-stats.txt \
+              -C link-arg=-Wl,--print-gc-sections \
+              -C link-arg=-Wl,--print-icf-sections \
+            2>&1 | head -c 16777217 > "$RUNNER_TEMP/moth-parity-cargo.log"
+          test "$(wc -c < "$RUNNER_TEMP/moth-parity-cargo.log")" -le 16777216
+          test -s agent-native-link.map
+          test "$(wc -c < agent-native-link.map)" -le 16777216
+          test -s agent-native-why-extract.txt
+          test -s agent-native-archive-stats.txt
+          test "$(wc -c < agent-native-why-extract.txt)" -le 16777216
+          test "$(wc -c < agent-native-archive-stats.txt)" -le 1048576
+          printf '%s\n' MAP_PARSE > parity/stage.txt
+          python3 - <<'PY'
+          from collections import Counter
+          from pathlib import Path
+          import hashlib
+          import re
+
+          map_path = Path('agent-native-link.map')
+          binary = Path('target/x86_64-unknown-linux-gnu/release/agent')
+          if not binary.is_file() or binary.is_symlink():
+              raise SystemExit('same-link binary missing')
+          target = ('curl_sys', 'openssl_sys', 'libz_sys')
+          archives = {name: set() for name in target}
+          rows = Counter()
+          isc = Counter()
+          headers = 0
+          lines = 0
+          rlib_rows = 0
+          with map_path.open(encoding='utf-8') as source:
+              for line in source:
+                  lines += 1
+                  if lines > 100000 or len(line) > 16384:
+                      raise SystemExit('map bounds exceeded')
+                  heading = ' '.join(line.casefold().split())
+                  if heading == 'vma lma size align out in symbol':
+                      headers += 1
+                  if heading.startswith('archive member included') or heading in ('discarded input sections', 'linker script and memory map'):
+                      raise SystemExit('unexpected map dialect')
+                  if '.rlib(' not in line:
+                      continue
+                  rlib_rows += 1
+                  words = line.split()
+                  if headers != 1 or len(words) != 5 or any(not re.fullmatch(r'[0-9a-fA-F]{1,16}', word) for word in words[:3]) or not re.fullmatch(r'[0-9]{1,20}', words[3]):
+                      raise SystemExit('LLD row grammar unexpected')
+                  member = re.fullmatch(r'([^\s()]+\.rlib)\(([^()]+)\):\(([^()]+)\)', words[4])
+                  if not member:
+                      raise SystemExit('LLD member grammar unexpected')
+                  archive = Path(member[1]).name
+                  section = member[3]
+                  size = int(words[2], 16)
+                  for name in target:
+                      prefix = 'lib' + name + '-'
+                      if archive.startswith(prefix):
+                          if not re.fullmatch(re.escape(prefix) + r'[0-9a-f]+\.rlib', archive):
+                              raise SystemExit('native rlib identity unexpected')
+                          archives[name].add(archive)
+                          family = next((kind for kind in ('text', 'rodata', 'data', 'bss', 'eh_frame', 'debug')
+                                         if section == '.' + kind or section.startswith('.' + kind + '.') or section.startswith('.' + kind + '+')), 'other')
+                          rows[(name, family, 'positive' if size else 'zero')] += 1
+                          if name == 'curl_sys':
+                              for stem in ('inet_ntop', 'inet_pton'):
+                                  if re.search(r'(?:^|-)' + stem + r'\.o$', member[2]):
+                                      isc[(stem, 'positive' if size else 'zero')] += 1
+                          break
+          if headers != 1 or not rlib_rows or any(len(archives[name]) != 1 or rows[(name, 'text', 'positive')] == 0 for name in target) or any(isc[(stem, 'positive')] == 0 for stem in ('inet_ntop', 'inet_pton')):
+              raise SystemExit('native LLD evidence incomplete')
+          sha = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+          with Path('parity/map-join.txt').open('w') as receipt:
+              print('schema=moth-local-map-release-layout-join/v1', file=receipt)
+              print('rust_lld_sha256=c30db53247911b065bf8b279bbbcdf8f516702750233a6e6ef815c1826b7ee53', file=receipt)
+              print('map_sha256=' + sha(map_path), file=receipt)
+              print('linked_agent_sha256=' + sha(binary), file=receipt)
+              print(f'map_lines={lines}', file=receipt)
+              print(f'rlib_rows={rlib_rows}', file=receipt)
+              for name in target:
+                  print(f'{name}_rlib_count={len(archives[name])}', file=receipt)
+                  for family in ('text', 'rodata', 'data', 'bss', 'eh_frame', 'debug', 'other'):
+                      for size_class in ('zero', 'positive'):
+                          print(f'{name}_{family}_{size_class}_map_rows={rows[(name, family, size_class)]}', file=receipt)
+              for stem in ('inet_ntop', 'inet_pton'):
+                  for size_class in ('zero', 'positive'):
+                      print(f'isc_{stem}_{size_class}_map_rows={isc[(stem, size_class)]}', file=receipt)
+          PY
+          printf '%s\n' ARCHIVE_INVENTORY > parity/stage.txt
+          python3 - <<'PY'
+          from pathlib import Path
+          from collections import Counter
+          import hashlib
+          import os
+          import re
+          import struct
+          import subprocess
+
+          root = Path.cwd()
+          families = ('curl_sys', 'openssl_sys', 'libz_sys')
+          rlibs = {name: set() for name in families}
+          for line in Path('agent-native-link.map').open(encoding='utf-8'):
+              for raw in re.findall(r'([^\s()]+\.rlib)\(', line):
+                  name = Path(raw).name
+                  for family in families:
+                      if re.fullmatch(r'lib' + family + r'-[0-9a-f]+\.rlib', name):
+                          rlibs[family].add(raw)
+          if any(len(paths) != 1 for paths in rlibs.values()):
+              raise SystemExit('native rlib inventory ambiguous')
+          archives = {}
+          for family, paths in rlibs.items():
+              raw = next(iter(paths))
+              path = root / raw.removeprefix('/work/') if raw.startswith('/work/') else root / raw
+              if not path.is_file() or path.is_symlink() or not path.resolve().is_relative_to(root / 'target'):
+                  raise SystemExit('native rlib path invalid')
+              archives[family + '_rlib'] = path
+          build_root = root / 'target/x86_64-unknown-linux-gnu/release/build'
+          for label, filename in (('curl_a', 'libcurl.a'), ('ssl_a', 'libssl.a'),
+                                  ('crypto_a', 'libcrypto.a'), ('z_a', 'libz.a')):
+              found = list(build_root.rglob(filename))
+              if len(found) != 1 or not found[0].is_file() or found[0].is_symlink():
+                  raise SystemExit('native static archive path ambiguous')
+              archives[label] = found[0]
+          records = {}
+          section_shape = Counter()
+          def count_native_sections(label, data):
+              if len(data) < 64 or data[:6] != b'\x7fELF\x02\x01' or struct.unpack_from('<HH', data, 16) != (1, 62):
+                  raise SystemExit('native object ELF identity')
+              shoff = struct.unpack_from('<Q', data, 40)[0]
+              shentsize, shnum, shstrndx = struct.unpack_from('<HHH', data, 58)
+              if shentsize != 64 or not 0 < shnum <= 4096 or not 0 < shstrndx < shnum or shoff + shnum * 64 > len(data):
+                  raise SystemExit('native object section bounds')
+              headers = [struct.unpack_from('<IIQQQQIIQQ', data, shoff + index * 64) for index in range(shnum)]
+              strings = headers[shstrndx]
+              if strings[1] != 3 or strings[4] + strings[5] > len(data) or strings[5] > 1048576:
+                  raise SystemExit('native object section names bounds')
+              names = data[strings[4]:strings[4] + strings[5]]
+              section_shape[(label, 'objects')] += 1
+              for name_offset, kind, flags, _, fileoff, size, _, _, _, _ in headers:
+                  if kind == 17:
+                      section_shape[(label, 'group_headers')] += 1
+                  if flags & 2 == 0:
+                      continue
+                  if kind != 8 and fileoff + size > len(data):
+                      raise SystemExit('native object allocated section bounds')
+                  if name_offset >= len(names) or names.find(b'\0', name_offset) < 0:
+                      raise SystemExit('native object section name offset')
+                  name = names[name_offset:names.find(b'\0', name_offset)]
+                  section_shape[(label, 'alloc_sections')] += 1
+                  section_shape[(label, 'alloc_bytes')] += size
+                  section_shape[(label, 'nobits' if kind == 8 else 'progbits' if kind == 1 else 'other_types')] += 1
+                  for field, enabled in (('zero', size == 0), ('merge', bool(flags & 0x10)),
+                                         ('group', bool(flags & 0x200)), ('exclude', bool(flags & 0x80000000)),
+                                         ('eh_frame', name == b'.eh_frame')):
+                      if enabled:
+                          section_shape[(label, field)] += 1
+              if section_shape[(label, 'alloc_sections')] > 100000 or section_shape[(label, 'alloc_bytes')] > 268435456:
+                  raise SystemExit('native object section census cap')
+          total_members = 0
+          total_bytes = 0
+          for label, archive in sorted(archives.items()):
+              if archive.stat().st_size > 134217728:
+                  raise SystemExit('native archive size exceeded')
+              listed = subprocess.run(['ar', 't', str(archive)], check=True, capture_output=True,
+                                      timeout=30).stdout.decode('utf-8').splitlines()
+              if not listed or len(listed) > 4096 or len(listed) != len(set(listed)):
+                  raise SystemExit('native archive member names ambiguous')
+              if any(not re.fullmatch(r'[A-Za-z0-9_.+\-]{1,160}', name) for name in listed):
+                  raise SystemExit('native archive member name unexpected')
+              members = []
+              for ordinal, name in enumerate(listed):
+                  data = subprocess.run(['ar', 'p', str(archive), name], check=True,
+                                        capture_output=True, timeout=30).stdout
+                  if not data or len(data) > 8388608:
+                      raise SystemExit('native archive member size invalid')
+                  total_members += 1
+                  total_bytes += len(data)
+                  if total_members > 8192 or total_bytes > 268435456:
+                      raise SystemExit('native archive inventory bound exceeded')
+                  if label in ('curl_a', 'ssl_a', 'crypto_a', 'z_a'):
+                      count_native_sections(label, data)
+                  members.append((ordinal, name, hashlib.sha256(data).hexdigest(), len(data)))
+              records[label] = members
+          for stem in ('inet_ntop', 'inet_pton'):
+              hashes = []
+              for label in ('curl_a', 'curl_sys_rlib'):
+                  matches = [entry for entry in records[label]
+                             if re.search(r'(?:^|-)' + stem + r'\.o$', entry[1])]
+                  if len(matches) != 1:
+                      raise SystemExit('ISC object identity ambiguous')
+                  hashes.append(matches[0][2])
+              if hashes[0] != hashes[1]:
+                  raise SystemExit('ISC native and rlib object bytes differ')
+          # LLD 21.1.8 Driver.cpp emits ordinary direct archive inputs as
+          # members<TAB>extracted<TAB>archive. Keep paths private and bind only
+          # the four same-build native .a files to those same-link rows.
+          stats_path = Path('agent-native-archive-stats.txt')
+          try:
+              stats_ok = stats_path.is_file() and not stats_path.is_symlink() and 0 < stats_path.stat().st_size <= 1048576
+          except OSError:
+              stats_ok = False
+          if not stats_ok:
+              raise SystemExit('native archive stats bounds')
+          try:
+              stats_lines = stats_path.read_text(encoding='utf-8').splitlines()
+          except (OSError, UnicodeError):
+              raise SystemExit('native archive stats unreadable') from None
+          if not 1 < len(stats_lines) <= 8192 or stats_lines[0] != 'members\textracted\tarchive':
+              raise SystemExit('native archive stats header')
+          stats_rows = []
+          for line in stats_lines[1:]:
+              if len(line) > 4096:
+                  raise SystemExit('native archive stats line bound')
+              fields = line.split('\t')
+              if len(fields) != 3 or any(not re.fullmatch(r'[0-9]{1,20}', value) for value in fields[:2]) or not fields[2] or '\x00' in fields[2]:
+                  raise SystemExit('native archive stats row grammar')
+              member_count, extracted_count = int(fields[0]), int(fields[1])
+              if extracted_count > member_count:
+                  raise SystemExit('native archive stats count')
+              stats_rows.append((member_count, extracted_count, fields[2]))
+          direct_inputs = {}
+          for label in ('curl_a', 'ssl_a', 'crypto_a', 'z_a'):
+              archive = archives[label].resolve()
+              matches = []
+              for member_count, extracted_count, raw_path in stats_rows:
+                  if raw_path.startswith('/work/'):
+                      linked_path = root / raw_path.removeprefix('/work/')
+                  elif not raw_path.startswith('/'):
+                      linked_path = root / raw_path
+                  else:
+                      continue
+                  try:
+                      same_archive = linked_path.resolve() == archive
+                  except (OSError, RuntimeError):
+                      raise SystemExit('native archive stats path invalid') from None
+                  if same_archive:
+                      matches.append((member_count, extracted_count))
+              if len(matches) > 8 or any(count != len(records[label]) for count, _ in matches):
+                  raise SystemExit('native direct archive identity ambiguous')
+              if sum(extracted for _, extracted in matches) > len(records[label]):
+                  raise SystemExit('native direct archive extraction count')
+              direct_inputs[label] = (len(matches), sum(extracted for _, extracted in matches))
+          with Path('parity/native-inventory.txt').open('w') as receipt:
+              print('schema=moth-local-native-archive-inventory/v1', file=receipt)
+              print('same_build_archive_inventory=yes', file=receipt)
+              # Whole-archive inputs do not enter LLD's archive-stats table.
+              # A missing row is therefore unknown, never proof of absence.
+              print('native_a_link_input_identity=LLD21_STATS_POSITIVE_ONLY', file=receipt)
+              print('full_allocated_section_reconciliation=UNPROVEN', file=receipt)
+              print(f'archive_stats_rows={len(stats_rows)}', file=receipt)
+              for label, (rows, extracted) in sorted(direct_inputs.items()):
+                  print(f'{label}_direct_input={"yes" if rows else "UNPROVEN"}', file=receipt)
+                  print(f'{label}_direct_input_rows={rows}', file=receipt)
+                  print(f'{label}_direct_extracted_members={extracted}', file=receipt)
+              for label, path in (('why_extract', Path('agent-native-why-extract.txt')),
+                                  ('archive_stats', Path('agent-native-archive-stats.txt')),
+                                  ('private_gc_icf_log', Path(os.environ['RUNNER_TEMP'], 'moth-parity-cargo.log'))):
+                  data = path.read_bytes()
+                  print(f'{label}_bytes={len(data)}', file=receipt)
+                  print(f'{label}_lines={data.count(bytes([10]))}', file=receipt)
+                  print(f'{label}_sha256={hashlib.sha256(data).hexdigest()}', file=receipt)
+              for label, archive in sorted(archives.items()):
+                  member_lines = [f'{label} {ordinal} {hashlib.sha256(name.encode()).hexdigest()} {digest} {size}\n'
+                                  for ordinal, name, digest, size in records[label]]
+                  print(f'{label}_archive_sha256=' + hashlib.sha256(archive.read_bytes()).hexdigest(), file=receipt)
+                  print(f'{label}_members={len(member_lines)}', file=receipt)
+                  print(f'{label}_member_bill_sha256=' + hashlib.sha256(''.join(member_lines).encode()).hexdigest(), file=receipt)
+              print('native_section_shape_scope=ORIGINAL_A_CENSUS_ONLY', file=receipt)
+              print('native_allocated_section_fate=UNKNOWN', file=receipt)
+              for label in ('crypto_a', 'curl_a', 'ssl_a', 'z_a'):
+                  for field in ('objects', 'alloc_sections', 'alloc_bytes', 'nobits', 'progbits',
+                                'other_types', 'zero', 'merge', 'group', 'exclude', 'eh_frame', 'group_headers'):
+                      print(f'{label}_section_{field}={section_shape[(label, field)]}', file=receipt)
+              for stem in ('inet_ntop', 'inet_pton'):
+                  for label in ('curl_a', 'curl_sys_rlib'):
+                      match = next(entry for entry in records[label] if re.search(r'(?:^|-)' + stem + r'\.o$', entry[1]))
+                      print(f'isc_{stem}_{label}_ordinal={match[0]}', file=receipt)
+                      print(f'isc_{stem}_{label}_name_sha256={hashlib.sha256(match[1].encode()).hexdigest()}', file=receipt)
+                  print(f'isc_{stem}_object_sha256={match[2]}', file=receipt)
+          with Path('parity/native-members.txt').open('w') as bill:
+              print('schema=moth-local-native-member-hashes/v1', file=bill)
+              for label, members in sorted(records.items()):
+                  for ordinal, name, digest, size in members:
+                      name_hash = hashlib.sha256(name.encode()).hexdigest()
+                      print(f'{label} {ordinal} {name_hash} {digest} {size}', file=bill)
+          if Path('parity/native-members.txt').stat().st_size > 1048576:
+              raise SystemExit('bounded native member bill exceeded')
+          PY
+          printf '%s\n' STRIP > parity/stage.txt
+          cp -- target/x86_64-unknown-linux-gnu/release/agent "$RUNNER_TEMP/moth-parity/linked-agent"
+          cmp -s -- target/x86_64-unknown-linux-gnu/release/agent "$RUNNER_TEMP/moth-parity/linked-agent"
+          docker run --rm -v "$PWD:/work" -w /work moth-parity-builder:diagnostic \
+            strip target/x86_64-unknown-linux-gnu/release/agent
+          printf 'stripped_agent_sha256=%s\n' "$(sha256sum target/x86_64-unknown-linux-gnu/release/agent | cut -d' ' -f1)" >> parity/map-join.txt
+          printf '%s\n' NATIVE_BYTES > parity/stage.txt
+          python3 - "$RUNNER_TEMP/moth-parity/linked-agent" target/x86_64-unknown-linux-gnu/release/agent <<'PY'
+          from collections import Counter
+          from pathlib import Path
+          import hashlib
+          import re
+          import struct
+          import sys
+
+          names = ('curl_sys', 'openssl_sys', 'libz_sys')
+          def load_segments(path):
+              path = Path(path)
+              if not path.is_file() or path.is_symlink() or not 0 < path.stat().st_size <= 104857600:
+                  raise SystemExit('agent ELF bounds')
+              with path.open('rb') as source:
+                  header = source.read(64)
+                  if len(header) != 64 or header[:6] != b'\x7fELF\x02\x01' or struct.unpack_from('<H', header, 18)[0] != 62:
+                      raise SystemExit('agent ELF identity')
+                  phoff = struct.unpack_from('<Q', header, 32)[0]
+                  phentsize, phnum = struct.unpack_from('<HH', header, 54)
+                  if phentsize != 56 or not 0 < phnum <= 128 or phoff + phnum * phentsize > path.stat().st_size:
+                      raise SystemExit('agent program header bounds')
+                  source.seek(phoff)
+                  table = source.read(phnum * phentsize)
+                  shoff = struct.unpack_from('<Q', header, 40)[0]
+                  shentsize, shnum, shstrndx = struct.unpack_from('<HHH', header, 58)
+                  if shentsize != 64 or not 0 < shnum <= 1024 or not 0 < shstrndx < shnum or shoff + shnum * shentsize > path.stat().st_size:
+                      raise SystemExit('agent section header bounds')
+                  source.seek(shoff)
+                  section_table = source.read(shnum * shentsize)
+                  shstr = struct.unpack_from('<IIQQQQIIQQ', section_table, shstrndx * shentsize)
+                  if shstr[4] + shstr[5] > path.stat().st_size or shstr[5] > 1048576:
+                      raise SystemExit('agent section names bounds')
+                  source.seek(shstr[4])
+                  names_blob = source.read(shstr[5])
+              segments = []
+              for offset in range(0, len(table), phentsize):
+                  kind, flags, fileoff, vaddr, _, filesz, memsz, _ = struct.unpack_from('<IIQQQQQQ', table, offset)
+                  if kind == 1 and filesz:
+                      if filesz > memsz or fileoff + filesz > path.stat().st_size:
+                          raise SystemExit('agent load segment bounds')
+                      segments.append((vaddr, vaddr + filesz, fileoff))
+              if not segments:
+                  raise SystemExit('agent load segments missing')
+              sections = {}
+              for offset in range(0, len(section_table), shentsize):
+                  name_off, kind, flags, addr, _, length, _, _, _, _ = struct.unpack_from('<IIQQQQIIQQ', section_table, offset)
+                  if name_off >= len(names_blob):
+                      raise SystemExit('agent section name offset')
+                  end = names_blob.find(b'\0', name_off)
+                  if end < 0:
+                      raise SystemExit('agent unterminated section name')
+                  name = names_blob[name_off:end].decode('ascii')
+                  if name in sections:
+                      raise SystemExit('agent duplicate section name')
+                  sections[name] = (kind, flags, addr, length)
+              return path, segments, sections
+
+          def slice_at(image, vma, size):
+              path, segments, _ = image
+              matches = [(start, offset) for start, end, offset in segments if start <= vma and vma + size <= end]
+              if len(matches) > 1:
+                  raise SystemExit('overlapping agent load segments')
+              if not matches:
+                  return None
+              start, offset = matches[0]
+              with path.open('rb') as source:
+                  source.seek(offset + vma - start)
+                  data = source.read(size)
+              if len(data) != size:
+                  raise SystemExit('agent mapped bytes short')
+              return data
+
+          before, after = map(load_segments, sys.argv[1:])
+          receipt = Path('parity/map-join.txt')
+          linked_hash = re.findall(r'^linked_agent_sha256=([0-9a-f]{64})$', receipt.read_text(), re.M)
+          if len(linked_hash) != 1 or hashlib.sha256(before[0].read_bytes()).hexdigest() != linked_hash[0]:
+              raise SystemExit('mapped prestrip agent identity')
+          map_hash = re.findall(r'^map_sha256=([0-9a-f]{64})$', receipt.read_text(), re.M)
+          if len(map_hash) != 1 or hashlib.sha256(Path('agent-native-link.map').read_bytes()).hexdigest() != map_hash[0]:
+              raise SystemExit('mapped linker map identity')
+          inventory = Path('parity/native-inventory.txt').read_text()
+          bill_path = Path('parity/native-members.txt')
+          if not bill_path.is_file() or bill_path.is_symlink() or not 0 < bill_path.stat().st_size <= 1048576:
+              raise SystemExit('native member bill bounds')
+          bill_lines = bill_path.read_text(encoding='ascii').splitlines(keepends=True)
+          if not 1 < len(bill_lines) <= 8192 or bill_lines[0] != 'schema=moth-local-native-member-hashes/v1\n':
+              raise SystemExit('native member bill header')
+          native_pairs = {'curl_a': 'curl_sys_rlib', 'ssl_a': 'openssl_sys_rlib',
+                          'crypto_a': 'openssl_sys_rlib', 'z_a': 'libz_sys_rlib'}
+          bill_labels = set(native_pairs) | set(native_pairs.values())
+          billed = {label: {} for label in bill_labels}
+          bill_rows = {label: [] for label in bill_labels}
+          for line in bill_lines[1:]:
+              if len(line) > 256:
+                  raise SystemExit('native member bill line bound')
+              match = re.fullmatch(r'(curl_a|ssl_a|crypto_a|z_a|curl_sys_rlib|openssl_sys_rlib|libz_sys_rlib) ([0-9]+) ([0-9a-f]{64}) ([0-9a-f]{64}) ([0-9]+)\n', line)
+              if match is None:
+                  raise SystemExit('native member bill grammar')
+              label, ordinal, name_hash, object_hash, size = match.groups()
+              if int(ordinal) != len(bill_rows[label]) or name_hash in billed[label] or not 0 < int(size) <= 8388608:
+                  raise SystemExit('native member bill identity')
+              bill_rows[label].append(line)
+              billed[label][name_hash] = (object_hash, int(size))
+          for label in bill_labels:
+              expected_count = re.findall(r'^' + label + r'_members=([0-9]+)$', inventory, re.M)
+              expected_hash = re.findall(r'^' + label + r'_member_bill_sha256=([0-9a-f]{64})$', inventory, re.M)
+              if len(expected_count) != 1 or len(expected_hash) != 1 or len(bill_rows[label]) != int(expected_count[0]) or not bill_rows[label]:
+                  raise SystemExit('native member inventory count')
+              if hashlib.sha256(''.join(bill_rows[label]).encode()).hexdigest() != expected_hash[0]:
+                  raise SystemExit('native member inventory hash')
+          native_by_rlib = {name: {} for name in names}
+          for label, rlib_label in native_pairs.items():
+              rlib_name = rlib_label.removesuffix('_rlib')
+              for name_hash, object_identity in billed[label].items():
+                  if billed[rlib_label].get(name_hash) != object_identity or name_hash in native_by_rlib[rlib_name]:
+                      raise SystemExit('native object not uniquely bundled')
+                  native_by_rlib[rlib_name][name_hash] = (label, *object_identity)
+          counters = Counter()
+          members = {name: set() for name in names}
+          ranges = []
+          digests = {name: hashlib.sha256() for name in names}
+          selected_native = {label: set() for label in native_pairs}
+          selected_rows = {label: [] for label in native_pairs}
+          rlib_link_paths = {name: set() for name in names}
+          isc = Counter()
+          lines = 0
+          output_section = None
+          with Path('agent-native-link.map').open(encoding='utf-8') as source:
+              for line in source:
+                  lines += 1
+                  if lines > 100000 or len(line) > 16384:
+                      raise SystemExit('native map bounds')
+                  # LLD 21.1.8 MapFile.cpp: output name starts at column 50;
+                  # an input section adds exactly eight spaces.
+                  if len(line) > 49 and line[49] == '.' and len(line.split()) == 5:
+                      output_section = line[49:].strip()
+                  if '.rlib(' not in line:
+                      continue
+                  words = line.split()
+                  if len(words) != 5 or any(not re.fullmatch(r'[0-9a-fA-F]{1,16}', word) for word in words[:3]) or not re.fullmatch(r'[0-9]{1,20}', words[3]):
+                      raise SystemExit('native row grammar')
+                  match = re.fullmatch(r'([^\s()]+\.rlib)\(([^()]+)\):\(([^()]+)\)', words[4])
+                  if match is None:
+                      raise SystemExit('native member grammar')
+                  archive = Path(match[1]).name
+                  name = next((name for name in names if archive.startswith('lib' + name + '-')), None)
+                  if name is None:
+                      continue
+                  if not re.fullmatch('lib' + name + r'-[0-9a-f]+\.rlib', archive):
+                      raise SystemExit('native archive identity')
+                  rlib_link_paths[name].add(match[1])
+                  if output_section is None or line[49:] != '        ' + words[4] + '\n':
+                      raise SystemExit('native output-section hierarchy')
+                  vma, size = int(words[0], 16), int(words[2], 16)
+                  member = match[2]
+                  counters[(name, 'map_rows')] += 1
+                  if size == 0:
+                      counters[(name, 'zero_rows')] += 1
+                      continue
+                  sections = [image[2].get(output_section) for image in (before, after)]
+                  if sections[0] is None:
+                      raise SystemExit('native output section absent')
+                  if not (sections[0][2] <= vma and vma + size <= sections[0][2] + sections[0][3]):
+                      raise SystemExit('native output section range')
+                  if sections[0][1] & 2 == 0 or sections[0][0] == 8:
+                      counters[(name, 'nonfile_rows')] += 1
+                      continue
+                  if sections[1] is None or sections[1][1] & 2 == 0 or sections[1][0] == 8 or not (sections[1][2] <= vma and vma + size <= sections[1][2] + sections[1][3]):
+                      raise SystemExit('allocated native section stripped')
+                  old, new = slice_at(before, vma, size), slice_at(after, vma, size)
+                  if (old is None) != (new is None):
+                      raise SystemExit('strip load-range drift')
+                  if old is None:
+                      raise SystemExit('allocated native range not file backed')
+                  if old != new:
+                      raise SystemExit('strip mapped bytes drift')
+                  ranges.append((vma, vma + size))
+                  members[name].add((archive, member))
+                  counters[(name, 'file_rows')] += 1
+                  counters[(name, 'file_bytes')] += size
+                  digests[name].update(vma.to_bytes(8, 'little') + size.to_bytes(8, 'little') + hashlib.sha256(new).digest())
+                  name_hash = hashlib.sha256(member.encode()).hexdigest()
+                  if name_hash not in billed[name + '_rlib']:
+                      raise SystemExit('selected rlib member absent from bill')
+                  native = native_by_rlib[name].get(name_hash)
+                  if native is None:
+                      counters[(name, 'other_rlib_file_rows')] += 1
+                  else:
+                      label, object_hash, object_size = native
+                      if billed[name + '_rlib'][name_hash] != (object_hash, object_size):
+                          raise SystemExit('selected native object byte identity')
+                      selected_native[label].add(name_hash)
+                      selected_rows[label].append((vma, size, name_hash, object_hash))
+                      counters[(label, 'file_rows')] += 1
+                      counters[(label, 'file_bytes')] += size
+                  if name == 'curl_sys':
+                      for stem in ('inet_ntop', 'inet_pton'):
+                          if re.search(r'(?:^|-)' + stem + r'\.o$', member):
+                              isc[stem] += size
+          if any(len(paths) != 1 for paths in rlib_link_paths.values()):
+              raise SystemExit('native rlib map path ambiguous')
+          root = Path.cwd()
+          def linked_path(raw):
+              try:
+                  if raw.startswith('/work/'):
+                      return (root / raw.removeprefix('/work/')).resolve()
+                  if not raw.startswith('/'):
+                      return (root / raw).resolve()
+                  return None
+              except (OSError, RuntimeError, ValueError):
+                  raise SystemExit('native extraction path invalid') from None
+          stats_file = Path('agent-native-archive-stats.txt')
+          why_file = Path('agent-native-why-extract.txt')
+          try:
+              diagnostics_in_bounds = all(path.is_file() and not path.is_symlink() and 0 < path.stat().st_size <= cap
+                                          for path, cap in ((stats_file, 1048576), (why_file, 16777216)))
+          except (OSError, RuntimeError, ValueError):
+              raise SystemExit('native extraction diagnostics bounds') from None
+          if not diagnostics_in_bounds:
+              raise SystemExit('native extraction diagnostics bounds')
+          try:
+              stats_lines = stats_file.read_text(encoding='utf-8').splitlines()
+              why_lines = why_file.read_text(encoding='utf-8').splitlines()
+          except (OSError, UnicodeError, RuntimeError, ValueError):
+              raise SystemExit('native extraction diagnostics unreadable') from None
+          if not 1 < len(stats_lines) <= 8192 or stats_lines[0] != 'members\textracted\tarchive':
+              raise SystemExit('native rlib stats header')
+          if not 1 < len(why_lines) <= 50000 or why_lines[0] != 'reference\textracted\tsymbol':
+              raise SystemExit('native why-extract header')
+          stats_matched = {name: [] for name in names}
+          for line in stats_lines[1:]:
+              fields = line.split('\t')
+              if len(line) > 4096 or len(fields) != 3 or any(not re.fullmatch(r'[0-9]{1,20}', value) for value in fields[:2]) or not fields[2]:
+                  raise SystemExit('native rlib stats grammar')
+              count, extracted, raw = int(fields[0]), int(fields[1]), fields[2]
+              if extracted > count:
+                  raise SystemExit('native rlib stats counts')
+              resolved = linked_path(raw)
+              for name in names:
+                  map_raw = next(iter(rlib_link_paths[name]))
+                  if resolved is not None and resolved == linked_path(map_raw):
+                      stats_matched[name].append((count, extracted, raw))
+          for name in names:
+              rows = stats_matched[name]
+              if not 1 <= len(rows) <= 8 or any(count != len(billed[name + '_rlib']) for count, _, _ in rows):
+                  raise SystemExit('native rlib stats identity')
+              if not 0 < sum(extracted for _, extracted, _ in rows) <= len(billed[name + '_rlib']):
+                  raise SystemExit('native rlib stats extracted count')
+          extracted_rlib = {name: set() for name in names}
+          for line in why_lines[1:]:
+              fields = line.split('\t')
+              if len(line) > 8192 or len(fields) != 3 or not all(fields) or '\x00' in line:
+                  raise SystemExit('native why-extract grammar')
+              extracted_field = fields[1]
+              matched = []
+              for name in names:
+                  for _, _, raw in stats_matched[name]:
+                      prefix = raw + '('
+                      if extracted_field.startswith(prefix) and extracted_field.endswith(')'):
+                          matched.append((name, extracted_field[len(prefix):-1]))
+              if len(set(matched)) > 1:
+                  raise SystemExit('native why-extract archive ambiguous')
+              if matched:
+                  name, member = matched[0]
+                  member_hash = hashlib.sha256(member.encode()).hexdigest()
+                  if not member or member_hash not in billed[name + '_rlib'] or member_hash in extracted_rlib[name]:
+                      raise SystemExit('native why-extract member identity')
+                  extracted_rlib[name].add(member_hash)
+          for name in names:
+              if len(extracted_rlib[name]) != sum(extracted for _, extracted, _ in stats_matched[name]):
+                  raise SystemExit('native stats why-extract mismatch')
+          extracted_native = {label: extracted_rlib[rlib.removesuffix('_rlib')] & set(billed[label])
+                              for label, rlib in native_pairs.items()}
+          if any(not selected_native[label] <= extracted_native[label] for label in native_pairs):
+              raise SystemExit('native selected member extraction missing')
+          ranges.sort()
+          if any(left[1] > right[0] for left, right in zip(ranges, ranges[1:])):
+              raise SystemExit('native file-backed ranges overlap')
+          if any(counters[(name, 'file_bytes')] == 0 for name in names) or any(isc[stem] == 0 for stem in ('inet_ntop', 'inet_pton')):
+              raise SystemExit('native file-backed witness missing')
+          if any(not selected_native[label] or not selected_rows[label] for label in native_pairs):
+              raise SystemExit('native original object map join missing')
+          if lines != int(re.findall(r'^map_lines=([0-9]+)$', receipt.read_text(), re.M)[0]):
+              raise SystemExit('native map changed after parse')
+          with receipt.open('a') as output:
+              print('native_file_backed_scope=LOCAL_MAP_PT_LOAD_PRESTRIP_STRIPPED_EQUAL', file=output)
+              print('native_discarded_member_scope=UNPROVEN', file=output)
+              print('native_original_object_scope=LOCAL_A_TO_RLIB_SELECTED_MAP_MEMBER_JOIN', file=output)
+              print('native_original_object_selected_bytes=UNPROVEN', file=output)
+              print('native_extraction_scope=LOCAL_LLD_STATS_WHY_EXACT_SET', file=output)
+              print('native_extracted_no_filebacked_fate=UNKNOWN', file=output)
+              print('native_unrecorded_member_fate=UNKNOWN', file=output)
+              for name in names:
+                  for field in ('map_rows', 'zero_rows', 'nonfile_rows', 'file_rows', 'file_bytes'):
+                      print(f'{name}_{field}={counters[(name, field)]}', file=output)
+                  print(f'{name}_file_members={len(members[name])}', file=output)
+                  print(f'{name}_mapped_slice_digest={digests[name].hexdigest()}', file=output)
+                  print(f'{name}_other_rlib_file_rows={counters[(name, "other_rlib_file_rows")]}', file=output)
+              for label in sorted(native_pairs):
+                  binding = hashlib.sha256()
+                  for vma, size, name_hash, object_hash in sorted(selected_rows[label]):
+                      binding.update(bytes.fromhex(name_hash) + bytes.fromhex(object_hash) +
+                                     vma.to_bytes(8, 'little') + size.to_bytes(8, 'little'))
+                  print(f'{label}_selected_map_members={len(selected_native[label])}', file=output)
+                  print(f'{label}_selected_file_rows={counters[(label, "file_rows")]}', file=output)
+                  print(f'{label}_selected_file_bytes={counters[(label, "file_bytes")]}', file=output)
+                  print(f'{label}_selected_member_map_digest={binding.hexdigest()}', file=output)
+                  print(f'{label}_extracted_members={len(extracted_native[label])}', file=output)
+                  print(f'{label}_no_recorded_ordinary_extraction_members={len(billed[label]) - len(extracted_native[label])}', file=output)
+                  print(f'{label}_extracted_no_filebacked_map_members={len(extracted_native[label] - selected_native[label])}', file=output)
+              for name in names:
+                  print(f'{name}_stats_extracted_members={len(extracted_rlib[name])}', file=output)
+                  print(f'{name}_other_extracted_rlib_members={len(extracted_rlib[name] - set(native_by_rlib[name]))}', file=output)
+              for stem in ('inet_ntop', 'inet_pton'):
+                  print(f'isc_{stem}_file_bytes={isc[stem]}', file=output)
+          PY
+          printf '%s\n' TAR_STAGE > parity/stage.txt
+          stage=agent-parity-diagnostic-x86_64-unknown-linux-gnu
+          mkdir -p "$RUNNER_TEMP/moth-parity/dist/$stage/THIRD_PARTY_NOTICES/native"
+          cp target/x86_64-unknown-linux-gnu/release/agent "$RUNNER_TEMP/moth-parity/dist/$stage/"
+          cp LICENSE README.md CHANGELOG.md "$RUNNER_TEMP/moth-parity/dist/$stage/"
+          test "$(wc -l < packaging/native-notice-files.txt)" -eq 14
+          test "$(sort -u packaging/native-notice-files.txt | wc -l)" -eq 14
+          while IFS= read -r source; do
+            case "$source" in vendor/*) ;; *) exit 1 ;; esac
+            case "$source" in *..*|*//*) exit 1 ;; esac
+            test -f "$source" && test ! -L "$source"
+            target="$RUNNER_TEMP/moth-parity/dist/$stage/THIRD_PARTY_NOTICES/native/$source"
+            mkdir -p "$(dirname "$target")"
+            cp "$source" "$target"
+            cmp -s "$source" "$target"
+          done < packaging/native-notice-files.txt
+          cp packaging/native-notice-files.txt "$RUNNER_TEMP/moth-parity/dist/$stage/THIRD_PARTY_NOTICES/native/FILES.txt"
+          tar -C "$RUNNER_TEMP/moth-parity/dist" -czf "$RUNNER_TEMP/moth-parity/candidate.tar.gz" "$stage"
+          printf '%s\n' TAR_VERIFY > parity/stage.txt
+          python3 - "$RUNNER_TEMP/moth-parity/candidate.tar.gz" "$stage" <<'PY'
+          import hashlib
+          from pathlib import Path
+          import sys
+          import tarfile
+
+          archive, stage = sys.argv[1:]
+          root = Path.cwd()
+          names = (root / 'packaging/native-notice-files.txt').read_text().splitlines()
+          assert len(names) == len(set(names)) == 14
+          wanted = {'agent', 'LICENSE', 'README.md', 'CHANGELOG.md',
+                    'THIRD_PARTY_NOTICES/native/FILES.txt'}
+          wanted |= {f'THIRD_PARTY_NOTICES/native/{name}' for name in names}
+          payload = root / 'release-payload/amd64'
+          (payload / 'native').mkdir(parents=True)
+          seen = set()
+          with tarfile.open(archive, 'r:gz') as tar:
+              for member in tar:
+                  parts = member.name.rstrip('/').split('/')
+                  assert parts[0] == stage and all(part not in ('', '.', '..') for part in parts)
+                  if member.isdir():
+                      continue
+                  assert member.isfile() and member.size <= 100 * 1024 * 1024
+                  relative = '/'.join(parts[1:])
+                  assert relative in wanted and relative not in seen
+                  seen.add(relative)
+                  if relative == 'agent':
+                      assert member.mode & 0o111
+                      dest = payload / 'agent'
+                  elif relative == 'LICENSE':
+                      dest = payload / 'LICENSE'
+                  elif relative.startswith('THIRD_PARTY_NOTICES/native/'):
+                      dest = payload / 'native' / relative.removeprefix('THIRD_PARTY_NOTICES/native/')
+                  else:
+                      continue
+                  dest.parent.mkdir(parents=True, exist_ok=True)
+                  with tar.extractfile(member) as source, dest.open('wb') as output:
+                      while chunk := source.read(1024 * 1024):
+                          output.write(chunk)
+                  dest.chmod(0o755 if relative == 'agent' else 0o644)
+          assert seen == wanted
+          assert (payload / 'LICENSE').read_bytes() == (root / 'LICENSE').read_bytes()
+          assert (payload / 'native/FILES.txt').read_bytes() == (root / 'packaging/native-notice-files.txt').read_bytes()
+          for name in names:
+              assert (payload / 'native' / name).read_bytes() == (root / name).read_bytes()
+          sha = lambda path: hashlib.sha256(Path(path).read_bytes()).hexdigest()
+          (root / 'parity/tar-sha256.txt').write_text(
+              f'tar_sha256={sha(archive)}\ntar_agent_sha256={sha(payload / "agent")}\n'
+          )
+          PY
+          printf '%s\n' TAR_READY > parity/stage.txt
+
+      - name: Build local release-only OCI and compare exported bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s\n' OCI_BUILD > parity/stage.txt
+          docker build --platform linux/amd64 --target runtime --file Dockerfile.release \
+            --build-arg TARGETARCH=amd64 \
+            --build-arg "REPO_SOURCE=https://github.com/$GITHUB_REPOSITORY" \
+            --build-arg "SOURCE_REVISION=$GITHUB_SHA" \
+            --tag moth-parity-runtime:diagnostic . > "$RUNNER_TEMP/moth-parity-oci.log" 2>&1
+          docker image inspect --format 'runtime_image={{.Id}}' moth-parity-runtime:diagnostic > parity/image.txt
+          printf '%s\n' OCI_EXPORT > parity/stage.txt
+          container=$(docker create --platform linux/amd64 moth-parity-runtime:diagnostic)
+          printf '%s\n' "$container" > "$RUNNER_TEMP/moth-parity/container-id"
+          docker export "$container" > "$RUNNER_TEMP/moth-parity/rootfs.tar"
+          printf '%s\n' OCI_COMPARE > parity/stage.txt
+          python3 - "$RUNNER_TEMP/moth-parity/rootfs.tar" <<'PY'
+          import hashlib
+          from pathlib import Path
+          import sys
+          import tarfile
+
+          root = Path.cwd()
+          payload = root / 'release-payload/amd64'
+          names = (root / 'packaging/native-notice-files.txt').read_text().splitlines()
+          expected = {'usr/local/bin/agent': payload / 'agent',
+                      'usr/share/licenses/moth/LICENSE': payload / 'LICENSE',
+                      'usr/share/doc/moth/THIRD_PARTY_NOTICES/native/FILES.txt': payload / 'native/FILES.txt'}
+          expected.update({f'usr/share/doc/moth/THIRD_PARTY_NOTICES/native/{name}': payload / 'native' / name
+                           for name in names})
+          oci_agent_hash = None
+          with tarfile.open(sys.argv[1], 'r:') as tar:
+              members = tar.getmembers()
+              for path, source in expected.items():
+                  matching = [m for m in members if m.name.removeprefix('./') == path]
+                  assert len(matching) == 1 and matching[0].isfile(), path
+                  observed = hashlib.sha256(tar.extractfile(matching[0]).read()).hexdigest()
+                  assert observed == hashlib.sha256(source.read_bytes()).hexdigest(), path
+                  if path == 'usr/local/bin/agent':
+                      oci_agent_hash = observed
+              native_prefix = 'usr/share/doc/moth/THIRD_PARTY_NOTICES/native/'
+              native = [m for m in members if m.name.removeprefix('./').startswith(native_prefix) and m.isfile()]
+              assert len(native) == 15
+          text_paths = sorted(path for path in expected if path != 'usr/local/bin/agent')
+          with (root / 'parity/text-sha256.txt').open('w') as receipt:
+              for path in text_paths:
+                  print(hashlib.sha256(expected[path].read_bytes()).hexdigest(), path, file=receipt)
+          with (root / 'parity/tar-sha256.txt').open('a') as receipt:
+              print('oci_agent_sha256=' + oci_agent_hash, file=receipt)
+              print('tar_oci_binary_identity=yes', file=receipt)
+          PY
+          printf '%s\n' OCI_READY > parity/stage.txt
+
+      - name: Mark local release-layout parity diagnostic complete
+        id: parity-complete
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(wc -l < parity/text-sha256.txt)" -eq 16
+          grep -Fxq 'tar_oci_binary_identity=yes' parity/tar-sha256.txt
+          test -s parity/map-join.txt
+          test "$(grep -c '^stripped_agent_sha256=' parity/map-join.txt)" -eq 1
+          test "$(grep -c '^tar_agent_sha256=' parity/tar-sha256.txt)" -eq 1
+          test "$(sed -n 's/^stripped_agent_sha256=//p' parity/map-join.txt)" = "$(sed -n 's/^tar_agent_sha256=//p' parity/tar-sha256.txt)"
+          grep -Fxq 'native_file_backed_scope=LOCAL_MAP_PT_LOAD_PRESTRIP_STRIPPED_EQUAL' parity/map-join.txt
+          grep -Fxq 'native_discarded_member_scope=UNPROVEN' parity/map-join.txt
+          grep -Fxq 'native_original_object_scope=LOCAL_A_TO_RLIB_SELECTED_MAP_MEMBER_JOIN' parity/map-join.txt
+          grep -Fxq 'native_original_object_selected_bytes=UNPROVEN' parity/map-join.txt
+          grep -Fxq 'native_extraction_scope=LOCAL_LLD_STATS_WHY_EXACT_SET' parity/map-join.txt
+          grep -Fxq 'native_extracted_no_filebacked_fate=UNKNOWN' parity/map-join.txt
+          grep -Fxq 'native_unrecorded_member_fate=UNKNOWN' parity/map-join.txt
+          for label in crypto_a curl_a ssl_a z_a; do
+            grep -Eq "^${label}_selected_map_members=[1-9][0-9]*$" parity/map-join.txt
+            grep -Eq "^${label}_selected_file_rows=[1-9][0-9]*$" parity/map-join.txt
+            grep -Eq "^${label}_extracted_members=[1-9][0-9]*$" parity/map-join.txt
+            grep -Eq "^${label}_section_alloc_sections=[1-9][0-9]*$" parity/native-inventory.txt
+          done
+          grep -Fxq 'full_allocated_section_reconciliation=UNPROVEN' parity/native-inventory.txt
+          grep -Fxq 'same_build_archive_inventory=yes' parity/native-inventory.txt
+          grep -Fxq 'native_section_shape_scope=ORIGINAL_A_CENSUS_ONLY' parity/native-inventory.txt
+          grep -Fxq 'native_allocated_section_fate=UNKNOWN' parity/native-inventory.txt
+          grep -Fxq 'native_a_link_input_identity=LLD21_STATS_POSITIVE_ONLY' parity/native-inventory.txt
+          test -s parity/native-members.txt
+          grep -Fxq 'schema=moth-local-native-member-hashes/v1' parity/native-members.txt
+          for stem in inet_ntop inet_pton; do
+            grep -Eq "^isc_${stem}_object_sha256=[0-9a-f]{64}$" parity/native-inventory.txt
+          done
+          grep -Eq '^isc_inet_ntop_file_bytes=[1-9][0-9]*$' parity/map-join.txt
+          grep -Eq '^isc_inet_pton_file_bytes=[1-9][0-9]*$' parity/map-join.txt
+          for source in vendor/curl-sys/curl/LICENSES/ISC.txt vendor/curl-sys/curl/lib/curlx/inet_ntop.c vendor/curl-sys/curl/lib/curlx/inet_pton.c; do
+            test "$(grep -Fc " usr/share/doc/moth/THIRD_PARTY_NOTICES/native/$source" parity/text-sha256.txt)" -eq 1
+          done
+          printf '%s\n' COMPLETE > parity/stage.txt
+
+      - name: Remove private parity payloads and containers
+        if: always()
+        shell: bash
+        env:
+          PARITY_OUTCOME: ${{ steps.parity-complete.outcome }}
+        run: |
+          set -uo pipefail
+          cleanup_ok=1
+          if test -s "$RUNNER_TEMP/moth-parity/cargo-container-id"; then
+            cargo_container="$(cat "$RUNNER_TEMP/moth-parity/cargo-container-id")"
+            if docker container inspect "$cargo_container" >/dev/null 2>&1; then
+              docker rm -f "$cargo_container" >/dev/null || cleanup_ok=0
+            fi
+          fi
+          if test -s "$RUNNER_TEMP/moth-parity/container-id"; then
+            docker rm -f "$(cat "$RUNNER_TEMP/moth-parity/container-id")" >/dev/null || cleanup_ok=0
+          fi
+          sudo -n rm -rf -- "$RUNNER_TEMP/moth-parity" "$GITHUB_WORKSPACE/release-payload" "$GITHUB_WORKSPACE/target" || cleanup_ok=0
+          rm -f -- agent-native-link.map agent-native-why-extract.txt agent-native-archive-stats.txt || cleanup_ok=0
+          rm -f -- "$RUNNER_TEMP/moth-parity-builder.log" "$RUNNER_TEMP/moth-parity-rustc-version.log" "$RUNNER_TEMP/moth-parity-rustc-identity.log" "$RUNNER_TEMP/moth-parity-linker-identity.log" "$RUNNER_TEMP/moth-parity-cargo.log" "$RUNNER_TEMP/moth-parity-oci.log" || cleanup_ok=0
+          for private in agent-native-link.map agent-native-why-extract.txt agent-native-archive-stats.txt "$GITHUB_WORKSPACE/target" \
+            "$RUNNER_TEMP/moth-parity" "$GITHUB_WORKSPACE/release-payload" \
+            "$RUNNER_TEMP/moth-parity-builder.log" "$RUNNER_TEMP/moth-parity-rustc-version.log" "$RUNNER_TEMP/moth-parity-rustc-identity.log" "$RUNNER_TEMP/moth-parity-linker-identity.log" "$RUNNER_TEMP/moth-parity-cargo.log" "$RUNNER_TEMP/moth-parity-oci.log"; do
+            { test ! -e "$private" && test ! -L "$private"; } || cleanup_ok=0
+          done
+          test "$cleanup_ok" -eq 1 || exit 1
+          test "$PARITY_OUTCOME" = success || exit 0
+          test -d parity && test ! -L parity && test -f parity/status.txt && test ! -L parity/status.txt || exit 1
+          printf '%s\n' 'INCOMPLETE' 'release_admission=NO' 'legal_admission=NO' | cmp -s - parity/status.txt || exit 1
+          test ! -e parity/status.pending && test ! -L parity/status.pending || exit 1
+          printf '%s\n' 'LOCAL_NATIVE_MAP_RELEASE_LAYOUT_JOIN_ONLY' 'release_admission=NO' 'legal_admission=NO' 'pushed_image_parity=UNPROVEN' 'native_link_retention=LOCAL_LLD_ROWS_OBSERVED' 'selected_native_bytes=UNPROVEN' 'notice_custody=LOCAL_14_SOURCE_TAR_OCI_BYTE_JOIN' 'base_image_notice_coverage=UNPROVEN' > parity/status.pending || exit 1
+          test -f parity/status.pending && test ! -L parity/status.pending || exit 1
+          printf '%s\n' 'LOCAL_NATIVE_MAP_RELEASE_LAYOUT_JOIN_ONLY' 'release_admission=NO' 'legal_admission=NO' 'pushed_image_parity=UNPROVEN' 'native_link_retention=LOCAL_LLD_ROWS_OBSERVED' 'selected_native_bytes=UNPROVEN' 'notice_custody=LOCAL_14_SOURCE_TAR_OCI_BYTE_JOIN' 'base_image_notice_coverage=UNPROVEN' | cmp -s - parity/status.pending || exit 1
+          mv -f -- parity/status.pending parity/status.txt || exit 1
+
+      - name: Bound text-only parity receipt
+        id: bound-parity
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -d parity && test ! -L parity
+          test -f parity/status.txt
+          test "$(find parity -type f | wc -l)" -le 9
+          test -z "$(find parity ! -type f ! -type d -print -quit)"
+          while IFS= read -r path; do
+            case "$path" in
+              parity/status.txt|parity/identity.txt|parity/tar-sha256.txt|parity/image.txt|parity/text-sha256.txt|parity/map-join.txt|parity/native-inventory.txt|parity/native-members.txt|parity/stage.txt) ;;
+              *) exit 1 ;;
+            esac
+            case "$path" in
+              parity/native-members.txt) test "$(wc -c < "$path")" -le 1048576 ;;
+              *) test "$(wc -c < "$path")" -le 8192 ;;
+            esac
+          done < <(find parity -type f -print)
+          if test -f parity/stage.txt; then
+            test "$(wc -l < parity/stage.txt)" -eq 1
+            test "$(wc -c < parity/stage.txt)" -le 32
+            case "$(cat parity/stage.txt)" in
+              BUILDER_IMAGE|RUSTC_IDENTITY|LINKER_IDENTITY|CARGO_LINK_MAP|MAP_PARSE|ARCHIVE_INVENTORY|STRIP|NATIVE_BYTES|TAR_STAGE|TAR_VERIFY|TAR_READY|OCI_BUILD|OCI_EXPORT|OCI_COMPARE|OCI_READY|COMPLETE) ;;
+              *) exit 1 ;;
+            esac
+          fi
+          test "$(du -sk parity | cut -f1)" -le 1152
+
+      - name: Retain parity diagnostic receipt
+        if: ${{ always() && steps.bound-parity.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: moth-pr8-release-layout-parity-${{ github.sha }}
+          path: parity/
+          if-no-files-found: error
+          retention-days: 7
+
+  base-custody-linux:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/fix/native-notice-packaging-pr5' && inputs.base_custody && !inputs.release_parity
+    runs-on: ubuntu-22.04
+    timeout-minutes: 75
+    permissions:
+      contents: read
+    steps:
+      - name: Fetch exact reviewed PR8 source for no-publish base rehearsal
+        shell: bash
+        env:
+          REVIEWED_SHA: ${{ inputs.notice_head_sha }}
+          GIT_TERMINAL_PROMPT: '0'
+          GIT_ASKPASS: /bin/false
+        run: |
+          set -euo pipefail
+          mkdir -p base-receipt
+          printf '%s\n' 'INCOMPLETE' 'release_admission=NO' 'legal_admission=NO' > base-receipt/status.txt
+          printf '%s\n' FETCH > base-receipt/stage.txt
+          [[ "$REVIEWED_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$REVIEWED_SHA" = "$GITHUB_SHA"
+          test -z "$(find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 ! -name base-receipt -print -quit)"
+          git init -q "$GITHUB_WORKSPACE"
+          git remote add origin https://github.com/ryanmaclean/moth.git
+          git -c credential.helper= fetch --no-tags --no-recurse-submodules --depth=128 origin refs/pull/8/head
+          test "$(git rev-parse FETCH_HEAD)" = "$REVIEWED_SHA"
+          git -c submodule.recurse=false checkout --detach --force "$REVIEWED_SHA"
+          test "$(git rev-parse HEAD)" = "$REVIEWED_SHA"
+          test "$(git merge-base HEAD 2ad30129a9af231b687b8821f2b9d062e41992f9)" = 2ad30129a9af231b687b8821f2b9d062e41992f9
+          git diff --name-only 2ad30129a9af231b687b8821f2b9d062e41992f9 HEAD | sort | diff -u <(printf '%s\n' '.github/workflows/freebsd.yml' '.github/workflows/release.yml' 'Dockerfile' 'Dockerfile.release' 'packaging/native-notice-files.txt' | sort) -
+          printf '%s\n' \
+            'befd91e188696989d415870792acb3f9fa5a5d3bd79fe8823989264714b6fe51  Cargo.lock' \
+            '392a5a80e863151504fa05add58ea97b98a4a7a57e36cd26436734a95465650a  Dockerfile' \
+            '8aecec600179b49cd5a1a8a4feede8e86c1fa2717c75752827201f476bf0ef4a  Dockerfile.release' \
+            'ae3f5acdad3187723f7779ae725467a51d80e2609f6c509c8ab43c935b3f58a6  .github/workflows/release.yml' \
+            '6321279cc4a58259e29638a1f7c6621184b07576e8a70728b2b5bb48d761d83c  packaging/native-notice-files.txt' \
+            '59d5f1cb240a41f1a4acea088ca1f964b0e9d81c6afea1cc748988f5bdb1a533  .dockerignore' \
+            | sha256sum --check --status
+          grep -Fxq 'FROM gcr.io/distroless/cc-debian12@sha256:e5d81ddde149641e2a9ba55be4545bc125c67de07508b03ba4c22e6eb0ded5aa AS runtime' Dockerfile.release
+          test -z "$(git status --porcelain --untracked-files=no)"
+          printf 'source_head=%s\nbase_index=sha256:e5d81ddde149641e2a9ba55be4545bc125c67de07508b03ba4c22e6eb0ded5aa\n' "$REVIEWED_SHA" > base-receipt/identity.txt
+
+      - name: Build two same-run release-layout payloads and private local images
+        shell: bash
+        run: |
+          set -euo pipefail
+          private="$RUNNER_TEMP/moth-base-custody"
+          mkdir -p "$private" release-payload
+          capture() {
+            local destination="$1" limit="$2"
+            shift 2
+            if ! "$@" 2>&1 | head -c "$((limit + 1))" > "$destination"; then
+              echo 'base custody private command failed or exceeded cap' >&2
+              exit 1
+            fi
+            if test "$(wc -c < "$destination")" -gt "$limit"; then
+              echo 'base custody private command exceeded cap' >&2
+              exit 1
+            fi
+          }
+          capture_archive() {
+            local destination="$1" limit="$2"
+            shift 2
+            if ! "$@" 2>/dev/null | head -c "$((limit + 1))" > "$destination"; then
+              echo 'base custody private archive failed or exceeded cap' >&2
+              exit 1
+            fi
+            if test "$(wc -c < "$destination")" -gt "$limit"; then
+              echo 'base custody private archive exceeded cap' >&2
+              exit 1
+            fi
+          }
+          printf '%s\n' BASE_INDEX > base-receipt/stage.txt
+          capture "$private/base-index.json" 1048576 docker buildx imagetools inspect --raw gcr.io/distroless/cc-debian12@sha256:e5d81ddde149641e2a9ba55be4545bc125c67de07508b03ba4c22e6eb0ded5aa
+          jq -e '([.manifests[] | select(.platform.os == "linux" and (.platform.architecture == "amd64" or .platform.architecture == "arm64")) | .platform.architecture] | sort) == ["amd64", "arm64"]' "$private/base-index.json" >/dev/null
+          printf '%s\n' BUILDER > base-receipt/stage.txt
+          capture "$private/builder.log" 4194304 docker build --target builder -t moth-base-custody-builder:local .
+          for pair in amd64:x86_64-unknown-linux-gnu arm64:aarch64-unknown-linux-gnu; do
+            arch="${pair%%:*}" target="${pair#*:}"
+            case "$arch" in amd64) suffix=AMD64 ;; arm64) suffix=ARM64 ;; *) exit 1 ;; esac
+            printf 'BUILD_%s\n' "$suffix" > base-receipt/stage.txt
+            capture "$private/build-$arch.log" 16777216 timeout 45m docker run --rm -v "$PWD:/work" -w /work moth-base-custody-builder:local \
+              cargo build --release --locked --frozen --offline -p cli --target "$target"
+            if test "$arch" = arm64; then strip_cmd='aarch64-linux-gnu-strip'; else strip_cmd='strip'; fi
+            printf 'STRIP_%s\n' "$suffix" > base-receipt/stage.txt
+            capture "$private/strip-$arch.log" 1048576 docker run --rm -v "$PWD:/work" -w /work moth-base-custody-builder:local \
+              "$strip_cmd" "target/$target/release/agent"
+            mkdir -p "release-payload/$arch/native" "$private/stage-$arch/THIRD_PARTY_NOTICES/native"
+            cp "target/$target/release/agent" "release-payload/$arch/agent"
+            cp LICENSE "release-payload/$arch/LICENSE"
+            cp packaging/native-notice-files.txt "release-payload/$arch/native/FILES.txt"
+            cp "release-payload/$arch/agent" "$private/stage-$arch/agent"
+            cp LICENSE README.md CHANGELOG.md "$private/stage-$arch/"
+            cp packaging/native-notice-files.txt "$private/stage-$arch/THIRD_PARTY_NOTICES/native/FILES.txt"
+            while IFS= read -r source; do
+              case "$source" in vendor/*) ;; *) exit 1 ;; esac
+              case "$source" in *..*|*//*) exit 1 ;; esac
+              test -f "$source" && test ! -L "$source"
+              mkdir -p "release-payload/$arch/native/$(dirname "$source")" "$private/stage-$arch/THIRD_PARTY_NOTICES/native/$(dirname "$source")"
+              cp "$source" "release-payload/$arch/native/$source"
+              cp "$source" "$private/stage-$arch/THIRD_PARTY_NOTICES/native/$source"
+            done < packaging/native-notice-files.txt
+            printf 'TAR_%s\n' "$suffix" > base-receipt/stage.txt
+            capture_archive "$private/candidate-$arch.tar.gz" 134217728 tar -C "$private" -czf - "stage-$arch"
+            printf 'IMAGE_BUILD_%s\n' "$suffix" > base-receipt/stage.txt
+            capture "$private/image-$arch.log" 4194304 docker build --platform "linux/$arch" --file Dockerfile.release \
+              --build-arg TARGETARCH="$arch" --build-arg SOURCE_REVISION="$GITHUB_SHA" \
+              -t "moth-base-custody-$arch:local" .
+            printf 'BASE_MANIFEST_%s\n' "$suffix" > base-receipt/stage.txt
+            digest=$(jq -er --arg arch "$arch" '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == $arch) | .digest] | if length == 1 then .[0] else empty end' "$private/base-index.json")
+            [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+            if test "$arch" = amd64; then
+              test "$digest" = sha256:6dc8478fd8e790ae427aeff51e588573dec83b13adb7e5d10505a717927009b5
+            else
+              test "$digest" = sha256:4bed9c8eff0e70bf6547aa04a3b1ea5bba63fb910707b3f94f45556edc2a9238
+            fi
+            printf '%s_base_manifest=%s\n' "$arch" "$digest" >> base-receipt/identity.txt
+            printf 'BASE_PULL_%s\n' "$suffix" > base-receipt/stage.txt
+            capture "$private/pull-$arch.log" 1048576 docker pull --platform "linux/$arch" "gcr.io/distroless/cc-debian12@$digest"
+            printf 'BASE_CREATE_%s\n' "$suffix" > base-receipt/stage.txt
+            # Distroless has no default command. This export-only container is
+            # never started; a deliberately absent command prevents execution.
+            capture "$private/create-base-$arch.log" 1048576 docker create --name "moth-base-custody-base-$arch" --platform "linux/$arch" "gcr.io/distroless/cc-debian12@$digest" /__moth_base_export_never_start__
+            printf 'IMAGE_CREATE_%s\n' "$suffix" > base-receipt/stage.txt
+            capture "$private/create-image-$arch.log" 1048576 docker create --name "moth-base-custody-image-$arch" --platform "linux/$arch" "moth-base-custody-$arch:local"
+            printf 'BASE_EXPORT_%s\n' "$suffix" > base-receipt/stage.txt
+            capture_archive "$private/base-$arch.tar" 268435456 docker export "moth-base-custody-base-$arch"
+            printf 'IMAGE_EXPORT_%s\n' "$suffix" > base-receipt/stage.txt
+            capture_archive "$private/image-$arch.tar" 268435456 docker export "moth-base-custody-image-$arch"
+          done
+
+      - name: Compare private tar, base and composed bytes with bounded receipt
+        id: custody-complete
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s\n' CUSTODY > base-receipt/stage.txt
+          python3 - <<'PY'
+          import hashlib
+          import os
+          from pathlib import Path
+          import posixpath
+          import re
+          import tarfile
+
+          private = Path(os.environ['RUNNER_TEMP']) / 'moth-base-custody'
+          manifest = Path('packaging/native-notice-files.txt').read_text().splitlines()
+          def require(condition):
+              if not condition:
+                  raise SystemExit('base custody mismatch') from None
+          def snapshot(path):
+              result = {}
+              require(path.is_file() and 0 < path.stat().st_size <= 268435456)
+              with tarfile.open(path, 'r:') as archive:
+                  for member in archive:
+                      name = member.name.removeprefix('./').lstrip('/')
+                      name.encode('utf-8', 'strict')
+                      require(len(name) <= 4096 and '..' not in name.split('/'))
+                      require(len(result) < 50000)
+                      require(name not in result)
+                      if member.isfile():
+                          require(0 <= member.size <= 100 * 1024 * 1024)
+                          stream = archive.extractfile(member)
+                          require(stream is not None)
+                          digest = hashlib.sha256()
+                          while chunk := stream.read(1024 * 1024):
+                              digest.update(chunk)
+                          result[name] = ('file', member.size, digest.hexdigest())
+                      else:
+                          result[name] = ('other', 0, '')
+              return result
+          def local(path):
+              require(path.is_file() and not path.is_symlink())
+              data = path.read_bytes()
+              require(len(data) <= 100 * 1024 * 1024)
+              return ('file', len(data), hashlib.sha256(data).hexdigest())
+          def package_shape(path, base, arch):
+              # Diagnostic only: no package bill or legal conclusion is inferred.
+              def mark(phase):
+                  Path('base-receipt/stage.txt').write_text(
+                      f'PKG_{phase}_{arch.upper()}\n', encoding='ascii')
+              records = {}
+              sums = {}
+              links = {}
+              mark('SCAN')
+              with tarfile.open(path, 'r:') as archive:
+                  for member in archive:
+                      name = member.name.removeprefix('./').lstrip('/')
+                      if member.issym():
+                          require(len(member.linkname) <= 4096)
+                          links[name] = member.linkname
+                      if not member.isfile() or not name.startswith('var/lib/dpkg/status.d/'):
+                          continue
+                      require(member.size <= 1048576)
+                      stream = archive.extractfile(member)
+                      require(stream is not None)
+                      data = stream.read(1048577)
+                      require(len(data) == member.size)
+                      leaf = name.removeprefix('var/lib/dpkg/status.d/')
+                      require('/' not in leaf and leaf and len(records) + len(sums) < 4096)
+                      if leaf.endswith('.md5sums'):
+                          package = leaf.removesuffix('.md5sums')
+                          require(package not in sums)
+                          sums[package] = data
+                      else:
+                          require(leaf not in records)
+                          records[leaf] = data
+              mark('PAIR')
+              require(0 < len(records) <= 2048 and len(sums) <= 2048)
+              require(set(records) == set(sums))
+              package_bill = []
+              owned = set()
+              direct = shared = missing = 0
+              for package in sorted(records):
+                  mark('CONTROL')
+                  mark('CTRL_NAME')
+                  require(re.fullmatch(r'[a-z0-9][a-z0-9+.-]{0,127}', package) is not None)
+                  fields = {}
+                  try:
+                      mark('CTRL_UTF8')
+                      control = records[package].decode('utf-8')
+                      mark('SUMS_UTF8')
+                      listing = sums[package].decode('utf-8', 'strict')
+                  except UnicodeError:
+                      require(False)
+                  for line in control.splitlines():
+                      if line.startswith((' ', '\t')):
+                          continue
+                      mark('CTRL_LINE')
+                      if ':' not in line:
+                          require(False)
+                      key, value = line.split(':', 1)
+                      mark('CTRL_DUP')
+                      require(key not in fields)
+                      fields[key] = value.strip()
+                  mark('CTRL_PACKAGE')
+                  require(fields.get('Package') == package)
+                  mark('CTRL_REQUIRED')
+                  require(fields.get('Version') and fields.get('Architecture'))
+                  mark('CTRL_LENGTH')
+                  require(len(fields['Version']) <= 256 and len(fields['Architecture']) <= 32)
+                  mark('CTRL_VERSION')
+                  require(re.fullmatch(r'[A-Za-z0-9.+:~_-]+', fields['Version']) is not None)
+                  mark('CTRL_ARCH')
+                  require(re.fullmatch(r'[a-z0-9-]+', fields['Architecture']) is not None)
+                  package_bill.append((package, fields['Version'], fields['Architecture']))
+                  mark('SUMS')
+                  for line in listing.splitlines():
+                      match = re.fullmatch(r'([0-9a-fA-F]{32})  (\S[^\r\n]*)', line)
+                      require(match is not None)
+                      raw_path = match.group(2)
+                      require(not raw_path.startswith(('//', '../', '/./')))
+                      member_path = raw_path.removeprefix('./').removeprefix('/')
+                      require(0 < len(member_path) <= 4096 and posixpath.normpath(member_path) == member_path)
+                      require('..' not in member_path.split('/') and not any(ord(c) < 32 or ord(c) == 127 for c in member_path))
+                      require(member_path not in owned and base.get(member_path, ('',))[0] == 'file')
+                      owned.add(member_path)
+                  mark('NOTICE')
+                  copyright_path = f'usr/share/doc/{package}/copyright'
+                  if base.get(copyright_path, ('',))[0] == 'file':
+                      direct += 1
+                  elif f'usr/share/doc/{package}' in links:
+                      target = links[f'usr/share/doc/{package}']
+                      candidate = posixpath.normpath(
+                          target.lstrip('/') if target.startswith('/') else
+                          posixpath.join('usr/share/doc', target))
+                      require(candidate != '..' and not candidate.startswith('../'))
+                      if base.get(f'{candidate}/copyright', ('',))[0] == 'file':
+                          shared += 1
+                      else:
+                          missing += 1
+                  else:
+                      missing += 1
+              bill = '\n'.join('\t'.join(row) for row in package_bill).encode('utf-8')
+              unowned = sum(value[0] == 'file' and name not in owned
+                            for name, value in base.items())
+              mark('DONE')
+              return (len(records), len(sums), direct, shared, missing,
+                      unowned, len(links), hashlib.sha256(bill).hexdigest())
+          try:
+              require(len(manifest) == len(set(manifest)) == 14)
+              with Path('base-receipt/custody.txt').open('w', encoding='ascii') as out:
+                  print('schema=moth-local-base-custody/v1', file=out)
+                  for arch in ('amd64', 'arm64'):
+                      base = snapshot(private / f'base-{arch}.tar')
+                      image = snapshot(private / f'image-{arch}.tar')
+                      require(0 < (private / f'candidate-{arch}.tar.gz').stat().st_size <= 134217728)
+                      with tarfile.open(private / f'candidate-{arch}.tar.gz', 'r:gz') as archive:
+                          tar_members = {}
+                          for member in archive:
+                              if member.isfile():
+                                  require(len(member.name) <= 4096 and '..' not in member.name.split('/'))
+                                  require(member.name not in tar_members and member.size <= 100 * 1024 * 1024)
+                                  stream = archive.extractfile(member)
+                                  require(stream is not None)
+                                  data = stream.read()
+                                  tar_members[member.name] = ('file', len(data), hashlib.sha256(data).hexdigest())
+                      payload = Path('release-payload') / arch
+                      wanted = {'usr/local/bin/agent': payload / 'agent',
+                                'usr/share/licenses/moth/LICENSE': payload / 'LICENSE',
+                                'usr/share/doc/moth/THIRD_PARTY_NOTICES/native/FILES.txt': payload / 'native/FILES.txt'}
+                      wanted.update({f'usr/share/doc/moth/THIRD_PARTY_NOTICES/native/{name}': payload / 'native' / name for name in manifest})
+                      require(len(tar_members) == len(wanted) + 2)
+                      for extra in ('README.md', 'CHANGELOG.md'):
+                          require(tar_members.get(f'stage-{arch}/{extra}') == local(Path(extra)))
+                      for dest, source in wanted.items():
+                          require(image.get(dest) == local(source))
+                          relative = dest.replace('usr/local/bin/', '').replace('usr/share/licenses/moth/', '').replace('usr/share/doc/moth/', '')
+                          require(tar_members.get(f'stage-{arch}/{relative}') == local(source))
+                      native_prefix = 'usr/share/doc/moth/THIRD_PARTY_NOTICES/native/'
+                      require(sum(k.startswith(native_prefix) and v[0] == 'file' for k, v in image.items()) == 15)
+                      notice = {k: v for k, v in base.items() if v[0] == 'file' and (
+                          (k.startswith('usr/share/doc/') and
+                           k.rsplit('/', 1)[-1].lower().startswith(('copyright', 'license', 'copying', 'notice'))) or
+                          k.startswith('usr/share/licenses/') or k.startswith('licenses/'))}
+                      package_meta = {k: v for k, v in base.items() if v[0] == 'file' and (
+                          k.startswith('var/lib/dpkg/status.d/') or k == 'var/lib/dpkg/status' or
+                          k.endswith('.spdx.json') or k.endswith('.spdx'))}
+                      require(0 < len(notice) <= 4096 and 0 < len(package_meta) <= 4096)
+                      require(all(image.get(k) == v for k, v in notice.items()))
+                      require(all(image.get(k) == v for k, v in package_meta.items()))
+                      shape = package_shape(private / f'base-{arch}.tar', base, arch)
+                      for label, value in zip(('package_records', 'md5sum_records',
+                                               'direct_notice_routes', 'shared_symlink_routes',
+                                               'missing_notice_routes', 'unlisted_regular_files',
+                                               'symlink_paths', 'package_bill_sha256'), shape):
+                          print(f'{arch}_{label}={value}', file=out)
+                      print(f'{arch}_agent_sha256={local(payload / "agent")[2]}', file=out)
+                      print(f'{arch}_native_notice_files=15', file=out)
+                      print(f'{arch}_base_notice_paths_inherited={len(notice)}', file=out)
+                      print(f'{arch}_base_package_metadata_paths_inherited={len(package_meta)}', file=out)
+                  print('base_notice_inheritance=EXACT_PATH_BYTES_FOR_OBSERVED_FILES', file=out)
+                  print('base_package_notice_coverage=UNPROVEN', file=out)
+                  print('non_debian_file_coverage=UNPROVEN', file=out)
+                  print('pushed_image_parity=UNPROVEN', file=out)
+          except Exception:
+              raise SystemExit('base custody private data invalid') from None
+          PY
+          printf '%s\n' VERIFIED > base-receipt/stage.txt
+
+      - name: Remove private base rehearsal payloads and containers
+        if: always()
+        shell: bash
+        env:
+          CUSTODY_OUTCOME: ${{ steps.custody-complete.outcome }}
+        run: |
+          set -uo pipefail
+          ok=1
+          for arch in amd64 arm64; do
+            docker rm -f "moth-base-custody-base-$arch" "moth-base-custody-image-$arch" >/dev/null 2>&1 || true
+            docker image rm -f "moth-base-custody-$arch:local" >/dev/null 2>&1 || true
+            docker container inspect "moth-base-custody-base-$arch" >/dev/null 2>&1 && ok=0
+            docker container inspect "moth-base-custody-image-$arch" >/dev/null 2>&1 && ok=0
+            docker image inspect "moth-base-custody-$arch:local" >/dev/null 2>&1 && ok=0
+          done
+          docker image rm -f moth-base-custody-builder:local >/dev/null 2>&1 || true
+          docker image inspect moth-base-custody-builder:local >/dev/null 2>&1 && ok=0
+          sudo -n rm -rf -- "$RUNNER_TEMP/moth-base-custody" "$GITHUB_WORKSPACE/release-payload" "$GITHUB_WORKSPACE/target" || ok=0
+          for private in "$RUNNER_TEMP/moth-base-custody" "$GITHUB_WORKSPACE/release-payload" "$GITHUB_WORKSPACE/target"; do
+            { test ! -e "$private" && test ! -L "$private"; } || ok=0
+          done
+          test "$ok" -eq 1 || exit 1
+          test "$CUSTODY_OUTCOME" = success || exit 0
+          test -f base-receipt/custody.txt && test ! -L base-receipt/custody.txt || exit 1
+          printf '%s\n' 'LOCAL_TWO_ARCH_BASE_INHERITANCE_ONLY' 'release_admission=NO' 'legal_admission=NO' 'base_package_notice_coverage=UNPROVEN' 'pushed_image_parity=UNPROVEN' > base-receipt/status.pending || exit 1
+          mv -f -- base-receipt/status.pending base-receipt/status.txt || exit 1
+          printf '%s\n' COMPLETE > base-receipt/stage.txt
+
+      - name: Bound base custody text receipt
+        id: bound-base
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          refuse() { echo 'base receipt bounds failure' >&2; exit 1; }
+          test -d base-receipt && test ! -L base-receipt || refuse
+          test -f base-receipt/status.txt && test ! -L base-receipt/status.txt || refuse
+          test -f base-receipt/stage.txt && test ! -L base-receipt/stage.txt || refuse
+          test -z "$(find base-receipt ! -type f ! -type d -print -quit)" || refuse
+          file_count=0
+          total_bytes=0
+          while IFS= read -r path; do
+            case "$path" in base-receipt/status.txt|base-receipt/stage.txt|base-receipt/identity.txt|base-receipt/custody.txt) ;; *) refuse ;; esac
+            bytes=$(wc -c < "$path") || refuse
+            test "$bytes" -gt 0 && test "$bytes" -le 2048 || refuse
+            if LC_ALL=C grep -qvE '^[A-Za-z0-9_=/:-]+$' "$path"; then
+              refuse
+            else
+              grep_status=$?
+              test "$grep_status" -eq 1 || refuse
+            fi
+            file_count=$((file_count + 1))
+            total_bytes=$((total_bytes + bytes))
+          done < <(find base-receipt -type f -print)
+          test "$file_count" -ge 2 && test "$file_count" -le 4 || refuse
+          test "$total_bytes" -le 8192 || refuse
+          case "$(cat base-receipt/stage.txt)" in
+            FETCH|BASE_INDEX|BUILDER|BUILD_AMD64|BUILD_ARM64|STRIP_AMD64|STRIP_ARM64|TAR_AMD64|TAR_ARM64|IMAGE_BUILD_AMD64|IMAGE_BUILD_ARM64|BASE_MANIFEST_AMD64|BASE_MANIFEST_ARM64|BASE_PULL_AMD64|BASE_PULL_ARM64|BASE_CREATE_AMD64|BASE_CREATE_ARM64|IMAGE_CREATE_AMD64|IMAGE_CREATE_ARM64|BASE_EXPORT_AMD64|BASE_EXPORT_ARM64|IMAGE_EXPORT_AMD64|IMAGE_EXPORT_ARM64|CUSTODY|PKG_SCAN_AMD64|PKG_PAIR_AMD64|PKG_CONTROL_AMD64|PKG_CTRL_NAME_AMD64|PKG_CTRL_UTF8_AMD64|PKG_SUMS_UTF8_AMD64|PKG_CTRL_LINE_AMD64|PKG_CTRL_DUP_AMD64|PKG_CTRL_PACKAGE_AMD64|PKG_CTRL_REQUIRED_AMD64|PKG_CTRL_LENGTH_AMD64|PKG_CTRL_VERSION_AMD64|PKG_CTRL_ARCH_AMD64|PKG_SUMS_AMD64|PKG_NOTICE_AMD64|PKG_DONE_AMD64|PKG_SCAN_ARM64|PKG_PAIR_ARM64|PKG_CONTROL_ARM64|PKG_CTRL_NAME_ARM64|PKG_CTRL_UTF8_ARM64|PKG_SUMS_UTF8_ARM64|PKG_CTRL_LINE_ARM64|PKG_CTRL_DUP_ARM64|PKG_CTRL_PACKAGE_ARM64|PKG_CTRL_REQUIRED_ARM64|PKG_CTRL_LENGTH_ARM64|PKG_CTRL_VERSION_ARM64|PKG_CTRL_ARCH_ARM64|PKG_SUMS_ARM64|PKG_NOTICE_ARM64|PKG_DONE_ARM64|VERIFIED|COMPLETE) ;;
+            *) refuse ;;
+          esac
+
+      - name: Retain bounded base custody receipt
+        if: ${{ always() && steps.bound-base.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: moth-pr8-base-custody-${{ github.sha }}
+          path: base-receipt/
+          if-no-files-found: error
+          retention-days: 7
