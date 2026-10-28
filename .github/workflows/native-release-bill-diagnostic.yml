@@ -291,10 +291,29 @@ jobs:
             > "$RUNNER_TEMP/moth-map-shape-cargo.log" 2>&1
           test -s agent-native-link.map
           test "$(wc -c < agent-native-link.map)" -le 16777216
+          docker run --rm moth-map-shape-builder:diagnostic sh -eu -c '
+            linker="$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-lld"
+            test -x "$linker"
+            "$linker" --version
+            sha256sum "$linker" | cut -d " " -f 1
+            rustc -vV
+          ' > "$RUNNER_TEMP/moth-map-shape-linker.log" 2>&1
           python3 - <<'PY'
           from collections import Counter
           from pathlib import Path
+          import os
           import re
+
+          tool_lines = (Path(os.environ['RUNNER_TEMP']) / 'moth-map-shape-linker.log').read_text().splitlines()
+          if len(tool_lines) < 5:
+              raise SystemExit('linker identity incomplete')
+          lld = re.fullmatch(r'LLD ([0-9]+\.[0-9]+\.[0-9]+)(?: .*)?', tool_lines[0])
+          linker_sha = re.fullmatch(r'[0-9a-f]{64}', tool_lines[1])
+          rustc_release = [line.removeprefix('release: ') for line in tool_lines if line.startswith('release: ')]
+          rustc_commit = [line.removeprefix('commit-hash: ') for line in tool_lines if line.startswith('commit-hash: ')]
+          llvm_version = [line.removeprefix('LLVM version: ') for line in tool_lines if line.startswith('LLVM version: ')]
+          if not lld or not linker_sha or rustc_release != ['1.94.1'] or len(rustc_commit) != 1 or not re.fullmatch(r'[0-9a-f]{40}', rustc_commit[0]) or len(llvm_version) != 1 or not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', llvm_version[0]):
+              raise SystemExit('linker identity unexpected')
 
           phase = 'PRELUDE'
           count = 0
@@ -302,6 +321,9 @@ jobs:
           line_count = 0
           shapes = Counter()
           grammars = Counter()
+          native_rows = Counter()
+          isc_rows = Counter()
+          native_archives = {name: set() for name in ('curl_sys', 'openssl_sys', 'libz_sys')}
           samples = {}
           contexts = {}
           pending = None
@@ -350,6 +372,12 @@ jobs:
                   return 'CLOSED'
               return 'TRAILING'
 
+          def native_family(section):
+              for family in ('text', 'rodata', 'data', 'bss', 'eh_frame', 'debug'):
+                  if section == '.' + family or section.startswith('.' + family + '.') or section.startswith('.' + family + '+'):
+                      return family
+              return 'other'
+
           with Path('agent-native-link.map').open(encoding='utf-8', errors='replace') as source:
               for line in source:
                   line_count += 1
@@ -390,6 +418,25 @@ jobs:
                   columns = tuple(numeric_kind(word) for word in words[:4])
                   grammar_key = (phase, columns, min(len(words), 8), min(member_index, 8), member_kind(words[member_index]))
                   grammars[grammar_key] += 1
+                  if phase != 'LLD_TABLE' or len(words) != 5 or member_index != 4 or member_kind(words[4]) != 'SECTION_SUFFIX' or any(numeric_kind(word) == 'OTHER' for word in words[:4]):
+                      raise SystemExit('LLD member row grammar unexpected')
+                  member = re.fullmatch(r'([^\s()]+\.rlib)\(([^()]+)\):\(([^()]+)\)', words[4])
+                  if not member:
+                      raise SystemExit('LLD member identity unexpected')
+                  archive = Path(member[1]).name
+                  for crate in native_archives:
+                      prefix = 'lib' + crate + '-'
+                      if archive.startswith(prefix):
+                          if not re.fullmatch(re.escape(prefix) + r'[0-9a-f]+\.rlib', archive):
+                              raise SystemExit('native rlib identity unexpected')
+                          native_archives[crate].add(archive)
+                          size_class = 'zero' if int(words[2], 16) == 0 else 'positive'
+                          native_rows[(crate, native_family(member[3]), size_class)] += 1
+                          if crate == 'curl_sys':
+                              for stem in ('inet_ntop', 'inet_pton'):
+                                  if re.search(r'(?:^|-)' + stem + r'\.o$', member[2]):
+                                      isc_rows[(stem, size_class)] += 1
+                          break
                   if key not in samples:
                       hex_tokens = [word.lower() for word in words if re.fullmatch(r'0x[0-9a-fA-F]{1,16}', word)]
                       samples[key] = (hex_tokens + ['NONE', 'NONE'])[:2]
@@ -398,7 +445,12 @@ jobs:
                   previous = line
 
           with Path('map-shape/shape.txt').open('w') as receipt:
-              print('schema=map-shape-v3', file=receipt)
+              print('schema=map-shape-v4', file=receipt)
+              print(f'rustc_release={rustc_release[0]}', file=receipt)
+              print(f'rustc_commit={rustc_commit[0]}', file=receipt)
+              print(f'llvm_version={llvm_version[0]}', file=receipt)
+              print(f'lld_version={lld[1]}', file=receipt)
+              print(f'rust_lld_sha256={linker_sha[0]}', file=receipt)
               print(f'total_lines={line_count}', file=receipt)
               print(f'rlib_text_lines={count}', file=receipt)
               print(f'overlong_lines={overlong}', file=receipt)
@@ -419,8 +471,18 @@ jobs:
                   print(f'grammar_{index:02d}={phase_name}|{",".join(columns)}|words:{words}|member_column:{member_index}|member:{member}|count:{n}', file=receipt)
               print(f'grammar_overflow={str(len(grammars) > 64).lower()}', file=receipt)
               print(f'shape_overflow={str(len(shapes) > 64).lower()}', file=receipt)
+              for crate in native_archives:
+                  print(f'native_{crate}_rlib_count={len(native_archives[crate])}', file=receipt)
+                  for family in ('text', 'rodata', 'data', 'bss', 'eh_frame', 'debug', 'other'):
+                      for size_class in ('zero', 'positive'):
+                          print(f'native_{crate}_{family}_{size_class}_map_rows={native_rows[(crate, family, size_class)]}', file=receipt)
+              for stem in ('inet_ntop', 'inet_pton'):
+                  for size_class in ('zero', 'positive'):
+                      print(f'isc_{stem}_{size_class}_map_rows={isc_rows[(stem, size_class)]}', file=receipt)
           if not count or overlong or len(shapes) > 64 or len(grammars) > 64 or markers['LLD_HEADER'] != 1 or any(markers[name] for name in ('GNU_ARCHIVE', 'GNU_DISCARDED', 'GNU_ALLOCATED')):
               raise SystemExit('bounded map-shape sample incomplete')
+          if any(len(archives) > 1 for archives in native_archives.values()):
+              raise SystemExit('multiple native rlib identities')
           PY
       - name: Mark map-shape sample complete without admission
         shell: bash
@@ -436,7 +498,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          rm -f agent-native-link.map "$RUNNER_TEMP/moth-map-shape-builder.log" "$RUNNER_TEMP/moth-map-shape-cargo.log"
+          rm -f agent-native-link.map "$RUNNER_TEMP/moth-map-shape-builder.log" "$RUNNER_TEMP/moth-map-shape-cargo.log" "$RUNNER_TEMP/moth-map-shape-linker.log"
       - name: Bound fixed-grammar text receipt
         id: bound-map-shape
         if: always()
