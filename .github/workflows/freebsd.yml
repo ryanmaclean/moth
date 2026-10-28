@@ -349,11 +349,17 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/moth-parity/dist"
+          printf '%s\n' BUILDER_IMAGE > parity/stage.txt
           docker build --target builder -t moth-parity-builder:diagnostic . > "$RUNNER_TEMP/moth-parity-builder.log" 2>&1
-          docker run --rm moth-parity-builder:diagnostic rustc -V | grep -Eq '^rustc 1\.94\.1 '
-          docker run --rm moth-parity-builder:diagnostic rustc -vV | grep -Fxq 'commit-hash: e408947bfd200af42db322daf0fadfe7e26d3bd1'
-          linker_hash="$(docker run --rm moth-parity-builder:diagnostic sh -eu -c 'linker="$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-lld"; test -x "$linker"; "$linker" -flavor gnu --version | grep -Eq "^LLD 21\\.1\\.8 "; sha256sum "$linker" | cut -d " " -f 1')"
+          printf '%s\n' RUSTC_IDENTITY > parity/stage.txt
+          docker run --rm moth-parity-builder:diagnostic rustc -V > "$RUNNER_TEMP/moth-parity-rustc-version.log"
+          grep -Eq '^rustc 1\.94\.1 ' "$RUNNER_TEMP/moth-parity-rustc-version.log"
+          docker run --rm moth-parity-builder:diagnostic rustc -vV > "$RUNNER_TEMP/moth-parity-rustc-identity.log"
+          grep -Fxq 'commit-hash: e408947bfd200af42db322daf0fadfe7e26d3bd1' "$RUNNER_TEMP/moth-parity-rustc-identity.log"
+          printf '%s\n' LINKER_IDENTITY > parity/stage.txt
+          linker_hash="$(docker run --rm moth-parity-builder:diagnostic sh -eu -c 'linker="$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-lld"; test -x "$linker"; version="$("$linker" -flavor gnu --version)"; case "$version" in "LLD 21.1.8 "*) ;; *) exit 1 ;; esac; hash="$(sha256sum "$linker")"; printf "%s\n" "${hash%% *}"')"
           test "$linker_hash" = c30db53247911b065bf8b279bbbcdf8f516702750233a6e6ef815c1826b7ee53
+          printf '%s\n' CARGO_LINK_MAP > parity/stage.txt
           rm -f agent-native-link.map
           docker run --rm -v "$PWD:/work" -w /work moth-parity-builder:diagnostic \
             cargo rustc --release --locked --frozen --offline -p cli --bin agent \
@@ -362,6 +368,7 @@ jobs:
             > "$RUNNER_TEMP/moth-parity-cargo.log" 2>&1
           test -s agent-native-link.map
           test "$(wc -c < agent-native-link.map)" -le 16777216
+          printf '%s\n' MAP_PARSE > parity/stage.txt
           python3 - <<'PY'
           from collections import Counter
           from pathlib import Path
@@ -434,9 +441,11 @@ jobs:
                   for size_class in ('zero', 'positive'):
                       print(f'isc_{stem}_{size_class}_map_rows={isc[(stem, size_class)]}', file=receipt)
           PY
+          printf '%s\n' STRIP > parity/stage.txt
           docker run --rm -v "$PWD:/work" -w /work moth-parity-builder:diagnostic \
             strip target/x86_64-unknown-linux-gnu/release/agent
           printf 'stripped_agent_sha256=%s\n' "$(sha256sum target/x86_64-unknown-linux-gnu/release/agent | cut -d' ' -f1)" >> parity/map-join.txt
+          printf '%s\n' TAR_STAGE > parity/stage.txt
           stage=agent-parity-diagnostic-x86_64-unknown-linux-gnu
           mkdir -p "$RUNNER_TEMP/moth-parity/dist/$stage/THIRD_PARTY_NOTICES/native"
           cp target/x86_64-unknown-linux-gnu/release/agent "$RUNNER_TEMP/moth-parity/dist/$stage/"
@@ -454,6 +463,7 @@ jobs:
           done < packaging/native-notice-files.txt
           cp packaging/native-notice-files.txt "$RUNNER_TEMP/moth-parity/dist/$stage/THIRD_PARTY_NOTICES/native/FILES.txt"
           tar -C "$RUNNER_TEMP/moth-parity/dist" -czf "$RUNNER_TEMP/moth-parity/candidate.tar.gz" "$stage"
+          printf '%s\n' TAR_VERIFY > parity/stage.txt
           python3 - "$RUNNER_TEMP/moth-parity/candidate.tar.gz" "$stage" <<'PY'
           import hashlib
           from pathlib import Path
@@ -504,20 +514,24 @@ jobs:
               f'tar_sha256={sha(archive)}\ntar_agent_sha256={sha(payload / "agent")}\n'
           )
           PY
+          printf '%s\n' TAR_READY > parity/stage.txt
 
       - name: Build local release-only OCI and compare exported bytes
         shell: bash
         run: |
           set -euo pipefail
+          printf '%s\n' OCI_BUILD > parity/stage.txt
           docker build --platform linux/amd64 --target runtime --file Dockerfile.release \
             --build-arg TARGETARCH=amd64 \
             --build-arg "REPO_SOURCE=https://github.com/$GITHUB_REPOSITORY" \
             --build-arg "SOURCE_REVISION=$GITHUB_SHA" \
             --tag moth-parity-runtime:diagnostic . > "$RUNNER_TEMP/moth-parity-oci.log" 2>&1
           docker image inspect --format 'runtime_image={{.Id}}' moth-parity-runtime:diagnostic > parity/image.txt
+          printf '%s\n' OCI_EXPORT > parity/stage.txt
           container=$(docker create --platform linux/amd64 moth-parity-runtime:diagnostic)
           printf '%s\n' "$container" > "$RUNNER_TEMP/moth-parity/container-id"
           docker export "$container" > "$RUNNER_TEMP/moth-parity/rootfs.tar"
+          printf '%s\n' OCI_COMPARE > parity/stage.txt
           python3 - "$RUNNER_TEMP/moth-parity/rootfs.tar" <<'PY'
           import hashlib
           from pathlib import Path
@@ -553,6 +567,7 @@ jobs:
               print('oci_agent_sha256=' + oci_agent_hash, file=receipt)
               print('tar_oci_binary_identity=yes', file=receipt)
           PY
+          printf '%s\n' OCI_READY > parity/stage.txt
 
       - name: Mark local release-layout parity diagnostic complete
         shell: bash
@@ -565,6 +580,7 @@ jobs:
           test "$(grep -c '^tar_agent_sha256=' parity/tar-sha256.txt)" -eq 1
           test "$(sed -n 's/^stripped_agent_sha256=//p' parity/map-join.txt)" = "$(sed -n 's/^tar_agent_sha256=//p' parity/tar-sha256.txt)"
           printf '%s\n' 'LOCAL_NATIVE_MAP_RELEASE_LAYOUT_JOIN_ONLY' 'release_admission=NO' 'legal_admission=NO' 'pushed_image_parity=UNPROVEN' 'native_link_retention=LOCAL_LLD_ROWS_OBSERVED' 'selected_native_bytes=UNPROVEN' 'notice_custody=LOCAL_14_SOURCE_TAR_OCI_BYTE_JOIN' 'base_image_notice_coverage=UNPROVEN' > parity/status.txt
+          printf '%s\n' COMPLETE > parity/stage.txt
 
       - name: Remove private parity payloads and containers
         if: always()
@@ -576,10 +592,10 @@ jobs:
           fi
           rm -rf "$RUNNER_TEMP/moth-parity" "$GITHUB_WORKSPACE/release-payload"
           rm -f agent-native-link.map target/x86_64-unknown-linux-gnu/release/agent
-          rm -f "$RUNNER_TEMP/moth-parity-builder.log" "$RUNNER_TEMP/moth-parity-cargo.log" "$RUNNER_TEMP/moth-parity-oci.log"
+          rm -f "$RUNNER_TEMP/moth-parity-builder.log" "$RUNNER_TEMP/moth-parity-rustc-version.log" "$RUNNER_TEMP/moth-parity-rustc-identity.log" "$RUNNER_TEMP/moth-parity-cargo.log" "$RUNNER_TEMP/moth-parity-oci.log"
           for private in agent-native-link.map target/x86_64-unknown-linux-gnu/release/agent \
             "$RUNNER_TEMP/moth-parity" "$GITHUB_WORKSPACE/release-payload" \
-            "$RUNNER_TEMP/moth-parity-builder.log" "$RUNNER_TEMP/moth-parity-cargo.log" "$RUNNER_TEMP/moth-parity-oci.log"; do
+            "$RUNNER_TEMP/moth-parity-builder.log" "$RUNNER_TEMP/moth-parity-rustc-version.log" "$RUNNER_TEMP/moth-parity-rustc-identity.log" "$RUNNER_TEMP/moth-parity-cargo.log" "$RUNNER_TEMP/moth-parity-oci.log"; do
             test ! -e "$private" && test ! -L "$private"
           done
 
@@ -591,15 +607,23 @@ jobs:
           set -euo pipefail
           test -d parity && test ! -L parity
           test -f parity/status.txt
-          test "$(find parity -type f | wc -l)" -le 6
+          test "$(find parity -type f | wc -l)" -le 7
           test -z "$(find parity ! -type f ! -type d -print -quit)"
           while IFS= read -r path; do
             case "$path" in
-              parity/status.txt|parity/identity.txt|parity/tar-sha256.txt|parity/image.txt|parity/text-sha256.txt|parity/map-join.txt) ;;
+              parity/status.txt|parity/identity.txt|parity/tar-sha256.txt|parity/image.txt|parity/text-sha256.txt|parity/map-join.txt|parity/stage.txt) ;;
               *) exit 1 ;;
             esac
             test "$(wc -c < "$path")" -le 8192
           done < <(find parity -type f -print)
+          if test -f parity/stage.txt; then
+            test "$(wc -l < parity/stage.txt)" -eq 1
+            test "$(wc -c < parity/stage.txt)" -le 32
+            case "$(cat parity/stage.txt)" in
+              BUILDER_IMAGE|RUSTC_IDENTITY|LINKER_IDENTITY|CARGO_LINK_MAP|MAP_PARSE|STRIP|TAR_STAGE|TAR_VERIFY|TAR_READY|OCI_BUILD|OCI_EXPORT|OCI_COMPARE|OCI_READY|COMPLETE) ;;
+              *) exit 1 ;;
+            esac
+          fi
           test "$(du -sk parity | cut -f1)" -le 64
 
       - name: Retain parity diagnostic receipt
