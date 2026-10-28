@@ -32,6 +32,11 @@ on:
         required: false
         type: boolean
         default: false
+      base_custody:
+        description: 'Run separate no-publish amd64/arm64 base notice and payload custody diagnostic'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   freebsd:
@@ -130,7 +135,7 @@ jobs:
             done
 
   notice-placement-linux:
-    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/fix/native-notice-packaging-pr5' && !inputs.release_parity
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/fix/native-notice-packaging-pr5' && !inputs.release_parity && !inputs.base_custody
     runs-on: ubuntu-22.04
     timeout-minutes: 75
     permissions:
@@ -164,7 +169,7 @@ jobs:
             'befd91e188696989d415870792acb3f9fa5a5d3bd79fe8823989264714b6fe51  Cargo.lock' \
             '392a5a80e863151504fa05add58ea97b98a4a7a57e36cd26436734a95465650a  Dockerfile' \
             'ae3f5acdad3187723f7779ae725467a51d80e2609f6c509c8ab43c935b3f58a6  .github/workflows/release.yml' \
-            '034a52f7f3e0ee8cc04ca738143fee3885d8cff65cda1b001b96c69fd4359448  Dockerfile.release' \
+            '8aecec600179b49cd5a1a8a4feede8e86c1fa2717c75752827201f476bf0ef4a  Dockerfile.release' \
             '6321279cc4a58259e29638a1f7c6621184b07576e8a70728b2b5bb48d761d83c  packaging/native-notice-files.txt' \
             '59d5f1cb240a41f1a4acea088ca1f964b0e9d81c6afea1cc748988f5bdb1a533  .dockerignore' \
             | sha256sum --check --status
@@ -302,7 +307,7 @@ jobs:
           retention-days: 7
 
   release-parity-linux:
-    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/fix/native-notice-packaging-pr5' && inputs.release_parity
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/fix/native-notice-packaging-pr5' && inputs.release_parity && !inputs.base_custody
     runs-on: ubuntu-22.04
     timeout-minutes: 75
     permissions:
@@ -334,7 +339,7 @@ jobs:
           printf '%s\n' \
             'befd91e188696989d415870792acb3f9fa5a5d3bd79fe8823989264714b6fe51  Cargo.lock' \
             '392a5a80e863151504fa05add58ea97b98a4a7a57e36cd26436734a95465650a  Dockerfile' \
-            '034a52f7f3e0ee8cc04ca738143fee3885d8cff65cda1b001b96c69fd4359448  Dockerfile.release' \
+            '8aecec600179b49cd5a1a8a4feede8e86c1fa2717c75752827201f476bf0ef4a  Dockerfile.release' \
             'ae3f5acdad3187723f7779ae725467a51d80e2609f6c509c8ab43c935b3f58a6  .github/workflows/release.yml' \
             '6321279cc4a58259e29638a1f7c6621184b07576e8a70728b2b5bb48d761d83c  packaging/native-notice-files.txt' \
             '59d5f1cb240a41f1a4acea088ca1f964b0e9d81c6afea1cc748988f5bdb1a533  .dockerignore' \
@@ -1209,5 +1214,251 @@ jobs:
         with:
           name: moth-pr8-release-layout-parity-${{ github.sha }}
           path: parity/
+          if-no-files-found: error
+          retention-days: 7
+
+  base-custody-linux:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/fix/native-notice-packaging-pr5' && inputs.base_custody && !inputs.release_parity
+    runs-on: ubuntu-22.04
+    timeout-minutes: 75
+    permissions:
+      contents: read
+    steps:
+      - name: Fetch exact reviewed PR8 source for no-publish base rehearsal
+        shell: bash
+        env:
+          REVIEWED_SHA: ${{ inputs.notice_head_sha }}
+          GIT_TERMINAL_PROMPT: '0'
+          GIT_ASKPASS: /bin/false
+        run: |
+          set -euo pipefail
+          mkdir -p base-receipt
+          printf '%s\n' 'INCOMPLETE' 'release_admission=NO' 'legal_admission=NO' > base-receipt/status.txt
+          printf '%s\n' FETCH > base-receipt/stage.txt
+          [[ "$REVIEWED_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$REVIEWED_SHA" = "$GITHUB_SHA"
+          test -z "$(find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 ! -name base-receipt -print -quit)"
+          git init -q "$GITHUB_WORKSPACE"
+          git remote add origin https://github.com/ryanmaclean/moth.git
+          git -c credential.helper= fetch --no-tags --no-recurse-submodules --depth=128 origin refs/pull/8/head
+          test "$(git rev-parse FETCH_HEAD)" = "$REVIEWED_SHA"
+          git -c submodule.recurse=false checkout --detach --force "$REVIEWED_SHA"
+          test "$(git rev-parse HEAD)" = "$REVIEWED_SHA"
+          test "$(git merge-base HEAD 2ad30129a9af231b687b8821f2b9d062e41992f9)" = 2ad30129a9af231b687b8821f2b9d062e41992f9
+          git diff --name-only 2ad30129a9af231b687b8821f2b9d062e41992f9 HEAD | sort | diff -u <(printf '%s\n' '.github/workflows/freebsd.yml' '.github/workflows/release.yml' 'Dockerfile' 'Dockerfile.release' 'packaging/native-notice-files.txt' | sort) -
+          printf '%s\n' \
+            'befd91e188696989d415870792acb3f9fa5a5d3bd79fe8823989264714b6fe51  Cargo.lock' \
+            '392a5a80e863151504fa05add58ea97b98a4a7a57e36cd26436734a95465650a  Dockerfile' \
+            '8aecec600179b49cd5a1a8a4feede8e86c1fa2717c75752827201f476bf0ef4a  Dockerfile.release' \
+            'ae3f5acdad3187723f7779ae725467a51d80e2609f6c509c8ab43c935b3f58a6  .github/workflows/release.yml' \
+            '6321279cc4a58259e29638a1f7c6621184b07576e8a70728b2b5bb48d761d83c  packaging/native-notice-files.txt' \
+            '59d5f1cb240a41f1a4acea088ca1f964b0e9d81c6afea1cc748988f5bdb1a533  .dockerignore' \
+            | sha256sum --check --status
+          grep -Fxq 'FROM gcr.io/distroless/cc-debian12@sha256:e5d81ddde149641e2a9ba55be4545bc125c67de07508b03ba4c22e6eb0ded5aa AS runtime' Dockerfile.release
+          test -z "$(git status --porcelain --untracked-files=no)"
+          printf 'source_head=%s\nbase_index=sha256:e5d81ddde149641e2a9ba55be4545bc125c67de07508b03ba4c22e6eb0ded5aa\n' "$REVIEWED_SHA" > base-receipt/identity.txt
+
+      - name: Build two same-run release-layout payloads and private local images
+        shell: bash
+        run: |
+          set -euo pipefail
+          private="$RUNNER_TEMP/moth-base-custody"
+          mkdir -p "$private" release-payload
+          printf '%s\n' BASE_INDEX > base-receipt/stage.txt
+          docker buildx imagetools inspect --raw gcr.io/distroless/cc-debian12@sha256:e5d81ddde149641e2a9ba55be4545bc125c67de07508b03ba4c22e6eb0ded5aa > "$private/base-index.json" 2> "$private/registry.log"
+          jq -e '([.manifests[] | select(.platform.os == "linux" and (.platform.architecture == "amd64" or .platform.architecture == "arm64")) | .platform.architecture] | sort) == ["amd64", "arm64"]' "$private/base-index.json" >/dev/null
+          printf '%s\n' BUILDER > base-receipt/stage.txt
+          docker build --target builder -t moth-base-custody-builder:local . > "$private/builder.log" 2>&1
+          for pair in amd64:x86_64-unknown-linux-gnu arm64:aarch64-unknown-linux-gnu; do
+            arch="${pair%%:*}" target="${pair#*:}"
+            printf '%s\n' BUILD > base-receipt/stage.txt
+            timeout 45m docker run --rm -v "$PWD:/work" -w /work moth-base-custody-builder:local \
+              cargo build --release --locked --frozen --offline -p cli --target "$target" > "$private/build-$arch.log" 2>&1
+            if test "$arch" = arm64; then strip_cmd='aarch64-linux-gnu-strip'; else strip_cmd='strip'; fi
+            docker run --rm -v "$PWD:/work" -w /work moth-base-custody-builder:local \
+              "$strip_cmd" "target/$target/release/agent" > "$private/strip-$arch.log" 2>&1
+            mkdir -p "release-payload/$arch/native" "$private/stage-$arch/THIRD_PARTY_NOTICES/native"
+            cp "target/$target/release/agent" "release-payload/$arch/agent"
+            cp LICENSE "release-payload/$arch/LICENSE"
+            cp packaging/native-notice-files.txt "release-payload/$arch/native/FILES.txt"
+            cp "release-payload/$arch/agent" "$private/stage-$arch/agent"
+            cp LICENSE README.md CHANGELOG.md "$private/stage-$arch/"
+            cp packaging/native-notice-files.txt "$private/stage-$arch/THIRD_PARTY_NOTICES/native/FILES.txt"
+            while IFS= read -r source; do
+              case "$source" in vendor/*) ;; *) exit 1 ;; esac
+              case "$source" in *..*|*//*) exit 1 ;; esac
+              test -f "$source" && test ! -L "$source"
+              mkdir -p "release-payload/$arch/native/$(dirname "$source")" "$private/stage-$arch/THIRD_PARTY_NOTICES/native/$(dirname "$source")"
+              cp "$source" "release-payload/$arch/native/$source"
+              cp "$source" "$private/stage-$arch/THIRD_PARTY_NOTICES/native/$source"
+            done < packaging/native-notice-files.txt
+            tar -C "$private" -czf "$private/candidate-$arch.tar.gz" "stage-$arch"
+            printf '%s\n' LOCAL_IMAGE > base-receipt/stage.txt
+            docker build --platform "linux/$arch" --file Dockerfile.release \
+              --build-arg TARGETARCH="$arch" --build-arg SOURCE_REVISION="$GITHUB_SHA" \
+              -t "moth-base-custody-$arch:local" . > "$private/image-$arch.log" 2>&1
+            digest=$(jq -er --arg arch "$arch" '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == $arch) | .digest] | if length == 1 then .[0] else empty end' "$private/base-index.json")
+            [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+            if test "$arch" = amd64; then
+              test "$digest" = sha256:6dc8478fd8e790ae427aeff51e588573dec83b13adb7e5d10505a717927009b5
+            else
+              test "$digest" = sha256:4bed9c8eff0e70bf6547aa04a3b1ea5bba63fb910707b3f94f45556edc2a9238
+            fi
+            printf '%s_base_manifest=%s\n' "$arch" "$digest" >> base-receipt/identity.txt
+            docker pull --platform "linux/$arch" "gcr.io/distroless/cc-debian12@$digest" > "$private/pull-$arch.log" 2>&1
+            docker create --name "moth-base-custody-base-$arch" --platform "linux/$arch" "gcr.io/distroless/cc-debian12@$digest" > "$private/create-base-$arch.log" 2>&1
+            docker create --name "moth-base-custody-image-$arch" --platform "linux/$arch" "moth-base-custody-$arch:local" > "$private/create-image-$arch.log" 2>&1
+            docker export "moth-base-custody-base-$arch" > "$private/base-$arch.tar"
+            docker export "moth-base-custody-image-$arch" > "$private/image-$arch.tar"
+          done
+
+      - name: Compare private tar, base and composed bytes with bounded receipt
+        id: custody-complete
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s\n' CUSTODY > base-receipt/stage.txt
+          python3 - <<'PY'
+          import hashlib
+          import os
+          from pathlib import Path
+          import tarfile
+
+          private = Path(os.environ['RUNNER_TEMP']) / 'moth-base-custody'
+          manifest = Path('packaging/native-notice-files.txt').read_text().splitlines()
+          def require(condition):
+              if not condition:
+                  raise SystemExit('base custody mismatch') from None
+          def snapshot(path):
+              result = {}
+              require(path.is_file() and 0 < path.stat().st_size <= 268435456)
+              with tarfile.open(path, 'r:') as archive:
+                  for member in archive:
+                      name = member.name.removeprefix('./').lstrip('/')
+                      require(len(name) <= 4096 and '..' not in name.split('/'))
+                      require(len(result) < 50000)
+                      require(name not in result)
+                      if member.isfile():
+                          require(0 <= member.size <= 100 * 1024 * 1024)
+                          stream = archive.extractfile(member)
+                          require(stream is not None)
+                          digest = hashlib.sha256()
+                          while chunk := stream.read(1024 * 1024):
+                              digest.update(chunk)
+                          result[name] = ('file', member.size, digest.hexdigest())
+                      else:
+                          result[name] = ('other', 0, '')
+              return result
+          def local(path):
+              require(path.is_file() and not path.is_symlink())
+              data = path.read_bytes()
+              require(len(data) <= 100 * 1024 * 1024)
+              return ('file', len(data), hashlib.sha256(data).hexdigest())
+          try:
+              require(len(manifest) == len(set(manifest)) == 14)
+              with Path('base-receipt/custody.txt').open('w', encoding='ascii') as out:
+                  print('schema=moth-local-base-custody/v1', file=out)
+                  for arch in ('amd64', 'arm64'):
+                      base = snapshot(private / f'base-{arch}.tar')
+                      image = snapshot(private / f'image-{arch}.tar')
+                      require(0 < (private / f'candidate-{arch}.tar.gz').stat().st_size <= 134217728)
+                      with tarfile.open(private / f'candidate-{arch}.tar.gz', 'r:gz') as archive:
+                          tar_members = {}
+                          for member in archive:
+                              if member.isfile():
+                                  require(len(member.name) <= 4096 and '..' not in member.name.split('/'))
+                                  require(member.name not in tar_members and member.size <= 100 * 1024 * 1024)
+                                  stream = archive.extractfile(member)
+                                  require(stream is not None)
+                                  data = stream.read()
+                                  tar_members[member.name] = ('file', len(data), hashlib.sha256(data).hexdigest())
+                      payload = Path('release-payload') / arch
+                      wanted = {'usr/local/bin/agent': payload / 'agent',
+                                'usr/share/licenses/moth/LICENSE': payload / 'LICENSE',
+                                'usr/share/doc/moth/THIRD_PARTY_NOTICES/native/FILES.txt': payload / 'native/FILES.txt'}
+                      wanted.update({f'usr/share/doc/moth/THIRD_PARTY_NOTICES/native/{name}': payload / 'native' / name for name in manifest})
+                      require(len(tar_members) == len(wanted) + 2)
+                      for extra in ('README.md', 'CHANGELOG.md'):
+                          require(tar_members.get(f'stage-{arch}/{extra}') == local(Path(extra)))
+                      for dest, source in wanted.items():
+                          require(image.get(dest) == local(source))
+                          relative = dest.replace('usr/local/bin/', '').replace('usr/share/licenses/moth/', '').replace('usr/share/doc/moth/', '')
+                          require(tar_members.get(f'stage-{arch}/{relative}') == local(source))
+                      native_prefix = 'usr/share/doc/moth/THIRD_PARTY_NOTICES/native/'
+                      require(sum(k.startswith(native_prefix) and v[0] == 'file' for k, v in image.items()) == 15)
+                      notice = {k: v for k, v in base.items() if v[0] == 'file' and (
+                          (k.startswith('usr/share/doc/') and
+                           k.rsplit('/', 1)[-1].lower().startswith(('copyright', 'license', 'copying', 'notice'))) or
+                          k.startswith('usr/share/licenses/') or k.startswith('licenses/'))}
+                      package_meta = {k: v for k, v in base.items() if v[0] == 'file' and (
+                          k.startswith('var/lib/dpkg/status.d/') or k == 'var/lib/dpkg/status' or
+                          k.endswith('.spdx.json') or k.endswith('.spdx'))}
+                      require(0 < len(notice) <= 4096 and 0 < len(package_meta) <= 4096)
+                      require(all(image.get(k) == v for k, v in notice.items()))
+                      require(all(image.get(k) == v for k, v in package_meta.items()))
+                      print(f'{arch}_agent_sha256={local(payload / "agent")[2]}', file=out)
+                      print(f'{arch}_native_notice_files=15', file=out)
+                      print(f'{arch}_base_notice_paths_inherited={len(notice)}', file=out)
+                      print(f'{arch}_base_package_metadata_paths_inherited={len(package_meta)}', file=out)
+                  print('base_notice_inheritance=EXACT_PATH_BYTES_FOR_OBSERVED_FILES', file=out)
+                  print('base_package_notice_coverage=UNPROVEN', file=out)
+                  print('pushed_image_parity=UNPROVEN', file=out)
+          except Exception:
+              raise SystemExit('base custody private data invalid') from None
+          PY
+          printf '%s\n' VERIFIED > base-receipt/stage.txt
+
+      - name: Remove private base rehearsal payloads and containers
+        if: always()
+        shell: bash
+        env:
+          CUSTODY_OUTCOME: ${{ steps.custody-complete.outcome }}
+        run: |
+          set -uo pipefail
+          ok=1
+          for arch in amd64 arm64; do
+            docker rm -f "moth-base-custody-base-$arch" "moth-base-custody-image-$arch" >/dev/null 2>&1 || true
+            docker image rm -f "moth-base-custody-$arch:local" >/dev/null 2>&1 || true
+            docker container inspect "moth-base-custody-base-$arch" >/dev/null 2>&1 && ok=0
+            docker container inspect "moth-base-custody-image-$arch" >/dev/null 2>&1 && ok=0
+            docker image inspect "moth-base-custody-$arch:local" >/dev/null 2>&1 && ok=0
+          done
+          docker image rm -f moth-base-custody-builder:local >/dev/null 2>&1 || true
+          docker image inspect moth-base-custody-builder:local >/dev/null 2>&1 && ok=0
+          sudo -n rm -rf -- "$RUNNER_TEMP/moth-base-custody" "$GITHUB_WORKSPACE/release-payload" "$GITHUB_WORKSPACE/target" || ok=0
+          for private in "$RUNNER_TEMP/moth-base-custody" "$GITHUB_WORKSPACE/release-payload" "$GITHUB_WORKSPACE/target"; do
+            { test ! -e "$private" && test ! -L "$private"; } || ok=0
+          done
+          test "$ok" -eq 1 || exit 1
+          test "$CUSTODY_OUTCOME" = success || exit 0
+          test -f base-receipt/custody.txt && test ! -L base-receipt/custody.txt || exit 1
+          printf '%s\n' 'LOCAL_TWO_ARCH_BASE_INHERITANCE_ONLY' 'release_admission=NO' 'legal_admission=NO' 'base_package_notice_coverage=UNPROVEN' 'pushed_image_parity=UNPROVEN' > base-receipt/status.pending || exit 1
+          mv -f -- base-receipt/status.pending base-receipt/status.txt || exit 1
+          printf '%s\n' COMPLETE > base-receipt/stage.txt
+
+      - name: Bound base custody text receipt
+        id: bound-base
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -d base-receipt && test ! -L base-receipt
+          test -f base-receipt/status.txt && test ! -L base-receipt/status.txt
+          test "$(find base-receipt -type f | wc -l)" -le 4
+          test -z "$(find base-receipt ! -type f ! -type d -print -quit)"
+          while IFS= read -r path; do
+            case "$path" in base-receipt/status.txt|base-receipt/stage.txt|base-receipt/identity.txt|base-receipt/custody.txt) ;; *) exit 1 ;; esac
+            test "$(wc -c < "$path")" -le 2048
+            test -s "$path"
+            if LC_ALL=C grep -qvE '^[A-Za-z0-9_=/:-]+$' "$path"; then exit 1; fi
+          done < <(find base-receipt -type f -print)
+          test "$(du -sk base-receipt | cut -f1)" -le 16
+
+      - name: Retain bounded base custody receipt
+        if: ${{ always() && steps.bound-base.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: moth-pr8-base-custody-${{ github.sha }}
+          path: base-receipt/
           if-no-files-found: error
           retention-days: 7

@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.6
 # Release-only assembly. The payload comes from this workflow run's checked
 # Linux tar artifacts; this Dockerfile does not recompile the agent.
-FROM gcr.io/distroless/cc-debian12 AS runtime
+FROM gcr.io/distroless/cc-debian12@sha256:e5d81ddde149641e2a9ba55be4545bc125c67de07508b03ba4c22e6eb0ded5aa AS runtime
 
 ARG TARGETARCH
 ARG REPO_SOURCE="https://github.com/ryanmaclean/moth"
