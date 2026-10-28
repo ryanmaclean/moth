@@ -264,6 +264,7 @@ jobs:
           set -euo pipefail
           mkdir -p map-shape
           printf '%s\n' 'INCOMPLETE' 'release_admission=NO' 'legal_admission=NO' 'selected_native_bytes=UNPROVEN' > map-shape/status.txt
+          printf '%s\n' 'SOURCE_GUARD' > map-shape/stage.txt
           [[ "$EXPECTED_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
           test "$EXPECTED_HEAD_SHA" = "$GITHUB_SHA"
           test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD_SHA"
@@ -283,14 +284,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          printf '%s\n' 'BUILDER_IMAGE' > map-shape/stage.txt
           docker build --target builder -t moth-map-shape-builder:diagnostic . > "$RUNNER_TEMP/moth-map-shape-builder.log" 2>&1
+          printf '%s\n' 'CARGO_LINK_MAP' > map-shape/stage.txt
           docker run --rm -v "$PWD:/work" -w /work moth-map-shape-builder:diagnostic \
             cargo rustc --release --locked --frozen --offline -p cli \
               --bin agent --target x86_64-unknown-linux-gnu -- \
               -C link-arg=-Wl,-Map=/work/agent-native-link.map \
             > "$RUNNER_TEMP/moth-map-shape-cargo.log" 2>&1
+          printf '%s\n' 'MAP_GUARD' > map-shape/stage.txt
           test -s agent-native-link.map
           test "$(wc -c < agent-native-link.map)" -le 16777216
+          printf '%s\n' 'LINKER_IDENTITY_COMMAND' > map-shape/stage.txt
           docker run --rm moth-map-shape-builder:diagnostic sh -eu -c '
             linker="$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-lld"
             test -x "$linker"
@@ -298,6 +303,7 @@ jobs:
             sha256sum "$linker" | cut -d " " -f 1
             rustc -vV
           ' > "$RUNNER_TEMP/moth-map-shape-linker.log" 2>&1
+          printf '%s\n' 'LINKER_IDENTITY_PARSE' > map-shape/stage.txt
           python3 - <<'PY'
           from collections import Counter
           from pathlib import Path
@@ -314,6 +320,7 @@ jobs:
           llvm_version = [line.removeprefix('LLVM version: ') for line in tool_lines if line.startswith('LLVM version: ')]
           if not lld or not linker_sha or rustc_release != ['1.94.1'] or len(rustc_commit) != 1 or not re.fullmatch(r'[0-9a-f]{40}', rustc_commit[0]) or len(llvm_version) != 1 or not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', llvm_version[0]):
               raise SystemExit('linker identity unexpected')
+          Path('map-shape/stage.txt').write_text('MAP_ROWS_PARSE\n')
 
           phase = 'PRELUDE'
           count = 0
@@ -484,11 +491,13 @@ jobs:
           if any(len(archives) > 1 for archives in native_archives.values()):
               raise SystemExit('multiple native rlib identities')
           PY
+          printf '%s\n' 'MAP_PARSE_COMPLETE' > map-shape/stage.txt
       - name: Mark map-shape sample complete without admission
         shell: bash
         run: |
           set -euo pipefail
           test -s map-shape/shape.txt
+          test "$(cat map-shape/stage.txt)" = 'MAP_PARSE_COMPLETE'
           grep -Fxq 'shape_overflow=false' map-shape/shape.txt
           grep -Fxq 'grammar_overflow=false' map-shape/shape.txt
           grep -Fxq 'overlong_lines=0' map-shape/shape.txt
@@ -507,15 +516,22 @@ jobs:
           set -euo pipefail
           test -d map-shape && test ! -L map-shape
           test -f map-shape/status.txt
-          test "$(find map-shape -type f | wc -l)" -le 3
+          test "$(find map-shape -type f | wc -l)" -le 4
           test -z "$(find map-shape ! -type f ! -type d -print -quit)"
           while IFS= read -r path; do
             case "$path" in
-              map-shape/status.txt|map-shape/identity.txt|map-shape/shape.txt) ;;
+              map-shape/status.txt|map-shape/identity.txt|map-shape/shape.txt|map-shape/stage.txt) ;;
               *) exit 1 ;;
             esac
             test "$(wc -c < "$path")" -le 16384
           done < <(find map-shape -type f -print)
+          test -f map-shape/stage.txt
+          test "$(wc -l < map-shape/stage.txt)" -eq 1
+          test "$(wc -c < map-shape/stage.txt)" -le 32
+          case "$(cat map-shape/stage.txt)" in
+            SOURCE_GUARD|BUILDER_IMAGE|CARGO_LINK_MAP|MAP_GUARD|LINKER_IDENTITY_COMMAND|LINKER_IDENTITY_PARSE|MAP_ROWS_PARSE|MAP_PARSE_COMPLETE) ;;
+            *) exit 1 ;;
+          esac
           test "$(du -sk map-shape | cut -f1)" -le 64
       - uses: actions/upload-artifact@v4
         if: ${{ always() && steps.bound-map-shape.outcome == 'success' }}
