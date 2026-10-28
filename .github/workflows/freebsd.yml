@@ -360,14 +360,23 @@ jobs:
           linker_hash="$(docker run --rm moth-parity-builder:diagnostic sh -eu -c 'linker="$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-lld"; test -x "$linker"; version="$("$linker" -flavor gnu --version)"; case "$version" in "LLD 21.1.8 "*) ;; *) exit 1 ;; esac; hash="$(sha256sum "$linker")"; printf "%s\n" "${hash%% *}"' 2> "$RUNNER_TEMP/moth-parity-linker-identity.log")"
           test "$linker_hash" = c30db53247911b065bf8b279bbbcdf8f516702750233a6e6ef815c1826b7ee53
           printf '%s\n' CARGO_LINK_MAP > parity/stage.txt
-          rm -f agent-native-link.map
-          docker run --rm -v "$PWD:/work" -w /work moth-parity-builder:diagnostic \
+          rm -f agent-native-link.map agent-native-why-extract.txt agent-native-archive-stats.txt
+          timeout 45m docker run --rm --cidfile "$RUNNER_TEMP/moth-parity/cargo-container-id" -v "$PWD:/work" -w /work moth-parity-builder:diagnostic \
             cargo rustc --release --locked --frozen --offline -p cli --bin agent \
               --target x86_64-unknown-linux-gnu -- \
               -C link-arg=-Wl,-Map=/work/agent-native-link.map \
-            > "$RUNNER_TEMP/moth-parity-cargo.log" 2>&1
+              -C link-arg=-Wl,--why-extract=/work/agent-native-why-extract.txt \
+              -C link-arg=-Wl,--print-archive-stats=/work/agent-native-archive-stats.txt \
+              -C link-arg=-Wl,--print-gc-sections \
+              -C link-arg=-Wl,--print-icf-sections \
+            2>&1 | head -c 16777217 > "$RUNNER_TEMP/moth-parity-cargo.log"
+          test "$(wc -c < "$RUNNER_TEMP/moth-parity-cargo.log")" -le 16777216
           test -s agent-native-link.map
           test "$(wc -c < agent-native-link.map)" -le 16777216
+          test -s agent-native-why-extract.txt
+          test -s agent-native-archive-stats.txt
+          test "$(wc -c < agent-native-why-extract.txt)" -le 16777216
+          test "$(wc -c < agent-native-archive-stats.txt)" -le 1048576
           printf '%s\n' MAP_PARSE > parity/stage.txt
           python3 - <<'PY'
           from collections import Counter
@@ -440,6 +449,106 @@ jobs:
               for stem in ('inet_ntop', 'inet_pton'):
                   for size_class in ('zero', 'positive'):
                       print(f'isc_{stem}_{size_class}_map_rows={isc[(stem, size_class)]}', file=receipt)
+          PY
+          printf '%s\n' ARCHIVE_INVENTORY > parity/stage.txt
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib
+          import os
+          import re
+          import subprocess
+
+          root = Path.cwd()
+          families = ('curl_sys', 'openssl_sys', 'libz_sys')
+          rlibs = {name: set() for name in families}
+          for line in Path('agent-native-link.map').open(encoding='utf-8'):
+              for raw in re.findall(r'([^\s()]+\.rlib)\(', line):
+                  name = Path(raw).name
+                  for family in families:
+                      if re.fullmatch(r'lib' + family + r'-[0-9a-f]+\.rlib', name):
+                          rlibs[family].add(raw)
+          if any(len(paths) != 1 for paths in rlibs.values()):
+              raise SystemExit('native rlib inventory ambiguous')
+          archives = {}
+          for family, paths in rlibs.items():
+              raw = next(iter(paths))
+              path = root / raw.removeprefix('/work/') if raw.startswith('/work/') else root / raw
+              if not path.is_file() or path.is_symlink() or not path.resolve().is_relative_to(root / 'target'):
+                  raise SystemExit('native rlib path invalid')
+              archives[family + '_rlib'] = path
+          build_root = root / 'target/x86_64-unknown-linux-gnu/release/build'
+          for label, filename in (('curl_a', 'libcurl.a'), ('ssl_a', 'libssl.a'),
+                                  ('crypto_a', 'libcrypto.a'), ('z_a', 'libz.a')):
+              found = list(build_root.rglob(filename))
+              if len(found) != 1 or not found[0].is_file() or found[0].is_symlink():
+                  raise SystemExit('native static archive path ambiguous')
+              archives[label] = found[0]
+          records = {}
+          total_members = 0
+          total_bytes = 0
+          for label, archive in sorted(archives.items()):
+              if archive.stat().st_size > 134217728:
+                  raise SystemExit('native archive size exceeded')
+              listed = subprocess.run(['ar', 't', str(archive)], check=True, capture_output=True,
+                                      timeout=30).stdout.decode('utf-8').splitlines()
+              if not listed or len(listed) > 4096 or len(listed) != len(set(listed)):
+                  raise SystemExit('native archive member names ambiguous')
+              if any(not re.fullmatch(r'[A-Za-z0-9_.+\-]{1,160}', name) for name in listed):
+                  raise SystemExit('native archive member name unexpected')
+              members = []
+              for ordinal, name in enumerate(listed):
+                  data = subprocess.run(['ar', 'p', str(archive), name], check=True,
+                                        capture_output=True, timeout=30).stdout
+                  if not data or len(data) > 8388608:
+                      raise SystemExit('native archive member size invalid')
+                  total_members += 1
+                  total_bytes += len(data)
+                  if total_members > 8192 or total_bytes > 268435456:
+                      raise SystemExit('native archive inventory bound exceeded')
+                  members.append((ordinal, name, hashlib.sha256(data).hexdigest(), len(data)))
+              records[label] = members
+          for stem in ('inet_ntop', 'inet_pton'):
+              hashes = []
+              for label in ('curl_a', 'curl_sys_rlib'):
+                  matches = [entry for entry in records[label]
+                             if re.search(r'(?:^|-)' + stem + r'\.o$', entry[1])]
+                  if len(matches) != 1:
+                      raise SystemExit('ISC object identity ambiguous')
+                  hashes.append(matches[0][2])
+              if hashes[0] != hashes[1]:
+                  raise SystemExit('ISC native and rlib object bytes differ')
+          with Path('parity/native-inventory.txt').open('w') as receipt:
+              print('schema=moth-local-native-archive-inventory/v1', file=receipt)
+              print('same_build_archive_inventory=yes', file=receipt)
+              print('native_a_link_input_identity=UNPROVEN', file=receipt)
+              print('full_allocated_section_reconciliation=UNPROVEN', file=receipt)
+              for label, path in (('why_extract', Path('agent-native-why-extract.txt')),
+                                  ('archive_stats', Path('agent-native-archive-stats.txt')),
+                                  ('private_gc_icf_log', Path(os.environ['RUNNER_TEMP'], 'moth-parity-cargo.log'))):
+                  data = path.read_bytes()
+                  print(f'{label}_bytes={len(data)}', file=receipt)
+                  print(f'{label}_lines={data.count(bytes([10]))}', file=receipt)
+                  print(f'{label}_sha256={hashlib.sha256(data).hexdigest()}', file=receipt)
+              for label, archive in sorted(archives.items()):
+                  member_lines = [f'{label} {ordinal} {hashlib.sha256(name.encode()).hexdigest()} {digest} {size}\n'
+                                  for ordinal, name, digest, size in records[label]]
+                  print(f'{label}_archive_sha256=' + hashlib.sha256(archive.read_bytes()).hexdigest(), file=receipt)
+                  print(f'{label}_members={len(member_lines)}', file=receipt)
+                  print(f'{label}_member_bill_sha256=' + hashlib.sha256(''.join(member_lines).encode()).hexdigest(), file=receipt)
+              for stem in ('inet_ntop', 'inet_pton'):
+                  for label in ('curl_a', 'curl_sys_rlib'):
+                      match = next(entry for entry in records[label] if re.search(r'(?:^|-)' + stem + r'\.o$', entry[1]))
+                      print(f'isc_{stem}_{label}_ordinal={match[0]}', file=receipt)
+                      print(f'isc_{stem}_{label}_name_sha256={hashlib.sha256(match[1].encode()).hexdigest()}', file=receipt)
+                  print(f'isc_{stem}_object_sha256={match[2]}', file=receipt)
+          with Path('parity/native-members.txt').open('w') as bill:
+              print('schema=moth-local-native-member-hashes/v1', file=bill)
+              for label, members in sorted(records.items()):
+                  for ordinal, name, digest, size in members:
+                      name_hash = hashlib.sha256(name.encode()).hexdigest()
+                      print(f'{label} {ordinal} {name_hash} {digest} {size}', file=bill)
+          if Path('parity/native-members.txt').stat().st_size > 1048576:
+              raise SystemExit('bounded native member bill exceeded')
           PY
           printf '%s\n' STRIP > parity/stage.txt
           cp -- target/x86_64-unknown-linux-gnu/release/agent "$RUNNER_TEMP/moth-parity/linked-agent"
@@ -747,6 +856,14 @@ jobs:
           test "$(sed -n 's/^stripped_agent_sha256=//p' parity/map-join.txt)" = "$(sed -n 's/^tar_agent_sha256=//p' parity/tar-sha256.txt)"
           grep -Fxq 'native_file_backed_scope=LOCAL_MAP_PT_LOAD_PRESTRIP_STRIPPED_EQUAL' parity/map-join.txt
           grep -Fxq 'native_discarded_member_scope=UNPROVEN' parity/map-join.txt
+          grep -Fxq 'full_allocated_section_reconciliation=UNPROVEN' parity/native-inventory.txt
+          grep -Fxq 'same_build_archive_inventory=yes' parity/native-inventory.txt
+          grep -Fxq 'native_a_link_input_identity=UNPROVEN' parity/native-inventory.txt
+          test -s parity/native-members.txt
+          grep -Fxq 'schema=moth-local-native-member-hashes/v1' parity/native-members.txt
+          for stem in inet_ntop inet_pton; do
+            grep -Eq "^isc_${stem}_object_sha256=[0-9a-f]{64}$" parity/native-inventory.txt
+          done
           grep -Eq '^isc_inet_ntop_file_bytes=[1-9][0-9]*$' parity/map-join.txt
           grep -Eq '^isc_inet_pton_file_bytes=[1-9][0-9]*$' parity/map-join.txt
           for source in vendor/curl-sys/curl/LICENSES/ISC.txt vendor/curl-sys/curl/lib/curlx/inet_ntop.c vendor/curl-sys/curl/lib/curlx/inet_pton.c; do
@@ -762,13 +879,19 @@ jobs:
         run: |
           set -uo pipefail
           cleanup_ok=1
+          if test -s "$RUNNER_TEMP/moth-parity/cargo-container-id"; then
+            cargo_container="$(cat "$RUNNER_TEMP/moth-parity/cargo-container-id")"
+            if docker container inspect "$cargo_container" >/dev/null 2>&1; then
+              docker rm -f "$cargo_container" >/dev/null || cleanup_ok=0
+            fi
+          fi
           if test -s "$RUNNER_TEMP/moth-parity/container-id"; then
             docker rm -f "$(cat "$RUNNER_TEMP/moth-parity/container-id")" >/dev/null || cleanup_ok=0
           fi
           sudo -n rm -rf -- "$RUNNER_TEMP/moth-parity" "$GITHUB_WORKSPACE/release-payload" "$GITHUB_WORKSPACE/target" || cleanup_ok=0
-          rm -f -- agent-native-link.map || cleanup_ok=0
+          rm -f -- agent-native-link.map agent-native-why-extract.txt agent-native-archive-stats.txt || cleanup_ok=0
           rm -f -- "$RUNNER_TEMP/moth-parity-builder.log" "$RUNNER_TEMP/moth-parity-rustc-version.log" "$RUNNER_TEMP/moth-parity-rustc-identity.log" "$RUNNER_TEMP/moth-parity-linker-identity.log" "$RUNNER_TEMP/moth-parity-cargo.log" "$RUNNER_TEMP/moth-parity-oci.log" || cleanup_ok=0
-          for private in agent-native-link.map "$GITHUB_WORKSPACE/target" \
+          for private in agent-native-link.map agent-native-why-extract.txt agent-native-archive-stats.txt "$GITHUB_WORKSPACE/target" \
             "$RUNNER_TEMP/moth-parity" "$GITHUB_WORKSPACE/release-payload" \
             "$RUNNER_TEMP/moth-parity-builder.log" "$RUNNER_TEMP/moth-parity-rustc-version.log" "$RUNNER_TEMP/moth-parity-rustc-identity.log" "$RUNNER_TEMP/moth-parity-linker-identity.log" "$RUNNER_TEMP/moth-parity-cargo.log" "$RUNNER_TEMP/moth-parity-oci.log"; do
             { test ! -e "$private" && test ! -L "$private"; } || cleanup_ok=0
@@ -791,24 +914,27 @@ jobs:
           set -euo pipefail
           test -d parity && test ! -L parity
           test -f parity/status.txt
-          test "$(find parity -type f | wc -l)" -le 7
+          test "$(find parity -type f | wc -l)" -le 9
           test -z "$(find parity ! -type f ! -type d -print -quit)"
           while IFS= read -r path; do
             case "$path" in
-              parity/status.txt|parity/identity.txt|parity/tar-sha256.txt|parity/image.txt|parity/text-sha256.txt|parity/map-join.txt|parity/stage.txt) ;;
+              parity/status.txt|parity/identity.txt|parity/tar-sha256.txt|parity/image.txt|parity/text-sha256.txt|parity/map-join.txt|parity/native-inventory.txt|parity/native-members.txt|parity/stage.txt) ;;
               *) exit 1 ;;
             esac
-            test "$(wc -c < "$path")" -le 8192
+            case "$path" in
+              parity/native-members.txt) test "$(wc -c < "$path")" -le 1048576 ;;
+              *) test "$(wc -c < "$path")" -le 8192 ;;
+            esac
           done < <(find parity -type f -print)
           if test -f parity/stage.txt; then
             test "$(wc -l < parity/stage.txt)" -eq 1
             test "$(wc -c < parity/stage.txt)" -le 32
             case "$(cat parity/stage.txt)" in
-              BUILDER_IMAGE|RUSTC_IDENTITY|LINKER_IDENTITY|CARGO_LINK_MAP|MAP_PARSE|STRIP|NATIVE_BYTES|TAR_STAGE|TAR_VERIFY|TAR_READY|OCI_BUILD|OCI_EXPORT|OCI_COMPARE|OCI_READY|COMPLETE) ;;
+              BUILDER_IMAGE|RUSTC_IDENTITY|LINKER_IDENTITY|CARGO_LINK_MAP|MAP_PARSE|ARCHIVE_INVENTORY|STRIP|NATIVE_BYTES|TAR_STAGE|TAR_VERIFY|TAR_READY|OCI_BUILD|OCI_EXPORT|OCI_COMPARE|OCI_READY|COMPLETE) ;;
               *) exit 1 ;;
             esac
           fi
-          test "$(du -sk parity | cut -f1)" -le 64
+          test "$(du -sk parity | cut -f1)" -le 1152
 
       - name: Retain parity diagnostic receipt
         if: ${{ always() && steps.bound-parity.outcome == 'success' }}
