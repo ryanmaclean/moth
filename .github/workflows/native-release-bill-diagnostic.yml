@@ -100,6 +100,94 @@ jobs:
             fi
           done
           test -s diagnostic/native-archive-sha256.txt
+          curl_archive=$(find target/x86_64-unknown-linux-gnu/release/build \
+            -type f -name libcurl.a -print)
+          test -f "$curl_archive"
+          curl_rlib=$(find target/x86_64-unknown-linux-gnu/release/deps \
+            -maxdepth 1 -type f -name 'libcurl_sys-*.rlib' -print)
+          test -f "$curl_rlib"
+          : > diagnostic/isc-object-probes.txt
+          for stem in inet_ntop inet_pton; do
+            mapfile -t curl_members < <(ar t "$curl_archive" | grep -E "(^|-)${stem}\\.o$" || true)
+            mapfile -t rlib_members < <(ar t "$curl_rlib" | grep -E "(^|-)${stem}\\.o$" || true)
+            printf '%s_archive_member_count=%s\n%s_rlib_member_count=%s\n' \
+              "$stem" "${#curl_members[@]}" "$stem" "${#rlib_members[@]}" \
+              >> diagnostic/isc-object-probes.txt
+            if [ "${#curl_members[@]}" -eq 1 ]; then
+              printf '%s_archive_object_sha256=' "$stem" >> diagnostic/isc-object-probes.txt
+              ar p "$curl_archive" "${curl_members[0]}" | sha256sum | cut -d' ' -f1 \
+                >> diagnostic/isc-object-probes.txt
+            fi
+            if [ "${#rlib_members[@]}" -eq 1 ]; then
+              printf '%s_rlib_object_sha256=' "$stem" >> diagnostic/isc-object-probes.txt
+              ar p "$curl_rlib" "${rlib_members[0]}" | sha256sum | cut -d' ' -f1 \
+                >> diagnostic/isc-object-probes.txt
+            fi
+          done
+          nm -an target/x86_64-unknown-linux-gnu/release/agent \
+            | awk 'tolower($0) ~ /inet_ntop/ { ntop++ }
+                   tolower($0) ~ /inet_pton/ { pton++ }
+                   END { printf "binary_symbol_inet_ntop=%d\nbinary_symbol_inet_pton=%d\n", ntop, pton }' \
+            >> diagnostic/isc-object-probes.txt
+      - name: Audit release-recipe tar placement on mapped binary
+        run: |
+          set -euo pipefail
+          stage=agent-diagnostic-x86_64-unknown-linux-gnu
+          mkdir -p "/tmp/moth-release-audit/$stage"
+          cp target/x86_64-unknown-linux-gnu/release/agent \
+            "/tmp/moth-release-audit/$stage/agent"
+          docker run --rm -v /tmp/moth-release-audit:/audit agent-builder \
+            strip "/audit/$stage/agent"
+          cp LICENSE README.md CHANGELOG.md "/tmp/moth-release-audit/$stage/"
+          tar -C /tmp/moth-release-audit -czf /tmp/moth-release-audit/candidate.tar.gz "$stage"
+          tar -tzf /tmp/moth-release-audit/candidate.tar.gz | sort \
+            > /tmp/moth-release-audit/members.txt
+          printf '%s\n' "$stage/" "$stage/CHANGELOG.md" "$stage/LICENSE" \
+            "$stage/README.md" "$stage/agent" | sort \
+            | diff -u - /tmp/moth-release-audit/members.txt
+          {
+            printf 'unstripped_binary_sha256=%s\n' \
+              "$(sha256sum target/x86_64-unknown-linux-gnu/release/agent | cut -d' ' -f1)"
+            printf 'stripped_binary_sha256=%s\n' \
+              "$(sha256sum "/tmp/moth-release-audit/$stage/agent" | cut -d' ' -f1)"
+            printf 'tar_member_binary_sha256=%s\n' \
+              "$(tar -xOzf /tmp/moth-release-audit/candidate.tar.gz "$stage/agent" | sha256sum | cut -d' ' -f1)"
+            printf 'tar_sha256=%s\ntar_root_license_sha256=%s\ntar_native_notice_member_count=0\n' \
+              "$(sha256sum /tmp/moth-release-audit/candidate.tar.gz | cut -d' ' -f1)" \
+              "$(sha256sum "/tmp/moth-release-audit/$stage/LICENSE" | cut -d' ' -f1)"
+          } > diagnostic/tar-placement.txt
+      - name: Audit OCI placement and binary join without publishing
+        run: |
+          set -euo pipefail
+          docker build --target runtime -t moth-native-audit-runtime .
+          docker image inspect --format '{{.Id}}' moth-native-audit-runtime \
+            > diagnostic/oci-image-id.txt
+          docker image inspect --format '{{.Id}}' gcr.io/distroless/cc-debian12 \
+            > diagnostic/oci-base-image-id.txt
+          docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.licenses" }}' \
+            moth-native-audit-runtime > diagnostic/oci-license-label.txt
+          container=$(docker create moth-native-audit-runtime)
+          trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
+          docker cp "$container:/usr/local/bin/agent" /tmp/moth-release-audit/oci-agent
+          docker export "$container" > /tmp/moth-release-audit/oci-rootfs.tar
+          tar -tf /tmp/moth-release-audit/oci-rootfs.tar \
+            | awk '
+                { sub(/^\.\//, "", $0) }
+                /^usr\/share\/doc\/moth\// { moth_doc++ }
+                /(^|\/)THIRD_PARTY_NOTICES\// { third_party++ }
+                /^usr\/share\/licenses\/moth\// { moth_license++ }
+                END { printf "moth_doc_paths=%d\nthird_party_notice_paths=%d\nmoth_license_paths=%d\n", moth_doc, third_party, moth_license }' \
+            > diagnostic/oci-placement.txt
+          printf 'oci_agent_sha256=%s\ntar_agent_sha256=%s\n' \
+            "$(sha256sum /tmp/moth-release-audit/oci-agent | cut -d' ' -f1)" \
+            "$(sha256sum /tmp/moth-release-audit/agent-diagnostic-x86_64-unknown-linux-gnu/agent | cut -d' ' -f1)" \
+            >> diagnostic/oci-placement.txt
+          if cmp -s /tmp/moth-release-audit/oci-agent \
+            /tmp/moth-release-audit/agent-diagnostic-x86_64-unknown-linux-gnu/agent; then
+            printf 'oci_binary_matches_tar=yes\n' >> diagnostic/oci-placement.txt
+          else
+            printf 'oci_binary_matches_tar=no\n' >> diagnostic/oci-placement.txt
+          fi
       - name: Record candidate legal text identities and limited scope
         run: |
           set -euo pipefail
@@ -117,10 +205,10 @@ jobs:
             sha256sum "$path" >> diagnostic/legal/candidate-text-sha256.txt
           done
           printf '%s\n' \
-            'NATIVE_LINK_INVENTORY_ONLY' \
+            'NATIVE_LINK_AND_DISTRIBUTION_CANDIDATE_DIAGNOSTIC_ONLY' \
             'release_admission=NO' \
             'legal_admission=NO' \
-            'distribution_placement=UNPROVEN' \
+            'distribution_placement=CANDIDATE_COUNTS_ONLY' \
             'archive_member_retention=UNPROVEN' \
             'ISC_selected_bytes=UNPROVEN' \
             'zlib_static_or_dynamic=SEE_DYNAMIC_AND_ARCHIVE_INVENTORY' \
@@ -133,11 +221,11 @@ jobs:
           test -f diagnostic/status.txt
           test ! -L diagnostic
           count=$(find diagnostic -type f | wc -l)
-          test "$count" -le 20
+          test "$count" -le 24
           test "$(find diagnostic -type l | wc -l)" -eq 0
           while IFS= read -r path; do
             case "$path" in
-              diagnostic/status.txt|diagnostic/identity.txt|diagnostic/changed-paths.txt|diagnostic/builder-image-id.txt|diagnostic/rustc-version.txt|diagnostic/cargo-version.txt|diagnostic/curl-feature-tree.txt|diagnostic/unstripped-binary-sha256.txt|diagnostic/dynamic-section.txt|diagnostic/native-map-size.txt|diagnostic/native-map-pattern-counts.txt|diagnostic/native-archive-sha256.txt|diagnostic/native-archive-members.txt|diagnostic/legal/candidate-text-sha256.txt) ;;
+              diagnostic/status.txt|diagnostic/identity.txt|diagnostic/changed-paths.txt|diagnostic/builder-image-id.txt|diagnostic/rustc-version.txt|diagnostic/cargo-version.txt|diagnostic/curl-feature-tree.txt|diagnostic/unstripped-binary-sha256.txt|diagnostic/dynamic-section.txt|diagnostic/native-map-size.txt|diagnostic/native-map-pattern-counts.txt|diagnostic/native-archive-sha256.txt|diagnostic/native-archive-members.txt|diagnostic/isc-object-probes.txt|diagnostic/tar-placement.txt|diagnostic/oci-image-id.txt|diagnostic/oci-base-image-id.txt|diagnostic/oci-license-label.txt|diagnostic/oci-placement.txt|diagnostic/legal/candidate-text-sha256.txt) ;;
               *) exit 1 ;;
             esac
             test "$(wc -c < "$path")" -le 2097152
