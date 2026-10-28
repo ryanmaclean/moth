@@ -296,11 +296,16 @@ jobs:
           test -s agent-native-link.map
           test "$(wc -c < agent-native-link.map)" -le 16777216
           printf '%s\n' 'LINKER_IDENTITY_COMMAND' > map-shape/stage.txt
-          docker run --rm moth-map-shape-builder:diagnostic sh -eu -c '
+          docker run --rm -v "$PWD/map-shape:/receipt" moth-map-shape-builder:diagnostic sh -eu -c '
+            printf "%s\n" RUST_LLD_PATH > /receipt/stage.txt
             linker="$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-lld"
             test -x "$linker"
-            "$linker" --version
-            sha256sum "$linker" | cut -d " " -f 1
+            printf "%s\n" RUST_LLD_VERSION > /receipt/stage.txt
+            "$linker" -flavor gnu --version
+            printf "%s\n" RUST_LLD_HASH > /receipt/stage.txt
+            hash="$(sha256sum "$linker")"
+            printf "%s\n" "${hash%% *}"
+            printf "%s\n" RUSTC_VERSION > /receipt/stage.txt
             rustc -vV
           ' > "$RUNNER_TEMP/moth-map-shape-linker.log" 2>&1
           printf '%s\n' 'LINKER_IDENTITY_PARSE' > map-shape/stage.txt
@@ -529,7 +534,7 @@ jobs:
           test "$(wc -l < map-shape/stage.txt)" -eq 1
           test "$(wc -c < map-shape/stage.txt)" -le 32
           case "$(cat map-shape/stage.txt)" in
-            SOURCE_GUARD|BUILDER_IMAGE|CARGO_LINK_MAP|MAP_GUARD|LINKER_IDENTITY_COMMAND|LINKER_IDENTITY_PARSE|MAP_ROWS_PARSE|MAP_PARSE_COMPLETE) ;;
+            SOURCE_GUARD|BUILDER_IMAGE|CARGO_LINK_MAP|MAP_GUARD|LINKER_IDENTITY_COMMAND|RUST_LLD_PATH|RUST_LLD_VERSION|RUST_LLD_HASH|RUSTC_VERSION|LINKER_IDENTITY_PARSE|MAP_ROWS_PARSE|MAP_PARSE_COMPLETE) ;;
             *) exit 1 ;;
           esac
           test "$(du -sk map-shape | cut -f1)" -le 64
