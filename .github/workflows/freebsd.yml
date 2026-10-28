@@ -22,9 +22,23 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      native_release_bill_diagnostic:
+        description: 'Run the held Linux native release bill diagnostic'
+        type: boolean
+        default: false
+      map_shape_sample:
+        description: 'Run the separate bounded native linker-map shape sample'
+        type: boolean
+        default: false
+      expected_head_sha:
+        description: 'Reviewed full commit SHA for the opt-in diagnostic'
+        type: string
+        default: ''
 
 jobs:
   freebsd:
+    if: ${{ !inputs.native_release_bill_diagnostic && !inputs.map_shape_sample }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -117,3 +131,12 @@ jobs:
               fi
               echo "::endgroup::"
             done
+
+  native-release-bill:
+    if: ${{ github.event_name == 'workflow_dispatch' && (inputs.native_release_bill_diagnostic || inputs.map_shape_sample) }}
+    uses: ./.github/workflows/native-release-bill-diagnostic.yml
+    with:
+      expected_head_sha: ${{ inputs.expected_head_sha }}
+      map_shape_sample: ${{ inputs.map_shape_sample }}
+    permissions:
+      contents: read

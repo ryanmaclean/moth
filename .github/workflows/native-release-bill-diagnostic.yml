@@ -1,0 +1,547 @@
+name: native link inventory diagnostic
+
+on:
+  workflow_call:
+    inputs:
+      expected_head_sha:
+        required: true
+        type: string
+      map_shape_sample:
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  linux-amd64:
+    if: ${{ !inputs.map_shape_sample }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Guard reviewed source and seed refusal
+        env:
+          EXPECTED_HEAD_SHA: ${{ inputs.expected_head_sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic
+          printf 'INCOMPLETE\nrelease_admission=NO\nlegal_admission=NO\ndistribution_placement=UNPROVEN\n' > diagnostic/status.txt
+          [[ "$EXPECTED_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$EXPECTED_HEAD_SHA" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD_SHA"
+          test "$(git merge-base HEAD 2ad30129a9af231b687b8821f2b9d062e41992f9)" = 2ad30129a9af231b687b8821f2b9d062e41992f9
+          git diff --name-only 2ad30129a9af231b687b8821f2b9d062e41992f9 HEAD \
+            | sort > diagnostic/changed-paths.txt
+          printf '%s\n' '.github/workflows/freebsd.yml' '.github/workflows/native-release-bill-diagnostic.yml' \
+            | sort | diff -u - diagnostic/changed-paths.txt
+          printf '%s\n' \
+            'befd91e188696989d415870792acb3f9fa5a5d3bd79fe8823989264714b6fe51  Cargo.lock' \
+            'e669269e333c7031fcd34595a34bc428965a79f4a1036cb495fcc13bf143006a  Dockerfile' \
+            'e882ab4f75e1724a36dc3984b94c71a15effb6da5faf5d5fcfcde8e0e5d96dda  .github/workflows/release.yml' \
+            | sha256sum --check --status
+          printf 'head=%s\nbase=%s\ntarget=x86_64-unknown-linux-gnu\n' \
+            "$EXPECTED_HEAD_SHA" 2ad30129a9af231b687b8821f2b9d062e41992f9 \
+            > diagnostic/identity.txt
+      - name: Build disposable native link inventory
+        run: |
+          set -euo pipefail
+          docker build --target builder -t agent-builder .
+          docker image inspect --format '{{.Id}}' agent-builder \
+            > diagnostic/builder-image-id.txt
+          docker run --rm agent-builder rustc -vV > diagnostic/rustc-version.txt
+          docker run --rm agent-builder cargo -V > diagnostic/cargo-version.txt
+          docker run --rm -v "$PWD:/work" -w /work agent-builder \
+            cargo tree --locked --offline -e features -i curl-sys \
+            > diagnostic/curl-feature-tree.txt
+          if ! docker run --rm -v "$PWD:/work" -w /work agent-builder \
+            cargo rustc --release --locked --frozen --offline -p cli \
+              --bin agent --target x86_64-unknown-linux-gnu -vv -- \
+              -C link-arg=-Wl,-Map=/work/agent-native-link.map \
+            > /tmp/moth-native-link-build.log 2>&1; then
+            tail -80 /tmp/moth-native-link-build.log
+            exit 1
+          fi
+          test -s agent-native-link.map
+          test -f target/x86_64-unknown-linux-gnu/release/agent
+          sha256sum target/x86_64-unknown-linux-gnu/release/agent \
+            > diagnostic/unstripped-binary-sha256.txt
+          readelf -d target/x86_64-unknown-linux-gnu/release/agent \
+            > diagnostic/dynamic-section.txt
+          wc -cl agent-native-link.map > diagnostic/native-map-size.txt
+          awk '
+            {
+              line = tolower($0)
+              total++
+              if (line ~ /^archive member included/) archive_header++
+              if (line ~ /libcurl\.a\(/) curl_archive++
+              if (line ~ /libssl\.a\(/) ssl_archive++
+              if (line ~ /libcrypto\.a\(/) crypto_archive++
+              if (line ~ /libz\.a\(/) z_archive++
+              if (line ~ /\.rlib\(/) rust_archive++
+              if (line ~ /curl/ && line ~ /\.rlib\(/) curl_rust_archive++
+              if (line ~ /inet_ntop/) inet_ntop++
+              if (line ~ /inet_pton/) inet_pton++
+              if (line ~ /discarded input sections/) discarded_header++
+            }
+            END {
+              printf "total_lines=%d\narchive_header=%d\nlibcurl_a=%d\nlibssl_a=%d\nlibcrypto_a=%d\nlibz_a=%d\nrlib_member=%d\ncurl_rlib_member=%d\ninet_ntop=%d\ninet_pton=%d\ndiscarded_header=%d\n", total, archive_header, curl_archive, ssl_archive, crypto_archive, z_archive, rust_archive, curl_rust_archive, inet_ntop, inet_pton, discarded_header
+            }' agent-native-link.map > diagnostic/native-map-pattern-counts.txt
+          : > diagnostic/native-archive-sha256.txt
+          : > diagnostic/native-archive-members.txt
+          for name in libcurl.a libssl.a libcrypto.a libz.a; do
+            mapfile -t found < <(find target/x86_64-unknown-linux-gnu/release/build \
+              -type f -name "$name" -print)
+            test "${#found[@]}" -le 1
+            if [ "${#found[@]}" -eq 1 ]; then
+              path="${found[0]}"
+              test ! -L "$path"
+              sha256sum "$path" >> diagnostic/native-archive-sha256.txt
+              printf '== %s ==\n' "$path" >> diagnostic/native-archive-members.txt
+              ar tv "$path" >> diagnostic/native-archive-members.txt
+            fi
+          done
+          test -s diagnostic/native-archive-sha256.txt
+          curl_archive=$(find target/x86_64-unknown-linux-gnu/release/build \
+            -type f -name libcurl.a -print)
+          test -f "$curl_archive"
+          curl_rlib=$(find target/x86_64-unknown-linux-gnu/release/deps \
+            -maxdepth 1 -type f -name 'libcurl_sys-*.rlib' -print)
+          test -f "$curl_rlib"
+          : > diagnostic/isc-object-probes.txt
+          for stem in inet_ntop inet_pton; do
+            mapfile -t curl_members < <(ar t "$curl_archive" | grep -E "(^|-)${stem}\\.o$" || true)
+            mapfile -t rlib_members < <(ar t "$curl_rlib" | grep -E "(^|-)${stem}\\.o$" || true)
+            printf '%s_archive_member_count=%s\n%s_rlib_member_count=%s\n' \
+              "$stem" "${#curl_members[@]}" "$stem" "${#rlib_members[@]}" \
+              >> diagnostic/isc-object-probes.txt
+            if [ "${#curl_members[@]}" -eq 1 ]; then
+              printf '%s_archive_object_sha256=' "$stem" >> diagnostic/isc-object-probes.txt
+              ar p "$curl_archive" "${curl_members[0]}" | sha256sum | cut -d' ' -f1 \
+                >> diagnostic/isc-object-probes.txt
+            fi
+            if [ "${#rlib_members[@]}" -eq 1 ]; then
+              printf '%s_rlib_object_sha256=' "$stem" >> diagnostic/isc-object-probes.txt
+              ar p "$curl_rlib" "${rlib_members[0]}" | sha256sum | cut -d' ' -f1 \
+                >> diagnostic/isc-object-probes.txt
+            fi
+          done
+          nm -an target/x86_64-unknown-linux-gnu/release/agent \
+            | awk 'tolower($0) ~ /inet_ntop/ { ntop++ }
+                   tolower($0) ~ /inet_pton/ { pton++ }
+                   END { printf "binary_symbol_inet_ntop=%d\nbinary_symbol_inet_pton=%d\n", ntop, pton }' \
+            >> diagnostic/isc-object-probes.txt
+      - name: Audit release-recipe tar placement on mapped binary
+        run: |
+          set -euo pipefail
+          stage=agent-diagnostic-x86_64-unknown-linux-gnu
+          mkdir -p "/tmp/moth-release-audit/$stage"
+          cp target/x86_64-unknown-linux-gnu/release/agent \
+            "/tmp/moth-release-audit/$stage/agent"
+          docker run --rm -v /tmp/moth-release-audit:/audit agent-builder \
+            strip "/audit/$stage/agent"
+          cp LICENSE README.md CHANGELOG.md "/tmp/moth-release-audit/$stage/"
+          tar -C /tmp/moth-release-audit -czf /tmp/moth-release-audit/candidate.tar.gz "$stage"
+          tar -tzf /tmp/moth-release-audit/candidate.tar.gz | sort \
+            > /tmp/moth-release-audit/members.txt
+          printf '%s\n' "$stage/" "$stage/CHANGELOG.md" "$stage/LICENSE" \
+            "$stage/README.md" "$stage/agent" | sort \
+            | diff -u - /tmp/moth-release-audit/members.txt
+          {
+            printf 'unstripped_binary_sha256=%s\n' \
+              "$(sha256sum target/x86_64-unknown-linux-gnu/release/agent | cut -d' ' -f1)"
+            printf 'stripped_binary_sha256=%s\n' \
+              "$(sha256sum "/tmp/moth-release-audit/$stage/agent" | cut -d' ' -f1)"
+            printf 'tar_member_binary_sha256=%s\n' \
+              "$(tar -xOzf /tmp/moth-release-audit/candidate.tar.gz "$stage/agent" | sha256sum | cut -d' ' -f1)"
+            printf 'tar_sha256=%s\ntar_root_license_sha256=%s\ntar_native_notice_member_count=0\n' \
+              "$(sha256sum /tmp/moth-release-audit/candidate.tar.gz | cut -d' ' -f1)" \
+              "$(sha256sum "/tmp/moth-release-audit/$stage/LICENSE" | cut -d' ' -f1)"
+          } > diagnostic/tar-placement.txt
+      - name: Audit OCI placement and binary join without publishing
+        run: |
+          set -euo pipefail
+          docker build --target runtime -t moth-native-audit-runtime .
+          docker image inspect --format '{{.Id}}' moth-native-audit-runtime \
+            > diagnostic/oci-image-id.txt
+          # BuildKit may use the distroless base without tagging it locally.
+          # Record the layers of the image actually built, not a separate
+          # mutable base-tag lookup that may fail or resolve to different bytes.
+          docker image inspect --format '{{range .RootFS.Layers}}{{println .}}{{end}}' \
+            moth-native-audit-runtime > diagnostic/oci-rootfs-layers.txt
+          test -s diagnostic/oci-rootfs-layers.txt
+          docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.licenses" }}' \
+            moth-native-audit-runtime > diagnostic/oci-license-label.txt
+          container=$(docker create moth-native-audit-runtime)
+          trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
+          docker cp "$container:/usr/local/bin/agent" /tmp/moth-release-audit/oci-agent
+          docker export "$container" > /tmp/moth-release-audit/oci-rootfs.tar
+          tar -tf /tmp/moth-release-audit/oci-rootfs.tar \
+            | awk '
+                { sub(/^\.\//, "", $0) }
+                /^usr\/share\/doc\/moth\// { moth_doc++ }
+                /(^|\/)THIRD_PARTY_NOTICES\// { third_party++ }
+                /^usr\/share\/licenses\/moth\// { moth_license++ }
+                END { printf "moth_doc_paths=%d\nthird_party_notice_paths=%d\nmoth_license_paths=%d\n", moth_doc, third_party, moth_license }' \
+            > diagnostic/oci-placement.txt
+          printf 'oci_agent_sha256=%s\ntar_agent_sha256=%s\n' \
+            "$(sha256sum /tmp/moth-release-audit/oci-agent | cut -d' ' -f1)" \
+            "$(sha256sum /tmp/moth-release-audit/agent-diagnostic-x86_64-unknown-linux-gnu/agent | cut -d' ' -f1)" \
+            >> diagnostic/oci-placement.txt
+          if cmp -s /tmp/moth-release-audit/oci-agent \
+            /tmp/moth-release-audit/agent-diagnostic-x86_64-unknown-linux-gnu/agent; then
+            printf 'oci_binary_matches_tar=yes\n' >> diagnostic/oci-placement.txt
+          else
+            printf 'oci_binary_matches_tar=no\n' >> diagnostic/oci-placement.txt
+          fi
+      - name: Record candidate legal text identities and limited scope
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic/legal
+          for path in \
+            vendor/curl-sys/LICENSE \
+            vendor/curl-sys/curl/COPYING \
+            vendor/curl-sys/curl/LICENSES/ISC.txt \
+            vendor/curl-sys/curl/lib/curlx/inet_ntop.c \
+            vendor/curl-sys/curl/lib/curlx/inet_pton.c \
+            vendor/openssl-src/openssl/LICENSE.txt \
+            vendor/libz-sys/src/zlib/LICENSE; do
+            test -f "$path" && test ! -L "$path"
+            test "$(wc -c < "$path")" -le 131072
+            sha256sum "$path" >> diagnostic/legal/candidate-text-sha256.txt
+          done
+          printf '%s\n' \
+            'NATIVE_LINK_AND_DISTRIBUTION_CANDIDATE_DIAGNOSTIC_ONLY' \
+            'release_admission=NO' \
+            'legal_admission=NO' \
+            'distribution_placement=CANDIDATE_COUNTS_ONLY' \
+            'archive_member_retention=UNPROVEN' \
+            'ISC_selected_bytes=UNPROVEN' \
+            'zlib_static_or_dynamic=SEE_DYNAMIC_AND_ARCHIVE_INVENTORY' \
+            > diagnostic/status.txt
+      - name: Bound diagnostic receipts even on failure
+        id: bound
+        if: always()
+        run: |
+          set -euo pipefail
+          test -f diagnostic/status.txt
+          test ! -L diagnostic
+          count=$(find diagnostic -type f | wc -l)
+          test "$count" -le 24
+          test "$(find diagnostic -type l | wc -l)" -eq 0
+          while IFS= read -r path; do
+            case "$path" in
+              diagnostic/status.txt|diagnostic/identity.txt|diagnostic/changed-paths.txt|diagnostic/builder-image-id.txt|diagnostic/rustc-version.txt|diagnostic/cargo-version.txt|diagnostic/curl-feature-tree.txt|diagnostic/unstripped-binary-sha256.txt|diagnostic/dynamic-section.txt|diagnostic/native-map-size.txt|diagnostic/native-map-pattern-counts.txt|diagnostic/native-archive-sha256.txt|diagnostic/native-archive-members.txt|diagnostic/isc-object-probes.txt|diagnostic/tar-placement.txt|diagnostic/oci-image-id.txt|diagnostic/oci-rootfs-layers.txt|diagnostic/oci-license-label.txt|diagnostic/oci-placement.txt|diagnostic/legal/candidate-text-sha256.txt) ;;
+              *) exit 1 ;;
+            esac
+            test "$(wc -c < "$path")" -le 2097152
+          done < <(find diagnostic -type f -print)
+          test "$(du -sk diagnostic | cut -f1)" -le 8192
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() && steps.bound.outcome == 'success' }}
+        with:
+          name: native-link-inventory-linux-amd64-${{ github.sha }}
+          path: diagnostic/
+          if-no-files-found: error
+          retention-days: 7
+
+  map-shape-sample-linux-amd64:
+    if: ${{ inputs.map_shape_sample }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Guard reviewed map-shape source and seed refusal
+        shell: bash
+        env:
+          EXPECTED_HEAD_SHA: ${{ inputs.expected_head_sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p map-shape
+          printf '%s\n' 'INCOMPLETE' 'release_admission=NO' 'legal_admission=NO' 'selected_native_bytes=UNPROVEN' > map-shape/status.txt
+          printf '%s\n' 'SOURCE_GUARD' > map-shape/stage.txt
+          [[ "$EXPECTED_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$EXPECTED_HEAD_SHA" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD_SHA"
+          test "$(git merge-base HEAD 2ad30129a9af231b687b8821f2b9d062e41992f9)" = 2ad30129a9af231b687b8821f2b9d062e41992f9
+          git diff --name-only 2ad30129a9af231b687b8821f2b9d062e41992f9 HEAD | sort \
+            | diff -u <(printf '%s\n' '.github/workflows/freebsd.yml' '.github/workflows/native-release-bill-diagnostic.yml' | sort) -
+          printf '%s\n' \
+            'befd91e188696989d415870792acb3f9fa5a5d3bd79fe8823989264714b6fe51  Cargo.lock' \
+            'e669269e333c7031fcd34595a34bc428965a79f4a1036cb495fcc13bf143006a  Dockerfile' \
+            'e882ab4f75e1724a36dc3984b94c71a15effb6da5faf5d5fcfcde8e0e5d96dda  .github/workflows/release.yml' \
+            | sha256sum --check --status
+          test -z "$(git status --porcelain --untracked-files=no)"
+          printf 'head=%s\nbase=%s\nlock_sha256=%s\ntarget=x86_64-unknown-linux-gnu\n' \
+            "$EXPECTED_HEAD_SHA" 2ad30129a9af231b687b8821f2b9d062e41992f9 \
+            "$(sha256sum Cargo.lock | cut -d' ' -f1)" > map-shape/identity.txt
+      - name: Build private linker map for lexical shape sampling
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s\n' 'BUILDER_IMAGE' > map-shape/stage.txt
+          docker build --target builder -t moth-map-shape-builder:diagnostic . > "$RUNNER_TEMP/moth-map-shape-builder.log" 2>&1
+          printf '%s\n' 'CARGO_LINK_MAP' > map-shape/stage.txt
+          docker run --rm -v "$PWD:/work" -w /work moth-map-shape-builder:diagnostic \
+            cargo rustc --release --locked --frozen --offline -p cli \
+              --bin agent --target x86_64-unknown-linux-gnu -- \
+              -C link-arg=-Wl,-Map=/work/agent-native-link.map \
+            > "$RUNNER_TEMP/moth-map-shape-cargo.log" 2>&1
+          printf '%s\n' 'MAP_GUARD' > map-shape/stage.txt
+          test -s agent-native-link.map
+          test "$(wc -c < agent-native-link.map)" -le 16777216
+          printf '%s\n' 'LINKER_IDENTITY_COMMAND' > map-shape/stage.txt
+          docker run --rm -v "$PWD/map-shape:/receipt" moth-map-shape-builder:diagnostic sh -eu -c '
+            printf "%s\n" RUST_LLD_PATH > /receipt/stage.txt
+            linker="$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-lld"
+            test -x "$linker"
+            printf "%s\n" RUST_LLD_VERSION > /receipt/stage.txt
+            "$linker" -flavor gnu --version
+            printf "%s\n" RUST_LLD_HASH > /receipt/stage.txt
+            hash="$(sha256sum "$linker")"
+            printf "%s\n" "${hash%% *}"
+            printf "%s\n" RUSTC_VERSION > /receipt/stage.txt
+            rustc -vV
+          ' > "$RUNNER_TEMP/moth-map-shape-linker.log" 2>&1
+          printf '%s\n' 'LINKER_IDENTITY_PARSE' > map-shape/stage.txt
+          python3 - <<'PY'
+          from collections import Counter
+          from pathlib import Path
+          import os
+          import re
+
+          tool_lines = (Path(os.environ['RUNNER_TEMP']) / 'moth-map-shape-linker.log').read_text().splitlines()
+          if len(tool_lines) < 5:
+              raise SystemExit('linker identity incomplete')
+          lld = re.fullmatch(r'LLD ([0-9]+\.[0-9]+\.[0-9]+)(?: .*)?', tool_lines[0])
+          linker_sha = re.fullmatch(r'[0-9a-f]{64}', tool_lines[1])
+          rustc_release = [line.removeprefix('release: ') for line in tool_lines if line.startswith('release: ')]
+          rustc_commit = [line.removeprefix('commit-hash: ') for line in tool_lines if line.startswith('commit-hash: ')]
+          llvm_version = [line.removeprefix('LLVM version: ') for line in tool_lines if line.startswith('LLVM version: ')]
+          if not lld or not linker_sha or rustc_release != ['1.94.1'] or len(rustc_commit) != 1 or not re.fullmatch(r'[0-9a-f]{40}', rustc_commit[0]) or len(llvm_version) != 1 or not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', llvm_version[0]):
+              raise SystemExit('linker identity unexpected')
+          Path('map-shape/stage.txt').write_text('MAP_ROWS_PARSE\n')
+
+          phase = 'PRELUDE'
+          count = 0
+          overlong = 0
+          line_count = 0
+          shapes = Counter()
+          grammars = Counter()
+          native_rows = Counter()
+          isc_rows = Counter()
+          native_archives = {name: set() for name in ('curl_sys', 'openssl_sys', 'libz_sys')}
+          samples = {}
+          contexts = {}
+          pending = None
+          previous = ''
+          markers = Counter()
+          phases = ('PRELUDE', 'ARCHIVE_SELECTION', 'DISCARDED', 'ALLOCATED', 'LLD_TABLE')
+
+          def row_shape(line):
+              if len(line) > 16384:
+                  return 'OVERLONG'
+              words = line.split()
+              kinds = [token_kind(word) for word in words]
+              indent = len(line) - len(line.lstrip())
+              bucket = 'ZERO' if indent == 0 else 'LOW' if indent < 8 else 'HIGH'
+              return bucket + ':' + '-'.join(kinds[:12]) + ('-MORE' if len(kinds) > 12 else '')
+
+          def token_kind(token):
+              if '.rlib(' in token:
+                  return 'RLIB'
+              if re.fullmatch(r'0x[0-9a-fA-F]{1,16}', token):
+                  return 'HEX'
+              if re.fullmatch(r'[0-9]{1,20}', token):
+                  return 'DEC'
+              if token.startswith('.'):
+                  return 'SECTION'
+              if re.fullmatch(r'[()=*+,:-]+', token):
+                  return 'PUNCT'
+              return 'ATOM'
+
+          def numeric_kind(token):
+              if re.fullmatch(r'0x[0-9a-fA-F]{1,16}', token):
+                  return 'PREFIX_ZERO' if int(token, 16) == 0 else 'PREFIX_NONZERO'
+              if re.fullmatch(r'[0-9a-fA-F]{1,16}', token):
+                  base = 'DIGITS' if token.isdecimal() else 'BARE_HEX'
+                  return base + ('_ZERO' if int(token, 16) == 0 else '_NONZERO')
+              return 'OTHER'
+
+          def member_kind(token):
+              if '.rlib(' not in token:
+                  return 'OTHER'
+              if re.fullmatch(r'.+\.rlib\([^()]+\):\([^()]+\)', token):
+                  return 'SECTION_SUFFIX'
+              if token.count('.rlib(') != 1 or token.count('(') != 1 or token.count(')') != 1:
+                  return 'COMPLEX'
+              if token.endswith(')'):
+                  return 'CLOSED'
+              return 'TRAILING'
+
+          def native_family(section):
+              for family in ('text', 'rodata', 'data', 'bss', 'eh_frame', 'debug'):
+                  if section == '.' + family or section.startswith('.' + family + '.') or section.startswith('.' + family + '+'):
+                      return family
+              return 'other'
+
+          with Path('agent-native-link.map').open(encoding='utf-8', errors='replace') as source:
+              for line in source:
+                  line_count += 1
+                  lower = line.casefold()
+                  heading = ' '.join(lower.split())
+                  if pending is not None:
+                      contexts[pending] = (contexts[pending][0], row_shape(line))
+                      pending = None
+                  if heading.startswith('archive member included to satisfy reference by file'):
+                      markers['GNU_ARCHIVE'] += 1
+                      phase = 'ARCHIVE_SELECTION'
+                  elif heading == 'discarded input sections':
+                      markers['GNU_DISCARDED'] += 1
+                      phase = 'DISCARDED'
+                  elif heading == 'linker script and memory map':
+                      markers['GNU_ALLOCATED'] += 1
+                      phase = 'ALLOCATED'
+                  elif heading == 'vma lma size align out in symbol':
+                      markers['LLD_HEADER'] += 1
+                      phase = 'LLD_TABLE'
+                  if '.rlib(' not in lower:
+                      previous = line
+                      continue
+                  count += 1
+                  if len(line) > 16384:
+                      overlong += 1
+                      previous = line
+                      continue
+                  words = line.split()
+                  kinds = [token_kind(word) for word in words]
+                  assert 'RLIB' in kinds
+                  template = '-'.join(kinds[:12]) + ('-MORE' if len(kinds) > 12 else '')
+                  indent = len(line) - len(line.lstrip())
+                  indent_bucket = 'ZERO' if indent == 0 else 'LOW' if indent < 8 else 'HIGH'
+                  key = (phase, indent_bucket, template)
+                  shapes[key] += 1
+                  member_index = next(index for index, word in enumerate(words) if '.rlib(' in word)
+                  columns = tuple(numeric_kind(word) for word in words[:4])
+                  grammar_key = (phase, columns, min(len(words), 8), min(member_index, 8), member_kind(words[member_index]))
+                  grammars[grammar_key] += 1
+                  if phase != 'LLD_TABLE' or len(words) != 5 or member_index != 4 or member_kind(words[4]) != 'SECTION_SUFFIX' or any(numeric_kind(word) == 'OTHER' for word in words[:4]):
+                      raise SystemExit('LLD member row grammar unexpected')
+                  member = re.fullmatch(r'([^\s()]+\.rlib)\(([^()]+)\):\(([^()]+)\)', words[4])
+                  if not member:
+                      raise SystemExit('LLD member identity unexpected')
+                  archive = Path(member[1]).name
+                  for crate in native_archives:
+                      prefix = 'lib' + crate + '-'
+                      if archive.startswith(prefix):
+                          if not re.fullmatch(re.escape(prefix) + r'[0-9a-f]+\.rlib', archive):
+                              raise SystemExit('native rlib identity unexpected')
+                          native_archives[crate].add(archive)
+                          size_class = 'zero' if int(words[2], 16) == 0 else 'positive'
+                          native_rows[(crate, native_family(member[3]), size_class)] += 1
+                          if crate == 'curl_sys':
+                              for stem in ('inet_ntop', 'inet_pton'):
+                                  if re.search(r'(?:^|-)' + stem + r'\.o$', member[2]):
+                                      isc_rows[(stem, size_class)] += 1
+                          break
+                  if key not in samples:
+                      hex_tokens = [word.lower() for word in words if re.fullmatch(r'0x[0-9a-fA-F]{1,16}', word)]
+                      samples[key] = (hex_tokens + ['NONE', 'NONE'])[:2]
+                      contexts[key] = (row_shape(previous), 'EOF')
+                      pending = key
+                  previous = line
+
+          with Path('map-shape/shape.txt').open('w') as receipt:
+              print('schema=map-shape-v4', file=receipt)
+              print(f'rustc_release={rustc_release[0]}', file=receipt)
+              print(f'rustc_commit={rustc_commit[0]}', file=receipt)
+              print(f'llvm_version={llvm_version[0]}', file=receipt)
+              print(f'lld_version={lld[1]}', file=receipt)
+              print(f'rust_lld_sha256={linker_sha[0]}', file=receipt)
+              print(f'total_lines={line_count}', file=receipt)
+              print(f'rlib_text_lines={count}', file=receipt)
+              print(f'overlong_lines={overlong}', file=receipt)
+              print(f'distinct_shapes={len(shapes)}', file=receipt)
+              for candidate in phases:
+                  print(f'phase_{candidate.lower()}={sum(n for (p, _, _), n in shapes.items() if p == candidate)}', file=receipt)
+              for marker in ('GNU_ARCHIVE', 'GNU_DISCARDED', 'GNU_ALLOCATED', 'LLD_HEADER'):
+                  print(f'marker_{marker.lower()}={markers[marker]}', file=receipt)
+              for index, (key, n) in enumerate(sorted(shapes.items())[:64], 1):
+                  phase_name, indent_name, template = key
+                  first, second = samples[key]
+                  print(f'class_{index:02d}={phase_name}|{indent_name}|{template}|count:{n}|numeric1:{first}|numeric2:{second}', file=receipt)
+                  before, after = contexts[key]
+                  print(f'context_{index:02d}=before:{before}|after:{after}', file=receipt)
+              print(f'distinct_grammars={len(grammars)}', file=receipt)
+              for index, (key, n) in enumerate(sorted(grammars.items())[:64], 1):
+                  phase_name, columns, words, member_index, member = key
+                  print(f'grammar_{index:02d}={phase_name}|{",".join(columns)}|words:{words}|member_column:{member_index}|member:{member}|count:{n}', file=receipt)
+              print(f'grammar_overflow={str(len(grammars) > 64).lower()}', file=receipt)
+              print(f'shape_overflow={str(len(shapes) > 64).lower()}', file=receipt)
+              for crate in native_archives:
+                  print(f'native_{crate}_rlib_count={len(native_archives[crate])}', file=receipt)
+                  for family in ('text', 'rodata', 'data', 'bss', 'eh_frame', 'debug', 'other'):
+                      for size_class in ('zero', 'positive'):
+                          print(f'native_{crate}_{family}_{size_class}_map_rows={native_rows[(crate, family, size_class)]}', file=receipt)
+              for stem in ('inet_ntop', 'inet_pton'):
+                  for size_class in ('zero', 'positive'):
+                      print(f'isc_{stem}_{size_class}_map_rows={isc_rows[(stem, size_class)]}', file=receipt)
+          if not count or overlong or len(shapes) > 64 or len(grammars) > 64 or markers['LLD_HEADER'] != 1 or any(markers[name] for name in ('GNU_ARCHIVE', 'GNU_DISCARDED', 'GNU_ALLOCATED')):
+              raise SystemExit('bounded map-shape sample incomplete')
+          if any(len(archives) > 1 for archives in native_archives.values()):
+              raise SystemExit('multiple native rlib identities')
+          PY
+          printf '%s\n' 'MAP_PARSE_COMPLETE' > map-shape/stage.txt
+      - name: Mark map-shape sample complete without admission
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s map-shape/shape.txt
+          test "$(cat map-shape/stage.txt)" = 'MAP_PARSE_COMPLETE'
+          grep -Fxq 'shape_overflow=false' map-shape/shape.txt
+          grep -Fxq 'grammar_overflow=false' map-shape/shape.txt
+          grep -Fxq 'overlong_lines=0' map-shape/shape.txt
+          printf '%s\n' 'MAP_SHAPE_SAMPLE_ONLY' 'release_admission=NO' 'legal_admission=NO' 'selected_native_bytes=UNPROVEN' 'distribution_placement=UNPROVEN' > map-shape/status.txt
+      - name: Remove private linker map and build logs
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f agent-native-link.map "$RUNNER_TEMP/moth-map-shape-builder.log" "$RUNNER_TEMP/moth-map-shape-cargo.log" "$RUNNER_TEMP/moth-map-shape-linker.log"
+      - name: Bound fixed-grammar text receipt
+        id: bound-map-shape
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -d map-shape && test ! -L map-shape
+          test -f map-shape/status.txt
+          test "$(find map-shape -type f | wc -l)" -le 4
+          test -z "$(find map-shape ! -type f ! -type d -print -quit)"
+          while IFS= read -r path; do
+            case "$path" in
+              map-shape/status.txt|map-shape/identity.txt|map-shape/shape.txt|map-shape/stage.txt) ;;
+              *) exit 1 ;;
+            esac
+            test "$(wc -c < "$path")" -le 16384
+          done < <(find map-shape -type f -print)
+          test -f map-shape/stage.txt
+          test "$(wc -l < map-shape/stage.txt)" -eq 1
+          test "$(wc -c < map-shape/stage.txt)" -le 32
+          case "$(cat map-shape/stage.txt)" in
+            SOURCE_GUARD|BUILDER_IMAGE|CARGO_LINK_MAP|MAP_GUARD|LINKER_IDENTITY_COMMAND|RUST_LLD_PATH|RUST_LLD_VERSION|RUST_LLD_HASH|RUSTC_VERSION|LINKER_IDENTITY_PARSE|MAP_ROWS_PARSE|MAP_PARSE_COMPLETE) ;;
+            *) exit 1 ;;
+          esac
+          test "$(du -sk map-shape | cut -f1)" -le 64
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() && steps.bound-map-shape.outcome == 'success' }}
+        with:
+          name: native-map-shape-linux-amd64-${{ github.sha }}
+          path: map-shape/
+          if-no-files-found: error
+          retention-days: 7
