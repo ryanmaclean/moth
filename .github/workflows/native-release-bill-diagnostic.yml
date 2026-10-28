@@ -66,9 +66,18 @@ jobs:
             > diagnostic/unstripped-binary-sha256.txt
           readelf -d target/x86_64-unknown-linux-gnu/release/agent \
             > diagnostic/dynamic-section.txt
-          grep -E '(^Archive member included|lib(curl|ssl|crypto|z)\.a\()' \
-            agent-native-link.map > diagnostic/native-map-lines.txt || true
-          test -s diagnostic/native-map-lines.txt
+          wc -cl agent-native-link.map > diagnostic/native-map-size.txt
+          awk 'NR <= 80 { print }' agent-native-link.map \
+            > diagnostic/native-map-head.txt
+          awk 'tolower($0) ~ /curl|openssl|libssl|libcrypto|libz|inet_ntop|inet_pton/ {
+                 if (++matches <= 160) print
+               }' agent-native-link.map > diagnostic/native-map-probes.txt
+          awk '/^Archive member included|lib(curl|ssl|crypto|z)\.a\(/ {
+                 matches++
+                 if (matches <= 160) print
+               }
+               END { print matches+0 > "diagnostic/native-map-match-count.txt" }' \
+            agent-native-link.map > diagnostic/native-map-lines.txt
           : > diagnostic/native-archive-sha256.txt
           : > diagnostic/native-archive-members.txt
           for name in libcurl.a libssl.a libcrypto.a libz.a; do
@@ -121,7 +130,7 @@ jobs:
           test "$(find diagnostic -type l | wc -l)" -eq 0
           while IFS= read -r path; do
             case "$path" in
-              diagnostic/status.txt|diagnostic/identity.txt|diagnostic/changed-paths.txt|diagnostic/builder-image-id.txt|diagnostic/rustc-version.txt|diagnostic/cargo-version.txt|diagnostic/curl-feature-tree.txt|diagnostic/unstripped-binary-sha256.txt|diagnostic/dynamic-section.txt|diagnostic/native-map-lines.txt|diagnostic/native-archive-sha256.txt|diagnostic/native-archive-members.txt|diagnostic/legal/candidate-text-sha256.txt) ;;
+              diagnostic/status.txt|diagnostic/identity.txt|diagnostic/changed-paths.txt|diagnostic/builder-image-id.txt|diagnostic/rustc-version.txt|diagnostic/cargo-version.txt|diagnostic/curl-feature-tree.txt|diagnostic/unstripped-binary-sha256.txt|diagnostic/dynamic-section.txt|diagnostic/native-map-size.txt|diagnostic/native-map-head.txt|diagnostic/native-map-probes.txt|diagnostic/native-map-lines.txt|diagnostic/native-map-match-count.txt|diagnostic/native-archive-sha256.txt|diagnostic/native-archive-members.txt|diagnostic/legal/candidate-text-sha256.txt) ;;
               *) exit 1 ;;
             esac
             test "$(wc -c < "$path")" -le 2097152
