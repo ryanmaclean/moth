@@ -96,11 +96,27 @@ jobs:
 
       # --------------- Common: stage + checksum + upload ---------------
       - name: Stage tarball
+        shell: bash
         run: |
+          set -euo pipefail
           STAGE="agent-${{ github.ref_name }}-${{ matrix.target }}"
           mkdir -p "dist/$STAGE"
           cp target/${{ matrix.target }}/release/agent "dist/$STAGE/"
           cp LICENSE README.md CHANGELOG.md "dist/$STAGE/"
+          NOTICE_ROOT="dist/$STAGE/THIRD_PARTY_NOTICES/native"
+          mkdir -p "$NOTICE_ROOT"
+          test "$(wc -l < packaging/native-notice-files.txt)" -eq 14
+          test "$(sort -u packaging/native-notice-files.txt | wc -l)" -eq 14
+          while IFS= read -r source; do
+            case "$source" in vendor/*) ;; *) exit 1 ;; esac
+            case "$source" in *..*|*//*) exit 1 ;; esac
+            test -f "$source" && test ! -L "$source"
+            target="$NOTICE_ROOT/$source"
+            mkdir -p "$(dirname "$target")"
+            cp "$source" "$target"
+            cmp -s "$source" "$target"
+          done < packaging/native-notice-files.txt
+          cp packaging/native-notice-files.txt "$NOTICE_ROOT/FILES.txt"
           tar -C dist -czf "dist/${STAGE}.tar.gz" "$STAGE"
 
       - name: SHA-256
