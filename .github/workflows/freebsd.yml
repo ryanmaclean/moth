@@ -517,11 +517,67 @@ jobs:
                   hashes.append(matches[0][2])
               if hashes[0] != hashes[1]:
                   raise SystemExit('ISC native and rlib object bytes differ')
+          # LLD 21.1.8 Driver.cpp emits ordinary direct archive inputs as
+          # members<TAB>extracted<TAB>archive. Keep paths private and bind only
+          # the four same-build native .a files to those same-link rows.
+          stats_path = Path('agent-native-archive-stats.txt')
+          try:
+              stats_ok = stats_path.is_file() and not stats_path.is_symlink() and 0 < stats_path.stat().st_size <= 1048576
+          except OSError:
+              stats_ok = False
+          if not stats_ok:
+              raise SystemExit('native archive stats bounds')
+          try:
+              stats_lines = stats_path.read_text(encoding='utf-8').splitlines()
+          except (OSError, UnicodeError):
+              raise SystemExit('native archive stats unreadable') from None
+          if not 1 < len(stats_lines) <= 8192 or stats_lines[0] != 'members\textracted\tarchive':
+              raise SystemExit('native archive stats header')
+          stats_rows = []
+          for line in stats_lines[1:]:
+              if len(line) > 4096:
+                  raise SystemExit('native archive stats line bound')
+              fields = line.split('\t')
+              if len(fields) != 3 or any(not re.fullmatch(r'[0-9]{1,20}', value) for value in fields[:2]) or not fields[2] or '\x00' in fields[2]:
+                  raise SystemExit('native archive stats row grammar')
+              member_count, extracted_count = int(fields[0]), int(fields[1])
+              if extracted_count > member_count:
+                  raise SystemExit('native archive stats count')
+              stats_rows.append((member_count, extracted_count, fields[2]))
+          direct_inputs = {}
+          for label in ('curl_a', 'ssl_a', 'crypto_a', 'z_a'):
+              archive = archives[label].resolve()
+              matches = []
+              for member_count, extracted_count, raw_path in stats_rows:
+                  if raw_path.startswith('/work/'):
+                      linked_path = root / raw_path.removeprefix('/work/')
+                  elif not raw_path.startswith('/'):
+                      linked_path = root / raw_path
+                  else:
+                      continue
+                  try:
+                      same_archive = linked_path.resolve() == archive
+                  except (OSError, RuntimeError):
+                      raise SystemExit('native archive stats path invalid') from None
+                  if same_archive:
+                      matches.append((member_count, extracted_count))
+              if len(matches) > 8 or any(count != len(records[label]) for count, _ in matches):
+                  raise SystemExit('native direct archive identity ambiguous')
+              if sum(extracted for _, extracted in matches) > len(records[label]):
+                  raise SystemExit('native direct archive extraction count')
+              direct_inputs[label] = (len(matches), sum(extracted for _, extracted in matches))
           with Path('parity/native-inventory.txt').open('w') as receipt:
               print('schema=moth-local-native-archive-inventory/v1', file=receipt)
               print('same_build_archive_inventory=yes', file=receipt)
-              print('native_a_link_input_identity=UNPROVEN', file=receipt)
+              # Whole-archive inputs do not enter LLD's archive-stats table.
+              # A missing row is therefore unknown, never proof of absence.
+              print('native_a_link_input_identity=LLD21_STATS_POSITIVE_ONLY', file=receipt)
               print('full_allocated_section_reconciliation=UNPROVEN', file=receipt)
+              print(f'archive_stats_rows={len(stats_rows)}', file=receipt)
+              for label, (rows, extracted) in sorted(direct_inputs.items()):
+                  print(f'{label}_direct_input={"yes" if rows else "UNPROVEN"}', file=receipt)
+                  print(f'{label}_direct_input_rows={rows}', file=receipt)
+                  print(f'{label}_direct_extracted_members={extracted}', file=receipt)
               for label, path in (('why_extract', Path('agent-native-why-extract.txt')),
                                   ('archive_stats', Path('agent-native-archive-stats.txt')),
                                   ('private_gc_icf_log', Path(os.environ['RUNNER_TEMP'], 'moth-parity-cargo.log'))):
@@ -858,7 +914,7 @@ jobs:
           grep -Fxq 'native_discarded_member_scope=UNPROVEN' parity/map-join.txt
           grep -Fxq 'full_allocated_section_reconciliation=UNPROVEN' parity/native-inventory.txt
           grep -Fxq 'same_build_archive_inventory=yes' parity/native-inventory.txt
-          grep -Fxq 'native_a_link_input_identity=UNPROVEN' parity/native-inventory.txt
+          grep -Fxq 'native_a_link_input_identity=LLD21_STATS_POSITIVE_ONLY' parity/native-inventory.txt
           test -s parity/native-members.txt
           grep -Fxq 'schema=moth-local-native-member-hashes/v1' parity/native-members.txt
           for stem in inet_ntop inet_pton; do
