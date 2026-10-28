@@ -351,11 +351,92 @@ jobs:
           mkdir -p "$RUNNER_TEMP/moth-parity/dist"
           docker build --target builder -t moth-parity-builder:diagnostic . > "$RUNNER_TEMP/moth-parity-builder.log" 2>&1
           docker run --rm moth-parity-builder:diagnostic rustc -V | grep -Eq '^rustc 1\.94\.1 '
+          docker run --rm moth-parity-builder:diagnostic rustc -vV | grep -Fxq 'commit-hash: e408947bfd200af42db322daf0fadfe7e26d3bd1'
+          linker_hash="$(docker run --rm moth-parity-builder:diagnostic sh -eu -c 'linker="$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-lld"; test -x "$linker"; "$linker" -flavor gnu --version | grep -Eq "^LLD 21\\.1\\.8 "; sha256sum "$linker" | cut -d " " -f 1')"
+          test "$linker_hash" = c30db53247911b065bf8b279bbbcdf8f516702750233a6e6ef815c1826b7ee53
+          rm -f agent-native-link.map
           docker run --rm -v "$PWD:/work" -w /work moth-parity-builder:diagnostic \
-            cargo build --release --locked --frozen --offline -p cli --target x86_64-unknown-linux-gnu \
+            cargo rustc --release --locked --frozen --offline -p cli --bin agent \
+              --target x86_64-unknown-linux-gnu -- \
+              -C link-arg=-Wl,-Map=/work/agent-native-link.map \
             > "$RUNNER_TEMP/moth-parity-cargo.log" 2>&1
+          test -s agent-native-link.map
+          test "$(wc -c < agent-native-link.map)" -le 16777216
+          python3 - <<'PY'
+          from collections import Counter
+          from pathlib import Path
+          import hashlib
+          import re
+
+          map_path = Path('agent-native-link.map')
+          binary = Path('target/x86_64-unknown-linux-gnu/release/agent')
+          if not binary.is_file() or binary.is_symlink():
+              raise SystemExit('same-link binary missing')
+          target = ('curl_sys', 'openssl_sys', 'libz_sys')
+          archives = {name: set() for name in target}
+          rows = Counter()
+          isc = Counter()
+          headers = 0
+          lines = 0
+          rlib_rows = 0
+          with map_path.open(encoding='utf-8') as source:
+              for line in source:
+                  lines += 1
+                  if lines > 100000 or len(line) > 16384:
+                      raise SystemExit('map bounds exceeded')
+                  heading = ' '.join(line.casefold().split())
+                  if heading == 'vma lma size align out in symbol':
+                      headers += 1
+                  if heading.startswith('archive member included') or heading in ('discarded input sections', 'linker script and memory map'):
+                      raise SystemExit('unexpected map dialect')
+                  if '.rlib(' not in line:
+                      continue
+                  rlib_rows += 1
+                  words = line.split()
+                  if headers != 1 or len(words) != 5 or any(not re.fullmatch(r'[0-9a-fA-F]{1,16}', word) for word in words[:3]) or not re.fullmatch(r'[0-9]{1,20}', words[3]):
+                      raise SystemExit('LLD row grammar unexpected')
+                  member = re.fullmatch(r'([^\s()]+\.rlib)\(([^()]+)\):\(([^()]+)\)', words[4])
+                  if not member:
+                      raise SystemExit('LLD member grammar unexpected')
+                  archive = Path(member[1]).name
+                  section = member[3]
+                  size = int(words[2], 16)
+                  for name in target:
+                      prefix = 'lib' + name + '-'
+                      if archive.startswith(prefix):
+                          if not re.fullmatch(re.escape(prefix) + r'[0-9a-f]+\.rlib', archive):
+                              raise SystemExit('native rlib identity unexpected')
+                          archives[name].add(archive)
+                          family = next((kind for kind in ('text', 'rodata', 'data', 'bss', 'eh_frame', 'debug')
+                                         if section == '.' + kind or section.startswith('.' + kind + '.') or section.startswith('.' + kind + '+')), 'other')
+                          rows[(name, family, 'positive' if size else 'zero')] += 1
+                          if name == 'curl_sys':
+                              for stem in ('inet_ntop', 'inet_pton'):
+                                  if re.search(r'(?:^|-)' + stem + r'\.o$', member[2]):
+                                      isc[(stem, 'positive' if size else 'zero')] += 1
+                          break
+          if headers != 1 or not rlib_rows or any(len(archives[name]) != 1 or rows[(name, 'text', 'positive')] == 0 for name in target) or any(isc[(stem, 'positive')] == 0 for stem in ('inet_ntop', 'inet_pton')):
+              raise SystemExit('native LLD evidence incomplete')
+          sha = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+          with Path('parity/map-join.txt').open('w') as receipt:
+              print('schema=moth-local-map-release-layout-join/v1', file=receipt)
+              print('rust_lld_sha256=c30db53247911b065bf8b279bbbcdf8f516702750233a6e6ef815c1826b7ee53', file=receipt)
+              print('map_sha256=' + sha(map_path), file=receipt)
+              print('linked_agent_sha256=' + sha(binary), file=receipt)
+              print(f'map_lines={lines}', file=receipt)
+              print(f'rlib_rows={rlib_rows}', file=receipt)
+              for name in target:
+                  print(f'{name}_rlib_count={len(archives[name])}', file=receipt)
+                  for family in ('text', 'rodata', 'data', 'bss', 'eh_frame', 'debug', 'other'):
+                      for size_class in ('zero', 'positive'):
+                          print(f'{name}_{family}_{size_class}_map_rows={rows[(name, family, size_class)]}', file=receipt)
+              for stem in ('inet_ntop', 'inet_pton'):
+                  for size_class in ('zero', 'positive'):
+                      print(f'isc_{stem}_{size_class}_map_rows={isc[(stem, size_class)]}', file=receipt)
+          PY
           docker run --rm -v "$PWD:/work" -w /work moth-parity-builder:diagnostic \
             strip target/x86_64-unknown-linux-gnu/release/agent
+          printf 'stripped_agent_sha256=%s\n' "$(sha256sum target/x86_64-unknown-linux-gnu/release/agent | cut -d' ' -f1)" >> parity/map-join.txt
           stage=agent-parity-diagnostic-x86_64-unknown-linux-gnu
           mkdir -p "$RUNNER_TEMP/moth-parity/dist/$stage/THIRD_PARTY_NOTICES/native"
           cp target/x86_64-unknown-linux-gnu/release/agent "$RUNNER_TEMP/moth-parity/dist/$stage/"
@@ -479,7 +560,11 @@ jobs:
           set -euo pipefail
           test "$(wc -l < parity/text-sha256.txt)" -eq 16
           grep -Fxq 'tar_oci_binary_identity=yes' parity/tar-sha256.txt
-          printf '%s\n' 'LOCAL_RELEASE_LAYOUT_PARITY_ONLY' 'release_admission=NO' 'legal_admission=NO' 'pushed_image_parity=UNPROVEN' 'native_link_retention=UNPROVEN' 'base_image_notice_coverage=UNPROVEN' > parity/status.txt
+          test -s parity/map-join.txt
+          test "$(grep -c '^stripped_agent_sha256=' parity/map-join.txt)" -eq 1
+          test "$(grep -c '^tar_agent_sha256=' parity/tar-sha256.txt)" -eq 1
+          test "$(sed -n 's/^stripped_agent_sha256=//p' parity/map-join.txt)" = "$(sed -n 's/^tar_agent_sha256=//p' parity/tar-sha256.txt)"
+          printf '%s\n' 'LOCAL_NATIVE_MAP_RELEASE_LAYOUT_JOIN_ONLY' 'release_admission=NO' 'legal_admission=NO' 'pushed_image_parity=UNPROVEN' 'native_link_retention=LOCAL_LLD_ROWS_OBSERVED' 'selected_native_bytes=UNPROVEN' 'notice_custody=LOCAL_14_SOURCE_TAR_OCI_BYTE_JOIN' 'base_image_notice_coverage=UNPROVEN' > parity/status.txt
 
       - name: Remove private parity payloads and containers
         if: always()
@@ -490,7 +575,13 @@ jobs:
             docker rm -f "$(cat "$RUNNER_TEMP/moth-parity/container-id")" >/dev/null
           fi
           rm -rf "$RUNNER_TEMP/moth-parity" "$GITHUB_WORKSPACE/release-payload"
+          rm -f agent-native-link.map target/x86_64-unknown-linux-gnu/release/agent
           rm -f "$RUNNER_TEMP/moth-parity-builder.log" "$RUNNER_TEMP/moth-parity-cargo.log" "$RUNNER_TEMP/moth-parity-oci.log"
+          for private in agent-native-link.map target/x86_64-unknown-linux-gnu/release/agent \
+            "$RUNNER_TEMP/moth-parity" "$GITHUB_WORKSPACE/release-payload" \
+            "$RUNNER_TEMP/moth-parity-builder.log" "$RUNNER_TEMP/moth-parity-cargo.log" "$RUNNER_TEMP/moth-parity-oci.log"; do
+            test ! -e "$private" && test ! -L "$private"
+          done
 
       - name: Bound text-only parity receipt
         id: bound-parity
@@ -500,11 +591,11 @@ jobs:
           set -euo pipefail
           test -d parity && test ! -L parity
           test -f parity/status.txt
-          test "$(find parity -type f | wc -l)" -le 5
+          test "$(find parity -type f | wc -l)" -le 6
           test -z "$(find parity ! -type f ! -type d -print -quit)"
           while IFS= read -r path; do
             case "$path" in
-              parity/status.txt|parity/identity.txt|parity/tar-sha256.txt|parity/image.txt|parity/text-sha256.txt) ;;
+              parity/status.txt|parity/identity.txt|parity/tar-sha256.txt|parity/image.txt|parity/text-sha256.txt|parity/map-join.txt) ;;
               *) exit 1 ;;
             esac
             test "$(wc -c < "$path")" -le 8192
