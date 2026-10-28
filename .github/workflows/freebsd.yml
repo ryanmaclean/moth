@@ -693,10 +693,49 @@ jobs:
           map_hash = re.findall(r'^map_sha256=([0-9a-f]{64})$', receipt.read_text(), re.M)
           if len(map_hash) != 1 or hashlib.sha256(Path('agent-native-link.map').read_bytes()).hexdigest() != map_hash[0]:
               raise SystemExit('mapped linker map identity')
+          inventory = Path('parity/native-inventory.txt').read_text()
+          bill_path = Path('parity/native-members.txt')
+          if not bill_path.is_file() or bill_path.is_symlink() or not 0 < bill_path.stat().st_size <= 1048576:
+              raise SystemExit('native member bill bounds')
+          bill_lines = bill_path.read_text(encoding='ascii').splitlines(keepends=True)
+          if not 1 < len(bill_lines) <= 8192 or bill_lines[0] != 'schema=moth-local-native-member-hashes/v1\n':
+              raise SystemExit('native member bill header')
+          native_pairs = {'curl_a': 'curl_sys_rlib', 'ssl_a': 'openssl_sys_rlib',
+                          'crypto_a': 'openssl_sys_rlib', 'z_a': 'libz_sys_rlib'}
+          bill_labels = set(native_pairs) | set(native_pairs.values())
+          billed = {label: {} for label in bill_labels}
+          bill_rows = {label: [] for label in bill_labels}
+          for line in bill_lines[1:]:
+              if len(line) > 256:
+                  raise SystemExit('native member bill line bound')
+              match = re.fullmatch(r'(curl_a|ssl_a|crypto_a|z_a|curl_sys_rlib|openssl_sys_rlib|libz_sys_rlib) ([0-9]+) ([0-9a-f]{64}) ([0-9a-f]{64}) ([0-9]+)\n', line)
+              if match is None:
+                  raise SystemExit('native member bill grammar')
+              label, ordinal, name_hash, object_hash, size = match.groups()
+              if int(ordinal) != len(bill_rows[label]) or name_hash in billed[label] or not 0 < int(size) <= 8388608:
+                  raise SystemExit('native member bill identity')
+              bill_rows[label].append(line)
+              billed[label][name_hash] = (object_hash, int(size))
+          for label in bill_labels:
+              expected_count = re.findall(r'^' + label + r'_members=([0-9]+)$', inventory, re.M)
+              expected_hash = re.findall(r'^' + label + r'_member_bill_sha256=([0-9a-f]{64})$', inventory, re.M)
+              if len(expected_count) != 1 or len(expected_hash) != 1 or len(bill_rows[label]) != int(expected_count[0]) or not bill_rows[label]:
+                  raise SystemExit('native member inventory count')
+              if hashlib.sha256(''.join(bill_rows[label]).encode()).hexdigest() != expected_hash[0]:
+                  raise SystemExit('native member inventory hash')
+          native_by_rlib = {name: {} for name in names}
+          for label, rlib_label in native_pairs.items():
+              rlib_name = rlib_label.removesuffix('_rlib')
+              for name_hash, object_identity in billed[label].items():
+                  if billed[rlib_label].get(name_hash) != object_identity or name_hash in native_by_rlib[rlib_name]:
+                      raise SystemExit('native object not uniquely bundled')
+                  native_by_rlib[rlib_name][name_hash] = (label, *object_identity)
           counters = Counter()
           members = {name: set() for name in names}
           ranges = []
           digests = {name: hashlib.sha256() for name in names}
+          selected_native = {label: set() for label in native_pairs}
+          selected_rows = {label: [] for label in native_pairs}
           isc = Counter()
           lines = 0
           output_section = None
@@ -753,6 +792,20 @@ jobs:
                   counters[(name, 'file_rows')] += 1
                   counters[(name, 'file_bytes')] += size
                   digests[name].update(vma.to_bytes(8, 'little') + size.to_bytes(8, 'little') + hashlib.sha256(new).digest())
+                  name_hash = hashlib.sha256(member.encode()).hexdigest()
+                  if name_hash not in billed[name + '_rlib']:
+                      raise SystemExit('selected rlib member absent from bill')
+                  native = native_by_rlib[name].get(name_hash)
+                  if native is None:
+                      counters[(name, 'other_rlib_file_rows')] += 1
+                  else:
+                      label, object_hash, object_size = native
+                      if billed[name + '_rlib'][name_hash] != (object_hash, object_size):
+                          raise SystemExit('selected native object byte identity')
+                      selected_native[label].add(name_hash)
+                      selected_rows[label].append((vma, size, name_hash, object_hash))
+                      counters[(label, 'file_rows')] += 1
+                      counters[(label, 'file_bytes')] += size
                   if name == 'curl_sys':
                       for stem in ('inet_ntop', 'inet_pton'):
                           if re.search(r'(?:^|-)' + stem + r'\.o$', member):
@@ -762,16 +815,30 @@ jobs:
               raise SystemExit('native file-backed ranges overlap')
           if any(counters[(name, 'file_bytes')] == 0 for name in names) or any(isc[stem] == 0 for stem in ('inet_ntop', 'inet_pton')):
               raise SystemExit('native file-backed witness missing')
+          if any(not selected_native[label] or not selected_rows[label] for label in native_pairs):
+              raise SystemExit('native original object map join missing')
           if lines != int(re.findall(r'^map_lines=([0-9]+)$', receipt.read_text(), re.M)[0]):
               raise SystemExit('native map changed after parse')
           with receipt.open('a') as output:
               print('native_file_backed_scope=LOCAL_MAP_PT_LOAD_PRESTRIP_STRIPPED_EQUAL', file=output)
               print('native_discarded_member_scope=UNPROVEN', file=output)
+              print('native_original_object_scope=LOCAL_A_TO_RLIB_SELECTED_MAP_MEMBER_JOIN', file=output)
+              print('native_original_object_selected_bytes=UNPROVEN', file=output)
               for name in names:
                   for field in ('map_rows', 'zero_rows', 'nonfile_rows', 'file_rows', 'file_bytes'):
                       print(f'{name}_{field}={counters[(name, field)]}', file=output)
                   print(f'{name}_file_members={len(members[name])}', file=output)
                   print(f'{name}_mapped_slice_digest={digests[name].hexdigest()}', file=output)
+                  print(f'{name}_other_rlib_file_rows={counters[(name, "other_rlib_file_rows")]}', file=output)
+              for label in sorted(native_pairs):
+                  binding = hashlib.sha256()
+                  for vma, size, name_hash, object_hash in sorted(selected_rows[label]):
+                      binding.update(bytes.fromhex(name_hash) + bytes.fromhex(object_hash) +
+                                     vma.to_bytes(8, 'little') + size.to_bytes(8, 'little'))
+                  print(f'{label}_selected_map_members={len(selected_native[label])}', file=output)
+                  print(f'{label}_selected_file_rows={counters[(label, "file_rows")]}', file=output)
+                  print(f'{label}_selected_file_bytes={counters[(label, "file_bytes")]}', file=output)
+                  print(f'{label}_selected_member_map_digest={binding.hexdigest()}', file=output)
               for stem in ('inet_ntop', 'inet_pton'):
                   print(f'isc_{stem}_file_bytes={isc[stem]}', file=output)
           PY
@@ -912,6 +979,12 @@ jobs:
           test "$(sed -n 's/^stripped_agent_sha256=//p' parity/map-join.txt)" = "$(sed -n 's/^tar_agent_sha256=//p' parity/tar-sha256.txt)"
           grep -Fxq 'native_file_backed_scope=LOCAL_MAP_PT_LOAD_PRESTRIP_STRIPPED_EQUAL' parity/map-join.txt
           grep -Fxq 'native_discarded_member_scope=UNPROVEN' parity/map-join.txt
+          grep -Fxq 'native_original_object_scope=LOCAL_A_TO_RLIB_SELECTED_MAP_MEMBER_JOIN' parity/map-join.txt
+          grep -Fxq 'native_original_object_selected_bytes=UNPROVEN' parity/map-join.txt
+          for label in crypto_a curl_a ssl_a z_a; do
+            grep -Eq "^${label}_selected_map_members=[1-9][0-9]*$" parity/map-join.txt
+            grep -Eq "^${label}_selected_file_rows=[1-9][0-9]*$" parity/map-join.txt
+          done
           grep -Fxq 'full_allocated_section_reconciliation=UNPROVEN' parity/native-inventory.txt
           grep -Fxq 'same_build_archive_inventory=yes' parity/native-inventory.txt
           grep -Fxq 'native_a_link_input_identity=LLD21_STATS_POSITIVE_ONLY' parity/native-inventory.txt
