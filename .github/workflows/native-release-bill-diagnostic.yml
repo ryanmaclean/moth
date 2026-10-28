@@ -67,17 +67,24 @@ jobs:
           readelf -d target/x86_64-unknown-linux-gnu/release/agent \
             > diagnostic/dynamic-section.txt
           wc -cl agent-native-link.map > diagnostic/native-map-size.txt
-          awk 'NR <= 80 { print }' agent-native-link.map \
-            > diagnostic/native-map-head.txt
-          awk 'tolower($0) ~ /curl|openssl|libssl|libcrypto|libz|inet_ntop|inet_pton/ {
-                 if (++matches <= 160) print
-               }' agent-native-link.map > diagnostic/native-map-probes.txt
-          awk '/^Archive member included|lib(curl|ssl|crypto|z)\.a\(/ {
-                 matches++
-                 if (matches <= 160) print
-               }
-               END { print matches+0 > "diagnostic/native-map-match-count.txt" }' \
-            agent-native-link.map > diagnostic/native-map-lines.txt
+          awk '
+            {
+              line = tolower($0)
+              total++
+              if (line ~ /^archive member included/) archive_header++
+              if (line ~ /libcurl\.a\(/) curl_archive++
+              if (line ~ /libssl\.a\(/) ssl_archive++
+              if (line ~ /libcrypto\.a\(/) crypto_archive++
+              if (line ~ /libz\.a\(/) z_archive++
+              if (line ~ /\.rlib\(/) rust_archive++
+              if (line ~ /curl/ && line ~ /\.rlib\(/) curl_rust_archive++
+              if (line ~ /inet_ntop/) inet_ntop++
+              if (line ~ /inet_pton/) inet_pton++
+              if (line ~ /discarded input sections/) discarded_header++
+            }
+            END {
+              printf "total_lines=%d\narchive_header=%d\nlibcurl_a=%d\nlibssl_a=%d\nlibcrypto_a=%d\nlibz_a=%d\nrlib_member=%d\ncurl_rlib_member=%d\ninet_ntop=%d\ninet_pton=%d\ndiscarded_header=%d\n", total, archive_header, curl_archive, ssl_archive, crypto_archive, z_archive, rust_archive, curl_rust_archive, inet_ntop, inet_pton, discarded_header
+            }' agent-native-link.map > diagnostic/native-map-pattern-counts.txt
           : > diagnostic/native-archive-sha256.txt
           : > diagnostic/native-archive-members.txt
           for name in libcurl.a libssl.a libcrypto.a libz.a; do
@@ -130,7 +137,7 @@ jobs:
           test "$(find diagnostic -type l | wc -l)" -eq 0
           while IFS= read -r path; do
             case "$path" in
-              diagnostic/status.txt|diagnostic/identity.txt|diagnostic/changed-paths.txt|diagnostic/builder-image-id.txt|diagnostic/rustc-version.txt|diagnostic/cargo-version.txt|diagnostic/curl-feature-tree.txt|diagnostic/unstripped-binary-sha256.txt|diagnostic/dynamic-section.txt|diagnostic/native-map-size.txt|diagnostic/native-map-head.txt|diagnostic/native-map-probes.txt|diagnostic/native-map-lines.txt|diagnostic/native-map-match-count.txt|diagnostic/native-archive-sha256.txt|diagnostic/native-archive-members.txt|diagnostic/legal/candidate-text-sha256.txt) ;;
+              diagnostic/status.txt|diagnostic/identity.txt|diagnostic/changed-paths.txt|diagnostic/builder-image-id.txt|diagnostic/rustc-version.txt|diagnostic/cargo-version.txt|diagnostic/curl-feature-tree.txt|diagnostic/unstripped-binary-sha256.txt|diagnostic/dynamic-section.txt|diagnostic/native-map-size.txt|diagnostic/native-map-pattern-counts.txt|diagnostic/native-archive-sha256.txt|diagnostic/native-archive-members.txt|diagnostic/legal/candidate-text-sha256.txt) ;;
               *) exit 1 ;;
             esac
             test "$(wc -c < "$path")" -le 2097152
