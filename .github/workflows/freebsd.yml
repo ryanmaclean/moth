@@ -352,12 +352,12 @@ jobs:
           printf '%s\n' BUILDER_IMAGE > parity/stage.txt
           docker build --target builder -t moth-parity-builder:diagnostic . > "$RUNNER_TEMP/moth-parity-builder.log" 2>&1
           printf '%s\n' RUSTC_IDENTITY > parity/stage.txt
-          docker run --rm moth-parity-builder:diagnostic rustc -V > "$RUNNER_TEMP/moth-parity-rustc-version.log"
+          docker run --rm moth-parity-builder:diagnostic rustc -V > "$RUNNER_TEMP/moth-parity-rustc-version.log" 2>&1
           grep -Eq '^rustc 1\.94\.1 ' "$RUNNER_TEMP/moth-parity-rustc-version.log"
-          docker run --rm moth-parity-builder:diagnostic rustc -vV > "$RUNNER_TEMP/moth-parity-rustc-identity.log"
+          docker run --rm moth-parity-builder:diagnostic rustc -vV > "$RUNNER_TEMP/moth-parity-rustc-identity.log" 2>&1
           grep -Fxq 'commit-hash: e408947bfd200af42db322daf0fadfe7e26d3bd1' "$RUNNER_TEMP/moth-parity-rustc-identity.log"
           printf '%s\n' LINKER_IDENTITY > parity/stage.txt
-          linker_hash="$(docker run --rm moth-parity-builder:diagnostic sh -eu -c 'linker="$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-lld"; test -x "$linker"; version="$("$linker" -flavor gnu --version)"; case "$version" in "LLD 21.1.8 "*) ;; *) exit 1 ;; esac; hash="$(sha256sum "$linker")"; printf "%s\n" "${hash%% *}"')"
+          linker_hash="$(docker run --rm moth-parity-builder:diagnostic sh -eu -c 'linker="$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-lld"; test -x "$linker"; version="$("$linker" -flavor gnu --version)"; case "$version" in "LLD 21.1.8 "*) ;; *) exit 1 ;; esac; hash="$(sha256sum "$linker")"; printf "%s\n" "${hash%% *}"' 2> "$RUNNER_TEMP/moth-parity-linker-identity.log")"
           test "$linker_hash" = c30db53247911b065bf8b279bbbcdf8f516702750233a6e6ef815c1826b7ee53
           printf '%s\n' CARGO_LINK_MAP > parity/stage.txt
           rm -f agent-native-link.map
@@ -579,8 +579,8 @@ jobs:
           test "$(grep -c '^stripped_agent_sha256=' parity/map-join.txt)" -eq 1
           test "$(grep -c '^tar_agent_sha256=' parity/tar-sha256.txt)" -eq 1
           test "$(sed -n 's/^stripped_agent_sha256=//p' parity/map-join.txt)" = "$(sed -n 's/^tar_agent_sha256=//p' parity/tar-sha256.txt)"
-          printf '%s\n' 'LOCAL_NATIVE_MAP_RELEASE_LAYOUT_JOIN_ONLY' 'release_admission=NO' 'legal_admission=NO' 'pushed_image_parity=UNPROVEN' 'native_link_retention=LOCAL_LLD_ROWS_OBSERVED' 'selected_native_bytes=UNPROVEN' 'notice_custody=LOCAL_14_SOURCE_TAR_OCI_BYTE_JOIN' 'base_image_notice_coverage=UNPROVEN' > parity/status.txt
           printf '%s\n' COMPLETE > parity/stage.txt
+          printf '%s\n' 'LOCAL_NATIVE_MAP_RELEASE_LAYOUT_JOIN_ONLY' 'release_admission=NO' 'legal_admission=NO' 'pushed_image_parity=UNPROVEN' 'native_link_retention=LOCAL_LLD_ROWS_OBSERVED' 'selected_native_bytes=UNPROVEN' 'notice_custody=LOCAL_14_SOURCE_TAR_OCI_BYTE_JOIN' 'base_image_notice_coverage=UNPROVEN' > parity/status.txt
 
       - name: Remove private parity payloads and containers
         if: always()
@@ -592,10 +592,10 @@ jobs:
           fi
           rm -rf "$RUNNER_TEMP/moth-parity" "$GITHUB_WORKSPACE/release-payload"
           rm -f agent-native-link.map target/x86_64-unknown-linux-gnu/release/agent
-          rm -f "$RUNNER_TEMP/moth-parity-builder.log" "$RUNNER_TEMP/moth-parity-rustc-version.log" "$RUNNER_TEMP/moth-parity-rustc-identity.log" "$RUNNER_TEMP/moth-parity-cargo.log" "$RUNNER_TEMP/moth-parity-oci.log"
+          rm -f "$RUNNER_TEMP/moth-parity-builder.log" "$RUNNER_TEMP/moth-parity-rustc-version.log" "$RUNNER_TEMP/moth-parity-rustc-identity.log" "$RUNNER_TEMP/moth-parity-linker-identity.log" "$RUNNER_TEMP/moth-parity-cargo.log" "$RUNNER_TEMP/moth-parity-oci.log"
           for private in agent-native-link.map target/x86_64-unknown-linux-gnu/release/agent \
             "$RUNNER_TEMP/moth-parity" "$GITHUB_WORKSPACE/release-payload" \
-            "$RUNNER_TEMP/moth-parity-builder.log" "$RUNNER_TEMP/moth-parity-rustc-version.log" "$RUNNER_TEMP/moth-parity-rustc-identity.log" "$RUNNER_TEMP/moth-parity-cargo.log" "$RUNNER_TEMP/moth-parity-oci.log"; do
+            "$RUNNER_TEMP/moth-parity-builder.log" "$RUNNER_TEMP/moth-parity-rustc-version.log" "$RUNNER_TEMP/moth-parity-rustc-identity.log" "$RUNNER_TEMP/moth-parity-linker-identity.log" "$RUNNER_TEMP/moth-parity-cargo.log" "$RUNNER_TEMP/moth-parity-oci.log"; do
             test ! -e "$private" && test ! -L "$private"
           done
 
