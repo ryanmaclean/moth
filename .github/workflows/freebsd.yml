@@ -570,6 +570,7 @@ jobs:
           printf '%s\n' OCI_READY > parity/stage.txt
 
       - name: Mark local release-layout parity diagnostic complete
+        id: parity-complete
         shell: bash
         run: |
           set -euo pipefail
@@ -580,11 +581,12 @@ jobs:
           test "$(grep -c '^tar_agent_sha256=' parity/tar-sha256.txt)" -eq 1
           test "$(sed -n 's/^stripped_agent_sha256=//p' parity/map-join.txt)" = "$(sed -n 's/^tar_agent_sha256=//p' parity/tar-sha256.txt)"
           printf '%s\n' COMPLETE > parity/stage.txt
-          printf '%s\n' 'LOCAL_NATIVE_MAP_RELEASE_LAYOUT_JOIN_ONLY' 'release_admission=NO' 'legal_admission=NO' 'pushed_image_parity=UNPROVEN' 'native_link_retention=LOCAL_LLD_ROWS_OBSERVED' 'selected_native_bytes=UNPROVEN' 'notice_custody=LOCAL_14_SOURCE_TAR_OCI_BYTE_JOIN' 'base_image_notice_coverage=UNPROVEN' > parity/status.txt
 
       - name: Remove private parity payloads and containers
         if: always()
         shell: bash
+        env:
+          PARITY_OUTCOME: ${{ steps.parity-complete.outcome }}
         run: |
           set -uo pipefail
           cleanup_ok=1
@@ -599,12 +601,15 @@ jobs:
             "$RUNNER_TEMP/moth-parity-builder.log" "$RUNNER_TEMP/moth-parity-rustc-version.log" "$RUNNER_TEMP/moth-parity-rustc-identity.log" "$RUNNER_TEMP/moth-parity-linker-identity.log" "$RUNNER_TEMP/moth-parity-cargo.log" "$RUNNER_TEMP/moth-parity-oci.log"; do
             { test ! -e "$private" && test ! -L "$private"; } || cleanup_ok=0
           done
-          if test "$cleanup_ok" -ne 1; then
-            if test -d parity && test ! -L parity; then
-              printf '%s\n' 'INCOMPLETE' 'release_admission=NO' 'legal_admission=NO' > parity/status.txt
-            fi
-            exit 1
-          fi
+          test "$cleanup_ok" -eq 1 || exit 1
+          test "$PARITY_OUTCOME" = success || exit 0
+          test -d parity && test ! -L parity && test -f parity/status.txt && test ! -L parity/status.txt || exit 1
+          printf '%s\n' 'INCOMPLETE' 'release_admission=NO' 'legal_admission=NO' | cmp -s - parity/status.txt || exit 1
+          test ! -e parity/status.pending && test ! -L parity/status.pending || exit 1
+          printf '%s\n' 'LOCAL_NATIVE_MAP_RELEASE_LAYOUT_JOIN_ONLY' 'release_admission=NO' 'legal_admission=NO' 'pushed_image_parity=UNPROVEN' 'native_link_retention=LOCAL_LLD_ROWS_OBSERVED' 'selected_native_bytes=UNPROVEN' 'notice_custody=LOCAL_14_SOURCE_TAR_OCI_BYTE_JOIN' 'base_image_notice_coverage=UNPROVEN' > parity/status.pending || exit 1
+          test -f parity/status.pending && test ! -L parity/status.pending || exit 1
+          printf '%s\n' 'LOCAL_NATIVE_MAP_RELEASE_LAYOUT_JOIN_ONLY' 'release_admission=NO' 'legal_admission=NO' 'pushed_image_parity=UNPROVEN' 'native_link_retention=LOCAL_LLD_ROWS_OBSERVED' 'selected_native_bytes=UNPROVEN' 'notice_custody=LOCAL_14_SOURCE_TAR_OCI_BYTE_JOIN' 'base_image_notice_coverage=UNPROVEN' | cmp -s - parity/status.pending || exit 1
+          mv -f -- parity/status.pending parity/status.txt || exit 1
 
       - name: Bound text-only parity receipt
         id: bound-parity
