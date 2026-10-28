@@ -299,9 +299,23 @@ jobs:
           phase = 'PRELUDE'
           count = 0
           overlong = 0
+          line_count = 0
           shapes = Counter()
           samples = {}
-          phases = ('PRELUDE', 'ARCHIVE_SELECTION', 'DISCARDED', 'ALLOCATED')
+          contexts = {}
+          pending = None
+          previous = ''
+          markers = Counter()
+          phases = ('PRELUDE', 'ARCHIVE_SELECTION', 'DISCARDED', 'ALLOCATED', 'LLD_TABLE')
+
+          def row_shape(line):
+              if len(line) > 16384:
+                  return 'OVERLONG'
+              words = line.split()
+              kinds = [token_kind(word) for word in words]
+              indent = len(line) - len(line.lstrip())
+              bucket = 'ZERO' if indent == 0 else 'LOW' if indent < 8 else 'HIGH'
+              return bucket + ':' + '-'.join(kinds[:12]) + ('-MORE' if len(kinds) > 12 else '')
 
           def token_kind(token):
               if '.rlib(' in token:
@@ -318,18 +332,31 @@ jobs:
 
           with Path('agent-native-link.map').open(encoding='utf-8', errors='replace') as source:
               for line in source:
-                  lower = line.lower()
-                  if lower.startswith('archive member included'):
+                  line_count += 1
+                  lower = line.casefold()
+                  heading = ' '.join(lower.split())
+                  if pending is not None:
+                      contexts[pending] = (contexts[pending][0], row_shape(line))
+                      pending = None
+                  if heading.startswith('archive member included to satisfy reference by file'):
+                      markers['GNU_ARCHIVE'] += 1
                       phase = 'ARCHIVE_SELECTION'
-                  elif lower.startswith('discarded input sections'):
+                  elif heading == 'discarded input sections':
+                      markers['GNU_DISCARDED'] += 1
                       phase = 'DISCARDED'
-                  elif lower.startswith('linker script and memory map'):
+                  elif heading == 'linker script and memory map':
+                      markers['GNU_ALLOCATED'] += 1
                       phase = 'ALLOCATED'
+                  elif heading == 'vma lma size align out in symbol':
+                      markers['LLD_HEADER'] += 1
+                      phase = 'LLD_TABLE'
                   if '.rlib(' not in lower:
+                      previous = line
                       continue
                   count += 1
                   if len(line) > 16384:
                       overlong += 1
+                      previous = line
                       continue
                   words = line.split()
                   kinds = [token_kind(word) for word in words]
@@ -342,18 +369,26 @@ jobs:
                   if key not in samples:
                       hex_tokens = [word.lower() for word in words if re.fullmatch(r'0x[0-9a-fA-F]{1,16}', word)]
                       samples[key] = (hex_tokens + ['NONE', 'NONE'])[:2]
+                      contexts[key] = (row_shape(previous), 'EOF')
+                      pending = key
+                  previous = line
 
           with Path('map-shape/shape.txt').open('w') as receipt:
-              print('schema=map-shape-v1', file=receipt)
+              print('schema=map-shape-v2', file=receipt)
+              print(f'total_lines={line_count}', file=receipt)
               print(f'rlib_text_lines={count}', file=receipt)
               print(f'overlong_lines={overlong}', file=receipt)
               print(f'distinct_shapes={len(shapes)}', file=receipt)
               for candidate in phases:
                   print(f'phase_{candidate.lower()}={sum(n for (p, _, _), n in shapes.items() if p == candidate)}', file=receipt)
+              for marker in ('GNU_ARCHIVE', 'GNU_DISCARDED', 'GNU_ALLOCATED', 'LLD_HEADER'):
+                  print(f'marker_{marker.lower()}={markers[marker]}', file=receipt)
               for index, (key, n) in enumerate(sorted(shapes.items())[:64], 1):
                   phase_name, indent_name, template = key
                   first, second = samples[key]
                   print(f'class_{index:02d}={phase_name}|{indent_name}|{template}|count:{n}|numeric1:{first}|numeric2:{second}', file=receipt)
+                  before, after = contexts[key]
+                  print(f'context_{index:02d}=before:{before}|after:{after}', file=receipt)
               print(f'shape_overflow={str(len(shapes) > 64).lower()}', file=receipt)
           if not count or overlong or len(shapes) > 64:
               raise SystemExit('bounded map-shape sample incomplete')
