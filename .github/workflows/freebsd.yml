@@ -324,7 +324,7 @@ jobs:
           test -z "$(find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 ! -name parity -print -quit)"
           git init -q "$GITHUB_WORKSPACE"
           git remote add origin https://github.com/ryanmaclean/moth.git
-          git -c credential.helper= fetch --no-tags --no-recurse-submodules --depth=12 origin refs/pull/8/head
+          git -c credential.helper= fetch --no-tags --no-recurse-submodules --depth=64 origin refs/pull/8/head
           test "$(git rev-parse FETCH_HEAD)" = "$REVIEWED_SHA"
           git -c submodule.recurse=false checkout --detach --force "$REVIEWED_SHA"
           test "$(git rev-parse HEAD)" = "$REVIEWED_SHA"
