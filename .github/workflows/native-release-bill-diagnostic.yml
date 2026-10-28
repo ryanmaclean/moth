@@ -301,6 +301,7 @@ jobs:
           overlong = 0
           line_count = 0
           shapes = Counter()
+          grammars = Counter()
           samples = {}
           contexts = {}
           pending = None
@@ -329,6 +330,25 @@ jobs:
               if re.fullmatch(r'[()=*+,:-]+', token):
                   return 'PUNCT'
               return 'ATOM'
+
+          def numeric_kind(token):
+              if re.fullmatch(r'0x[0-9a-fA-F]{1,16}', token):
+                  return 'PREFIX_ZERO' if int(token, 16) == 0 else 'PREFIX_NONZERO'
+              if re.fullmatch(r'[0-9a-fA-F]{1,16}', token):
+                  base = 'DIGITS' if token.isdecimal() else 'BARE_HEX'
+                  return base + ('_ZERO' if int(token, 16) == 0 else '_NONZERO')
+              return 'OTHER'
+
+          def member_kind(token):
+              if '.rlib(' not in token:
+                  return 'OTHER'
+              if re.fullmatch(r'.+\.rlib\([^()]+\):\([^()]+\)', token):
+                  return 'SECTION_SUFFIX'
+              if token.count('.rlib(') != 1 or token.count('(') != 1 or token.count(')') != 1:
+                  return 'COMPLEX'
+              if token.endswith(')'):
+                  return 'CLOSED'
+              return 'TRAILING'
 
           with Path('agent-native-link.map').open(encoding='utf-8', errors='replace') as source:
               for line in source:
@@ -366,6 +386,10 @@ jobs:
                   indent_bucket = 'ZERO' if indent == 0 else 'LOW' if indent < 8 else 'HIGH'
                   key = (phase, indent_bucket, template)
                   shapes[key] += 1
+                  member_index = next(index for index, word in enumerate(words) if '.rlib(' in word)
+                  columns = tuple(numeric_kind(word) for word in words[:4])
+                  grammar_key = (phase, columns, min(len(words), 8), min(member_index, 8), member_kind(words[member_index]))
+                  grammars[grammar_key] += 1
                   if key not in samples:
                       hex_tokens = [word.lower() for word in words if re.fullmatch(r'0x[0-9a-fA-F]{1,16}', word)]
                       samples[key] = (hex_tokens + ['NONE', 'NONE'])[:2]
@@ -374,7 +398,7 @@ jobs:
                   previous = line
 
           with Path('map-shape/shape.txt').open('w') as receipt:
-              print('schema=map-shape-v2', file=receipt)
+              print('schema=map-shape-v3', file=receipt)
               print(f'total_lines={line_count}', file=receipt)
               print(f'rlib_text_lines={count}', file=receipt)
               print(f'overlong_lines={overlong}', file=receipt)
@@ -389,8 +413,13 @@ jobs:
                   print(f'class_{index:02d}={phase_name}|{indent_name}|{template}|count:{n}|numeric1:{first}|numeric2:{second}', file=receipt)
                   before, after = contexts[key]
                   print(f'context_{index:02d}=before:{before}|after:{after}', file=receipt)
+              print(f'distinct_grammars={len(grammars)}', file=receipt)
+              for index, (key, n) in enumerate(sorted(grammars.items())[:64], 1):
+                  phase_name, columns, words, member_index, member = key
+                  print(f'grammar_{index:02d}={phase_name}|{",".join(columns)}|words:{words}|member_column:{member_index}|member:{member}|count:{n}', file=receipt)
+              print(f'grammar_overflow={str(len(grammars) > 64).lower()}', file=receipt)
               print(f'shape_overflow={str(len(shapes) > 64).lower()}', file=receipt)
-          if not count or overlong or len(shapes) > 64:
+          if not count or overlong or len(shapes) > 64 or len(grammars) > 64 or markers['LLD_HEADER'] != 1 or any(markers[name] for name in ('GNU_ARCHIVE', 'GNU_DISCARDED', 'GNU_ALLOCATED')):
               raise SystemExit('bounded map-shape sample incomplete')
           PY
       - name: Mark map-shape sample complete without admission
@@ -399,6 +428,7 @@ jobs:
           set -euo pipefail
           test -s map-shape/shape.txt
           grep -Fxq 'shape_overflow=false' map-shape/shape.txt
+          grep -Fxq 'grammar_overflow=false' map-shape/shape.txt
           grep -Fxq 'overlong_lines=0' map-shape/shape.txt
           printf '%s\n' 'MAP_SHAPE_SAMPLE_ONLY' 'release_admission=NO' 'legal_admission=NO' 'selected_native_bytes=UNPROVEN' 'distribution_placement=UNPROVEN' > map-shape/status.txt
       - name: Remove private linker map and build logs
