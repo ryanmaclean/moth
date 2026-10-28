@@ -1,0 +1,105 @@
+name: native release bill diagnostic
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-amd64:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Record immutable inputs
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic/input diagnostic/link diagnostic/native diagnostic/distribution diagnostic/legal
+          git rev-parse HEAD > diagnostic/input/source-commit.txt
+          sha256sum Cargo.lock Dockerfile .github/workflows/release.yml > diagnostic/input/source-sha256.txt
+          env | sort | grep -E '^(CARGO_|RUST|CC_|AR_|HOST|TARGET)' > diagnostic/input/build-environment.txt || true
+          test "$(cat diagnostic/input/source-commit.txt)" = "$GITHUB_SHA"
+      - name: Build release-equivalent builder image
+        run: docker build --target builder -t agent-builder .
+      - name: Build unstripped release binary with GNU ld map
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD:/work" -w /work agent-builder \
+            cargo tree --locked --offline -e features -i curl-sys \
+            > diagnostic/input/curl-feature-tree.txt
+          docker run --rm -v "$PWD:/work" -w /work agent-builder \
+            cargo rustc --release --locked --frozen --offline -p cli \
+              --bin agent --target x86_64-unknown-linux-gnu -vv -- \
+              -C link-arg=-Wl,-Map=/work/diagnostic/link/agent.map \
+            > diagnostic/input/cargo-build.log 2>&1
+          test -s diagnostic/link/agent.map
+          cp target/x86_64-unknown-linux-gnu/release/agent diagnostic/link/agent.unstripped
+          sha256sum diagnostic/link/agent.unstripped > diagnostic/link/binary-sha256.txt
+          readelf -d diagnostic/link/agent.unstripped > diagnostic/link/dynamic-section.txt
+          readelf -Ws diagnostic/link/agent.unstripped > diagnostic/link/symbols.txt
+          file diagnostic/link/agent.unstripped > diagnostic/link/file.txt
+      - name: Preserve native archives and member inventories
+        run: |
+          set -euo pipefail
+          : > diagnostic/native/archive-sha256.txt
+          : > diagnostic/native/archive-members.txt
+          for name in libcurl.a libssl.a libcrypto.a libz.a; do
+            while IFS= read -r path; do
+              rel="${path#target/x86_64-unknown-linux-gnu/release/build/}"
+              out="diagnostic/native/${rel//\//__}"
+              cp "$path" "$out"
+              sha256sum "$out" >> diagnostic/native/archive-sha256.txt
+              printf '%s\n' "== $rel ==" >> diagnostic/native/archive-members.txt
+              ar tv "$path" >> diagnostic/native/archive-members.txt
+            done < <(find target/x86_64-unknown-linux-gnu/release/build -type f -name "$name" -print)
+          done
+          grep -E '(^Archive member included|lib(curl|ssl|crypto|z)\.a\()' \
+            diagnostic/link/agent.map > diagnostic/native/selected-map-lines.txt || true
+          test -s diagnostic/native/archive-sha256.txt
+          test -s diagnostic/native/selected-map-lines.txt
+      - name: Stage actual release-recipe tarball candidate
+        run: |
+          set -euo pipefail
+          stage=agent-diagnostic-x86_64-unknown-linux-gnu
+          mkdir -p "diagnostic/distribution/$stage"
+          docker run --rm -v "$PWD:/work" -w /work agent-builder \
+            strip target/x86_64-unknown-linux-gnu/release/agent
+          cp target/x86_64-unknown-linux-gnu/release/agent "diagnostic/distribution/$stage/"
+          cp LICENSE README.md CHANGELOG.md "diagnostic/distribution/$stage/"
+          tar -C diagnostic/distribution -czf "diagnostic/distribution/$stage.tar.gz" "$stage"
+          tar -tzf "diagnostic/distribution/$stage.tar.gz" \
+            > diagnostic/distribution/tar-members.txt
+          sha256sum "diagnostic/distribution/$stage.tar.gz" \
+            target/x86_64-unknown-linux-gnu/release/agent \
+            > diagnostic/distribution/sha256.txt
+      - name: Inspect runtime OCI candidate without publishing
+        run: |
+          set -euo pipefail
+          docker build --target runtime -t moth-native-bill-diagnostic .
+          docker image inspect moth-native-bill-diagnostic \
+            > diagnostic/distribution/image-inspect.json
+          container=$(docker create moth-native-bill-diagnostic)
+          trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
+          docker export "$container" > diagnostic/distribution/runtime-rootfs.tar
+          tar -tf diagnostic/distribution/runtime-rootfs.tar \
+            > diagnostic/distribution/runtime-members.txt
+          sha256sum diagnostic/distribution/runtime-rootfs.tar \
+            > diagnostic/distribution/runtime-sha256.txt
+      - name: Preserve exact candidate native legal texts separately
+        run: |
+          set -euo pipefail
+          cp vendor/curl-sys/LICENSE diagnostic/legal/curl-sys-LICENSE
+          cp vendor/curl-sys/curl/COPYING diagnostic/legal/libcurl-COPYING
+          cp vendor/curl-sys/curl/LICENSES/ISC.txt diagnostic/legal/curl-ISC.txt
+          cp vendor/curl-sys/curl/lib/curlx/inet_ntop.c diagnostic/legal/inet_ntop.c
+          cp vendor/curl-sys/curl/lib/curlx/inet_pton.c diagnostic/legal/inet_pton.c
+          cp vendor/openssl-src/openssl/LICENSE.txt diagnostic/legal/openssl-LICENSE.txt
+          cp vendor/libz-sys/src/zlib/LICENSE diagnostic/legal/zlib-LICENSE
+          sha256sum diagnostic/legal/* > diagnostic/legal/sha256.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-release-bill-linux-amd64-${{ github.sha }}
+          path: diagnostic/
+          if-no-files-found: error
+          retention-days: 7

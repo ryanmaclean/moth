@@ -22,9 +22,15 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      native_release_bill_diagnostic:
+        description: 'Run the held Linux native release bill diagnostic'
+        type: boolean
+        default: false
 
 jobs:
   freebsd:
+    if: ${{ !inputs.native_release_bill_diagnostic }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -117,3 +123,9 @@ jobs:
               fi
               echo "::endgroup::"
             done
+
+  native-release-bill:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.native_release_bill_diagnostic }}
+    uses: ./.github/workflows/native-release-bill-diagnostic.yml
+    permissions:
+      contents: read
