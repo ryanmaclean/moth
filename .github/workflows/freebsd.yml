@@ -1391,11 +1391,15 @@ jobs:
               data = path.read_bytes()
               require(len(data) <= 100 * 1024 * 1024)
               return ('file', len(data), hashlib.sha256(data).hexdigest())
-          def package_shape(path, base):
+          def package_shape(path, base, arch):
               # Diagnostic only: no package bill or legal conclusion is inferred.
+              def mark(phase):
+                  Path('base-receipt/stage.txt').write_text(
+                      f'PKG_{phase}_{arch.upper()}\n', encoding='ascii')
               records = {}
               sums = {}
               links = {}
+              mark('SCAN')
               with tarfile.open(path, 'r:') as archive:
                   for member in archive:
                       name = member.name.removeprefix('./').lstrip('/')
@@ -1418,12 +1422,14 @@ jobs:
                       else:
                           require(leaf not in records)
                           records[leaf] = data
+              mark('PAIR')
               require(0 < len(records) <= 2048 and len(sums) <= 2048)
               require(set(records) == set(sums))
               package_bill = []
               owned = set()
               direct = shared = missing = 0
               for package in sorted(records):
+                  mark('CONTROL')
                   require(re.fullmatch(r'[a-z0-9][a-z0-9+.-]{0,127}', package) is not None)
                   fields = {}
                   try:
@@ -1445,6 +1451,7 @@ jobs:
                   require(re.fullmatch(r'[A-Za-z0-9.+:~_-]+', fields['Version']) is not None)
                   require(re.fullmatch(r'[a-z0-9-]+', fields['Architecture']) is not None)
                   package_bill.append((package, fields['Version'], fields['Architecture']))
+                  mark('SUMS')
                   for line in listing.splitlines():
                       match = re.fullmatch(r'([0-9a-fA-F]{32})  (\S[^\r\n]*)', line)
                       require(match is not None)
@@ -1452,6 +1459,7 @@ jobs:
                       require(len(member_path) <= 4096 and '..' not in member_path.split('/'))
                       require(member_path not in owned and base.get(member_path, ('',))[0] == 'file')
                       owned.add(member_path)
+                  mark('NOTICE')
                   copyright_path = f'usr/share/doc/{package}/copyright'
                   if base.get(copyright_path, ('',))[0] == 'file':
                       direct += 1
@@ -1470,6 +1478,7 @@ jobs:
               bill = '\n'.join('\t'.join(row) for row in package_bill).encode('utf-8')
               unowned = sum(value[0] == 'file' and name not in owned
                             for name, value in base.items())
+              mark('DONE')
               return (len(records), len(sums), direct, shared, missing,
                       unowned, len(links), hashlib.sha256(bill).hexdigest())
           try:
@@ -1514,7 +1523,7 @@ jobs:
                       require(0 < len(notice) <= 4096 and 0 < len(package_meta) <= 4096)
                       require(all(image.get(k) == v for k, v in notice.items()))
                       require(all(image.get(k) == v for k, v in package_meta.items()))
-                      shape = package_shape(private / f'base-{arch}.tar', base)
+                      shape = package_shape(private / f'base-{arch}.tar', base, arch)
                       for label, value in zip(('package_records', 'md5sum_records',
                                                'direct_notice_routes', 'shared_symlink_routes',
                                                'missing_notice_routes', 'unlisted_regular_files',
@@ -1590,7 +1599,7 @@ jobs:
           test "$file_count" -ge 2 && test "$file_count" -le 4 || refuse
           test "$total_bytes" -le 8192 || refuse
           case "$(cat base-receipt/stage.txt)" in
-            FETCH|BASE_INDEX|BUILDER|BUILD_AMD64|BUILD_ARM64|STRIP_AMD64|STRIP_ARM64|TAR_AMD64|TAR_ARM64|IMAGE_BUILD_AMD64|IMAGE_BUILD_ARM64|BASE_MANIFEST_AMD64|BASE_MANIFEST_ARM64|BASE_PULL_AMD64|BASE_PULL_ARM64|BASE_CREATE_AMD64|BASE_CREATE_ARM64|IMAGE_CREATE_AMD64|IMAGE_CREATE_ARM64|BASE_EXPORT_AMD64|BASE_EXPORT_ARM64|IMAGE_EXPORT_AMD64|IMAGE_EXPORT_ARM64|CUSTODY|VERIFIED|COMPLETE) ;;
+            FETCH|BASE_INDEX|BUILDER|BUILD_AMD64|BUILD_ARM64|STRIP_AMD64|STRIP_ARM64|TAR_AMD64|TAR_ARM64|IMAGE_BUILD_AMD64|IMAGE_BUILD_ARM64|BASE_MANIFEST_AMD64|BASE_MANIFEST_ARM64|BASE_PULL_AMD64|BASE_PULL_ARM64|BASE_CREATE_AMD64|BASE_CREATE_ARM64|IMAGE_CREATE_AMD64|IMAGE_CREATE_ARM64|BASE_EXPORT_AMD64|BASE_EXPORT_ARM64|IMAGE_EXPORT_AMD64|IMAGE_EXPORT_ARM64|CUSTODY|PKG_SCAN_AMD64|PKG_PAIR_AMD64|PKG_CONTROL_AMD64|PKG_SUMS_AMD64|PKG_NOTICE_AMD64|PKG_DONE_AMD64|PKG_SCAN_ARM64|PKG_PAIR_ARM64|PKG_CONTROL_ARM64|PKG_SUMS_ARM64|PKG_NOTICE_ARM64|PKG_DONE_ARM64|VERIFIED|COMPLETE) ;;
             *) refuse ;;
           esac
 
