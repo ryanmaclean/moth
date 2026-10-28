@@ -162,8 +162,12 @@ jobs:
           docker build --target runtime -t moth-native-audit-runtime .
           docker image inspect --format '{{.Id}}' moth-native-audit-runtime \
             > diagnostic/oci-image-id.txt
-          docker image inspect --format '{{.Id}}' gcr.io/distroless/cc-debian12 \
-            > diagnostic/oci-base-image-id.txt
+          # BuildKit may use the distroless base without tagging it locally.
+          # Record the layers of the image actually built, not a separate
+          # mutable base-tag lookup that may fail or resolve to different bytes.
+          docker image inspect --format '{{range .RootFS.Layers}}{{println .}}{{end}}' \
+            moth-native-audit-runtime > diagnostic/oci-rootfs-layers.txt
+          test -s diagnostic/oci-rootfs-layers.txt
           docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.licenses" }}' \
             moth-native-audit-runtime > diagnostic/oci-license-label.txt
           container=$(docker create moth-native-audit-runtime)
@@ -225,7 +229,7 @@ jobs:
           test "$(find diagnostic -type l | wc -l)" -eq 0
           while IFS= read -r path; do
             case "$path" in
-              diagnostic/status.txt|diagnostic/identity.txt|diagnostic/changed-paths.txt|diagnostic/builder-image-id.txt|diagnostic/rustc-version.txt|diagnostic/cargo-version.txt|diagnostic/curl-feature-tree.txt|diagnostic/unstripped-binary-sha256.txt|diagnostic/dynamic-section.txt|diagnostic/native-map-size.txt|diagnostic/native-map-pattern-counts.txt|diagnostic/native-archive-sha256.txt|diagnostic/native-archive-members.txt|diagnostic/isc-object-probes.txt|diagnostic/tar-placement.txt|diagnostic/oci-image-id.txt|diagnostic/oci-base-image-id.txt|diagnostic/oci-license-label.txt|diagnostic/oci-placement.txt|diagnostic/legal/candidate-text-sha256.txt) ;;
+              diagnostic/status.txt|diagnostic/identity.txt|diagnostic/changed-paths.txt|diagnostic/builder-image-id.txt|diagnostic/rustc-version.txt|diagnostic/cargo-version.txt|diagnostic/curl-feature-tree.txt|diagnostic/unstripped-binary-sha256.txt|diagnostic/dynamic-section.txt|diagnostic/native-map-size.txt|diagnostic/native-map-pattern-counts.txt|diagnostic/native-archive-sha256.txt|diagnostic/native-archive-members.txt|diagnostic/isc-object-probes.txt|diagnostic/tar-placement.txt|diagnostic/oci-image-id.txt|diagnostic/oci-rootfs-layers.txt|diagnostic/oci-license-label.txt|diagnostic/oci-placement.txt|diagnostic/legal/candidate-text-sha256.txt) ;;
               *) exit 1 ;;
             esac
             test "$(wc -c < "$path")" -le 2097152
