@@ -1430,8 +1430,10 @@ jobs:
               direct = shared = missing = 0
               for package in sorted(records):
                   mark('CONTROL')
+                  mark('CTRL_NAME')
                   require(re.fullmatch(r'[a-z0-9][a-z0-9+.-]{0,127}', package) is not None)
                   fields = {}
+                  mark('CTRL_DECODE')
                   try:
                       control = records[package].decode('utf-8')
                       listing = sums[package].decode('ascii')
@@ -1440,15 +1442,22 @@ jobs:
                   for line in control.splitlines():
                       if line.startswith((' ', '\t')):
                           continue
+                      mark('CTRL_LINE')
                       if ':' not in line:
                           require(False)
                       key, value = line.split(':', 1)
+                      mark('CTRL_DUP')
                       require(key not in fields)
                       fields[key] = value.strip()
+                  mark('CTRL_PACKAGE')
                   require(fields.get('Package') == package)
+                  mark('CTRL_REQUIRED')
                   require(fields.get('Version') and fields.get('Architecture'))
+                  mark('CTRL_LENGTH')
                   require(len(fields['Version']) <= 256 and len(fields['Architecture']) <= 32)
+                  mark('CTRL_VERSION')
                   require(re.fullmatch(r'[A-Za-z0-9.+:~_-]+', fields['Version']) is not None)
+                  mark('CTRL_ARCH')
                   require(re.fullmatch(r'[a-z0-9-]+', fields['Architecture']) is not None)
                   package_bill.append((package, fields['Version'], fields['Architecture']))
                   mark('SUMS')
@@ -1599,7 +1608,7 @@ jobs:
           test "$file_count" -ge 2 && test "$file_count" -le 4 || refuse
           test "$total_bytes" -le 8192 || refuse
           case "$(cat base-receipt/stage.txt)" in
-            FETCH|BASE_INDEX|BUILDER|BUILD_AMD64|BUILD_ARM64|STRIP_AMD64|STRIP_ARM64|TAR_AMD64|TAR_ARM64|IMAGE_BUILD_AMD64|IMAGE_BUILD_ARM64|BASE_MANIFEST_AMD64|BASE_MANIFEST_ARM64|BASE_PULL_AMD64|BASE_PULL_ARM64|BASE_CREATE_AMD64|BASE_CREATE_ARM64|IMAGE_CREATE_AMD64|IMAGE_CREATE_ARM64|BASE_EXPORT_AMD64|BASE_EXPORT_ARM64|IMAGE_EXPORT_AMD64|IMAGE_EXPORT_ARM64|CUSTODY|PKG_SCAN_AMD64|PKG_PAIR_AMD64|PKG_CONTROL_AMD64|PKG_SUMS_AMD64|PKG_NOTICE_AMD64|PKG_DONE_AMD64|PKG_SCAN_ARM64|PKG_PAIR_ARM64|PKG_CONTROL_ARM64|PKG_SUMS_ARM64|PKG_NOTICE_ARM64|PKG_DONE_ARM64|VERIFIED|COMPLETE) ;;
+            FETCH|BASE_INDEX|BUILDER|BUILD_AMD64|BUILD_ARM64|STRIP_AMD64|STRIP_ARM64|TAR_AMD64|TAR_ARM64|IMAGE_BUILD_AMD64|IMAGE_BUILD_ARM64|BASE_MANIFEST_AMD64|BASE_MANIFEST_ARM64|BASE_PULL_AMD64|BASE_PULL_ARM64|BASE_CREATE_AMD64|BASE_CREATE_ARM64|IMAGE_CREATE_AMD64|IMAGE_CREATE_ARM64|BASE_EXPORT_AMD64|BASE_EXPORT_ARM64|IMAGE_EXPORT_AMD64|IMAGE_EXPORT_ARM64|CUSTODY|PKG_SCAN_AMD64|PKG_PAIR_AMD64|PKG_CONTROL_AMD64|PKG_CTRL_NAME_AMD64|PKG_CTRL_DECODE_AMD64|PKG_CTRL_LINE_AMD64|PKG_CTRL_DUP_AMD64|PKG_CTRL_PACKAGE_AMD64|PKG_CTRL_REQUIRED_AMD64|PKG_CTRL_LENGTH_AMD64|PKG_CTRL_VERSION_AMD64|PKG_CTRL_ARCH_AMD64|PKG_SUMS_AMD64|PKG_NOTICE_AMD64|PKG_DONE_AMD64|PKG_SCAN_ARM64|PKG_PAIR_ARM64|PKG_CONTROL_ARM64|PKG_CTRL_NAME_ARM64|PKG_CTRL_DECODE_ARM64|PKG_CTRL_LINE_ARM64|PKG_CTRL_DUP_ARM64|PKG_CTRL_PACKAGE_ARM64|PKG_CTRL_REQUIRED_ARM64|PKG_CTRL_LENGTH_ARM64|PKG_CTRL_VERSION_ARM64|PKG_CTRL_ARCH_ARM64|PKG_SUMS_ARM64|PKG_NOTICE_ARM64|PKG_DONE_ARM64|VERIFIED|COMPLETE) ;;
             *) refuse ;;
           esac
 
