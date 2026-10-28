@@ -1336,7 +1336,9 @@ jobs:
             printf 'BASE_PULL_%s\n' "$suffix" > base-receipt/stage.txt
             capture "$private/pull-$arch.log" 1048576 docker pull --platform "linux/$arch" "gcr.io/distroless/cc-debian12@$digest"
             printf 'BASE_CREATE_%s\n' "$suffix" > base-receipt/stage.txt
-            capture "$private/create-base-$arch.log" 1048576 docker create --name "moth-base-custody-base-$arch" --platform "linux/$arch" "gcr.io/distroless/cc-debian12@$digest"
+            # Distroless has no default command. This export-only container is
+            # never started; a deliberately absent command prevents execution.
+            capture "$private/create-base-$arch.log" 1048576 docker create --name "moth-base-custody-base-$arch" --platform "linux/$arch" "gcr.io/distroless/cc-debian12@$digest" /__moth_base_export_never_start__
             printf 'IMAGE_CREATE_%s\n' "$suffix" > base-receipt/stage.txt
             capture "$private/create-image-$arch.log" 1048576 docker create --name "moth-base-custody-image-$arch" --platform "linux/$arch" "moth-base-custody-$arch:local"
             printf 'BASE_EXPORT_%s\n' "$suffix" > base-receipt/stage.txt
