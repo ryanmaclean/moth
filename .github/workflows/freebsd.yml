@@ -24,9 +24,14 @@ on:
   workflow_dispatch:
     inputs:
       notice_head_sha:
-        description: 'Full independently reviewed PR8 head for notice placement diagnostic'
+        description: 'Full independently reviewed PR8 head for selected diagnostic'
         required: false
         type: string
+      release_parity:
+        description: 'Run separate no-publish release-layout tar and OCI byte parity diagnostic'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   freebsd:
@@ -125,7 +130,7 @@ jobs:
             done
 
   notice-placement-linux:
-    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/fix/native-notice-packaging-pr5'
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/fix/native-notice-packaging-pr5' && !inputs.release_parity
     runs-on: ubuntu-22.04
     timeout-minutes: 75
     permissions:
@@ -154,11 +159,12 @@ jobs:
           git cat-file -e '2ad30129a9af231b687b8821f2b9d062e41992f9^{commit}'
           test "$(git merge-base HEAD 2ad30129a9af231b687b8821f2b9d062e41992f9)" = '2ad30129a9af231b687b8821f2b9d062e41992f9'
           git diff --name-only 2ad30129a9af231b687b8821f2b9d062e41992f9 HEAD | sort > notice-audit/changed-paths.txt
-          printf '%s\n' '.github/workflows/freebsd.yml' '.github/workflows/release.yml' 'Dockerfile' 'packaging/native-notice-files.txt' | sort | diff -u - notice-audit/changed-paths.txt
+          printf '%s\n' '.github/workflows/freebsd.yml' '.github/workflows/release.yml' 'Dockerfile' 'Dockerfile.release' 'packaging/native-notice-files.txt' | sort | diff -u - notice-audit/changed-paths.txt
           printf '%s\n' \
             'befd91e188696989d415870792acb3f9fa5a5d3bd79fe8823989264714b6fe51  Cargo.lock' \
             '392a5a80e863151504fa05add58ea97b98a4a7a57e36cd26436734a95465650a  Dockerfile' \
-            '3ea7cd527c66f01d96c3961ddb41897e34877c814cd7372b7f5e037ade7f7396  .github/workflows/release.yml' \
+            'ae3f5acdad3187723f7779ae725467a51d80e2609f6c509c8ab43c935b3f58a6  .github/workflows/release.yml' \
+            '034a52f7f3e0ee8cc04ca738143fee3885d8cff65cda1b001b96c69fd4359448  Dockerfile.release' \
             '6321279cc4a58259e29638a1f7c6621184b07576e8a70728b2b5bb48d761d83c  packaging/native-notice-files.txt' \
             '59d5f1cb240a41f1a4acea088ca1f964b0e9d81c6afea1cc748988f5bdb1a533  .dockerignore' \
             | sha256sum --check --status
@@ -292,5 +298,224 @@ jobs:
         with:
           name: moth-pr8-native-notice-placement-${{ github.sha }}
           path: notice-audit/
+          if-no-files-found: error
+          retention-days: 7
+
+  release-parity-linux:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/fix/native-notice-packaging-pr5' && inputs.release_parity
+    runs-on: ubuntu-22.04
+    timeout-minutes: 75
+    permissions:
+      contents: read
+    steps:
+      - name: Fetch exact reviewed PR8 release-layout source
+        shell: bash
+        env:
+          REVIEWED_SHA: ${{ inputs.notice_head_sha }}
+          GIT_TERMINAL_PROMPT: '0'
+          GIT_ASKPASS: /bin/false
+        run: |
+          set -euo pipefail
+          mkdir -p parity
+          printf '%s\n' 'INCOMPLETE' 'release_admission=NO' 'legal_admission=NO' > parity/status.txt
+          printf 'workflow_head=%s\n' "$GITHUB_SHA" > parity/identity.txt
+          [[ "$REVIEWED_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$REVIEWED_SHA" = "$GITHUB_SHA"
+          test -z "$(find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 ! -name parity -print -quit)"
+          git init -q "$GITHUB_WORKSPACE"
+          git remote add origin https://github.com/ryanmaclean/moth.git
+          git -c credential.helper= fetch --no-tags --no-recurse-submodules --depth=12 origin refs/pull/8/head
+          test "$(git rev-parse FETCH_HEAD)" = "$REVIEWED_SHA"
+          git -c submodule.recurse=false checkout --detach --force "$REVIEWED_SHA"
+          test "$(git rev-parse HEAD)" = "$REVIEWED_SHA"
+          git cat-file -e '2ad30129a9af231b687b8821f2b9d062e41992f9^{commit}'
+          test "$(git merge-base HEAD 2ad30129a9af231b687b8821f2b9d062e41992f9)" = '2ad30129a9af231b687b8821f2b9d062e41992f9'
+          git diff --name-only 2ad30129a9af231b687b8821f2b9d062e41992f9 HEAD | sort | diff -u <(printf '%s\n' '.github/workflows/freebsd.yml' '.github/workflows/release.yml' 'Dockerfile' 'Dockerfile.release' 'packaging/native-notice-files.txt' | sort) -
+          printf '%s\n' \
+            'befd91e188696989d415870792acb3f9fa5a5d3bd79fe8823989264714b6fe51  Cargo.lock' \
+            '392a5a80e863151504fa05add58ea97b98a4a7a57e36cd26436734a95465650a  Dockerfile' \
+            '034a52f7f3e0ee8cc04ca738143fee3885d8cff65cda1b001b96c69fd4359448  Dockerfile.release' \
+            'ae3f5acdad3187723f7779ae725467a51d80e2609f6c509c8ab43c935b3f58a6  .github/workflows/release.yml' \
+            '6321279cc4a58259e29638a1f7c6621184b07576e8a70728b2b5bb48d761d83c  packaging/native-notice-files.txt' \
+            '59d5f1cb240a41f1a4acea088ca1f964b0e9d81c6afea1cc748988f5bdb1a533  .dockerignore' \
+            | sha256sum --check --status
+          test -z "$(git status --porcelain --untracked-files=no)"
+          printf 'source_head=%s\nbase=%s\nlock_sha256=%s\ntarget=x86_64-unknown-linux-gnu\n' \
+            "$REVIEWED_SHA" 2ad30129a9af231b687b8821f2b9d062e41992f9 \
+            "$(sha256sum Cargo.lock | cut -d' ' -f1)" >> parity/identity.txt
+
+      - name: Build and verify release-layout Linux tar candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/moth-parity/dist"
+          docker build --target builder -t moth-parity-builder:diagnostic . > "$RUNNER_TEMP/moth-parity-builder.log" 2>&1
+          docker run --rm moth-parity-builder:diagnostic rustc -V | grep -Eq '^rustc 1\.94\.1 '
+          docker run --rm -v "$PWD:/work" -w /work moth-parity-builder:diagnostic \
+            cargo build --release --locked --frozen --offline -p cli --target x86_64-unknown-linux-gnu \
+            > "$RUNNER_TEMP/moth-parity-cargo.log" 2>&1
+          docker run --rm -v "$PWD:/work" -w /work moth-parity-builder:diagnostic \
+            strip target/x86_64-unknown-linux-gnu/release/agent
+          stage=agent-parity-diagnostic-x86_64-unknown-linux-gnu
+          mkdir -p "$RUNNER_TEMP/moth-parity/dist/$stage/THIRD_PARTY_NOTICES/native"
+          cp target/x86_64-unknown-linux-gnu/release/agent "$RUNNER_TEMP/moth-parity/dist/$stage/"
+          cp LICENSE README.md CHANGELOG.md "$RUNNER_TEMP/moth-parity/dist/$stage/"
+          test "$(wc -l < packaging/native-notice-files.txt)" -eq 14
+          test "$(sort -u packaging/native-notice-files.txt | wc -l)" -eq 14
+          while IFS= read -r source; do
+            case "$source" in vendor/*) ;; *) exit 1 ;; esac
+            case "$source" in *..*|*//*) exit 1 ;; esac
+            test -f "$source" && test ! -L "$source"
+            target="$RUNNER_TEMP/moth-parity/dist/$stage/THIRD_PARTY_NOTICES/native/$source"
+            mkdir -p "$(dirname "$target")"
+            cp "$source" "$target"
+            cmp -s "$source" "$target"
+          done < packaging/native-notice-files.txt
+          cp packaging/native-notice-files.txt "$RUNNER_TEMP/moth-parity/dist/$stage/THIRD_PARTY_NOTICES/native/FILES.txt"
+          tar -C "$RUNNER_TEMP/moth-parity/dist" -czf "$RUNNER_TEMP/moth-parity/candidate.tar.gz" "$stage"
+          python3 - "$RUNNER_TEMP/moth-parity/candidate.tar.gz" "$stage" <<'PY'
+          import hashlib
+          from pathlib import Path
+          import sys
+          import tarfile
+
+          archive, stage = sys.argv[1:]
+          root = Path.cwd()
+          names = (root / 'packaging/native-notice-files.txt').read_text().splitlines()
+          assert len(names) == len(set(names)) == 14
+          wanted = {'agent', 'LICENSE', 'README.md', 'CHANGELOG.md',
+                    'THIRD_PARTY_NOTICES/native/FILES.txt'}
+          wanted |= {f'THIRD_PARTY_NOTICES/native/{name}' for name in names}
+          payload = root / 'release-payload/amd64'
+          (payload / 'native').mkdir(parents=True)
+          seen = set()
+          with tarfile.open(archive, 'r:gz') as tar:
+              for member in tar:
+                  parts = member.name.rstrip('/').split('/')
+                  assert parts[0] == stage and all(part not in ('', '.', '..') for part in parts)
+                  if member.isdir():
+                      continue
+                  assert member.isfile() and member.size <= 100 * 1024 * 1024
+                  relative = '/'.join(parts[1:])
+                  assert relative in wanted and relative not in seen
+                  seen.add(relative)
+                  if relative == 'agent':
+                      assert member.mode & 0o111
+                      dest = payload / 'agent'
+                  elif relative == 'LICENSE':
+                      dest = payload / 'LICENSE'
+                  elif relative.startswith('THIRD_PARTY_NOTICES/native/'):
+                      dest = payload / 'native' / relative.removeprefix('THIRD_PARTY_NOTICES/native/')
+                  else:
+                      continue
+                  dest.parent.mkdir(parents=True, exist_ok=True)
+                  with tar.extractfile(member) as source, dest.open('wb') as output:
+                      while chunk := source.read(1024 * 1024):
+                          output.write(chunk)
+                  dest.chmod(0o755 if relative == 'agent' else 0o644)
+          assert seen == wanted
+          assert (payload / 'LICENSE').read_bytes() == (root / 'LICENSE').read_bytes()
+          assert (payload / 'native/FILES.txt').read_bytes() == (root / 'packaging/native-notice-files.txt').read_bytes()
+          for name in names:
+              assert (payload / 'native' / name).read_bytes() == (root / name).read_bytes()
+          sha = lambda path: hashlib.sha256(Path(path).read_bytes()).hexdigest()
+          (root / 'parity/tar-sha256.txt').write_text(
+              f'tar_sha256={sha(archive)}\ntar_agent_sha256={sha(payload / "agent")}\n'
+          )
+          PY
+
+      - name: Build local release-only OCI and compare exported bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build --platform linux/amd64 --target runtime --file Dockerfile.release \
+            --build-arg TARGETARCH=amd64 \
+            --build-arg "REPO_SOURCE=https://github.com/$GITHUB_REPOSITORY" \
+            --build-arg "SOURCE_REVISION=$GITHUB_SHA" \
+            --tag moth-parity-runtime:diagnostic . > "$RUNNER_TEMP/moth-parity-oci.log" 2>&1
+          docker image inspect --format 'runtime_image={{.Id}}' moth-parity-runtime:diagnostic > parity/image.txt
+          container=$(docker create --platform linux/amd64 moth-parity-runtime:diagnostic)
+          printf '%s\n' "$container" > "$RUNNER_TEMP/moth-parity/container-id"
+          docker export "$container" > "$RUNNER_TEMP/moth-parity/rootfs.tar"
+          python3 - "$RUNNER_TEMP/moth-parity/rootfs.tar" <<'PY'
+          import hashlib
+          from pathlib import Path
+          import sys
+          import tarfile
+
+          root = Path.cwd()
+          payload = root / 'release-payload/amd64'
+          names = (root / 'packaging/native-notice-files.txt').read_text().splitlines()
+          expected = {'usr/local/bin/agent': payload / 'agent',
+                      'usr/share/licenses/moth/LICENSE': payload / 'LICENSE',
+                      'usr/share/doc/moth/THIRD_PARTY_NOTICES/native/FILES.txt': payload / 'native/FILES.txt'}
+          expected.update({f'usr/share/doc/moth/THIRD_PARTY_NOTICES/native/{name}': payload / 'native' / name
+                           for name in names})
+          oci_agent_hash = None
+          with tarfile.open(sys.argv[1], 'r:') as tar:
+              members = tar.getmembers()
+              for path, source in expected.items():
+                  matching = [m for m in members if m.name.removeprefix('./') == path]
+                  assert len(matching) == 1 and matching[0].isfile(), path
+                  observed = hashlib.sha256(tar.extractfile(matching[0]).read()).hexdigest()
+                  assert observed == hashlib.sha256(source.read_bytes()).hexdigest(), path
+                  if path == 'usr/local/bin/agent':
+                      oci_agent_hash = observed
+              native_prefix = 'usr/share/doc/moth/THIRD_PARTY_NOTICES/native/'
+              native = [m for m in members if m.name.removeprefix('./').startswith(native_prefix) and m.isfile()]
+              assert len(native) == 15
+          text_paths = sorted(path for path in expected if path != 'usr/local/bin/agent')
+          with (root / 'parity/text-sha256.txt').open('w') as receipt:
+              for path in text_paths:
+                  print(hashlib.sha256(expected[path].read_bytes()).hexdigest(), path, file=receipt)
+          with (root / 'parity/tar-sha256.txt').open('a') as receipt:
+              print('oci_agent_sha256=' + oci_agent_hash, file=receipt)
+              print('tar_oci_binary_identity=yes', file=receipt)
+          PY
+
+      - name: Mark local release-layout parity diagnostic complete
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(wc -l < parity/text-sha256.txt)" -eq 16
+          grep -Fxq 'tar_oci_binary_identity=yes' parity/tar-sha256.txt
+          printf '%s\n' 'LOCAL_RELEASE_LAYOUT_PARITY_ONLY' 'release_admission=NO' 'legal_admission=NO' 'pushed_image_parity=UNPROVEN' 'native_link_retention=UNPROVEN' 'base_image_notice_coverage=UNPROVEN' > parity/status.txt
+
+      - name: Remove private parity payloads and containers
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if test -s "$RUNNER_TEMP/moth-parity/container-id"; then
+            docker rm -f "$(cat "$RUNNER_TEMP/moth-parity/container-id")" >/dev/null
+          fi
+          rm -rf "$RUNNER_TEMP/moth-parity" "$GITHUB_WORKSPACE/release-payload"
+          rm -f "$RUNNER_TEMP/moth-parity-builder.log" "$RUNNER_TEMP/moth-parity-cargo.log" "$RUNNER_TEMP/moth-parity-oci.log"
+
+      - name: Bound text-only parity receipt
+        id: bound-parity
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -d parity && test ! -L parity
+          test -f parity/status.txt
+          test "$(find parity -type f | wc -l)" -le 5
+          test -z "$(find parity ! -type f ! -type d -print -quit)"
+          while IFS= read -r path; do
+            case "$path" in
+              parity/status.txt|parity/identity.txt|parity/tar-sha256.txt|parity/image.txt|parity/text-sha256.txt) ;;
+              *) exit 1 ;;
+            esac
+            test "$(wc -c < "$path")" -le 8192
+          done < <(find parity -type f -print)
+          test "$(du -sk parity | cut -f1)" -le 64
+
+      - name: Retain parity diagnostic receipt
+        if: ${{ always() && steps.bound-parity.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: moth-pr8-release-layout-parity-${{ github.sha }}
+          path: parity/
           if-no-files-found: error
           retention-days: 7
