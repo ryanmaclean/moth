@@ -76,7 +76,6 @@ FROM gcr.io/distroless/cc-debian12 AS runtime
 ARG REPO_SOURCE="https://github.com/ryanmaclean/moth"
 LABEL org.opencontainers.image.source="${REPO_SOURCE}"
 LABEL org.opencontainers.image.description="Minimal Rust agent harness; vendored deps, libcurl + OpenSSL via curl-sys."
-LABEL org.opencontainers.image.licenses="MIT"
 
 COPY --from=build /src/target/release/agent /usr/local/bin/agent
 COPY --from=build /src/LICENSE /usr/share/licenses/moth/LICENSE

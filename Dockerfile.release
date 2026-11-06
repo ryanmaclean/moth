@@ -9,7 +9,6 @@ ARG SOURCE_REVISION
 LABEL org.opencontainers.image.source="${REPO_SOURCE}"
 LABEL org.opencontainers.image.revision="${SOURCE_REVISION}"
 LABEL org.opencontainers.image.description="Minimal Rust agent harness; vendored deps, libcurl + OpenSSL via curl-sys."
-LABEL org.opencontainers.image.licenses="MIT"
 
 COPY release-payload/${TARGETARCH}/agent /usr/local/bin/agent
 COPY release-payload/${TARGETARCH}/LICENSE /usr/share/licenses/moth/LICENSE
