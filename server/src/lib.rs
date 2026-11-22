@@ -1650,6 +1650,8 @@ mod tests {
         client.shutdown(std::net::Shutdown::Write).ok();
         worker.join().unwrap().unwrap();
         assert_eq!(count.load(Ordering::SeqCst), 0);
+    }
+
     // Bearer-token auth ------------------------------------------------------
 
     /// Spawn a server with the same handler set as `spawn_server` but with a
