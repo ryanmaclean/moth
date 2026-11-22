@@ -2,6 +2,7 @@
 name = "anthropic"
 version = "0.0.1"
 edition = "2024"
+license.workspace = true
 publish = false
 description = "Streaming client for the Anthropic Messages API. libcurl + OpenSSL via FFI, tiny hand-rolled JSON."
 

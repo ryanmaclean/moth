@@ -2,6 +2,7 @@
 name = "tmpl"
 version = "0.0.1"
 edition = "2024"
+license.workspace = true
 publish = false
 description = "{{KEY}} prompt-template substitution and Markdown skill/role loader. Tiny YAML-frontmatter subset, no serde."
 

@@ -6,6 +6,9 @@ semver pre-1.0 (every release is `0.x.y`; minor bumps may break API).
 ## Unreleased
 
 ### Added
+- `agent run --run-id ID` (env `AGENT_RUN_ID`, then `BOP_RUN_ID`): run identity is supplied by the caller (BOP owns it) instead of always minted as `run-<ms>`; the minted id remains the fallback. An invalid explicit id exits 2 rather than being silently replaced.
+- runlog records carry a leading `"seq"`: per-run, contiguous from 0, assigned under the write lock (file order == seq order), and resumed from the last committed record when a run file is re-opened. `ts_ms` is now documented as metadata, not an ordering key.
+- `runlog::validate_run_id` / `is_valid_run_id`, `RunLog::{sync, next_seq, write_record_seq}`, `TerminalSummary::last_seq`, `RunLogError::InvalidRunId`.
 - `agent --version` / `-V` prints `agent <cargo-pkg-version>`.
 - `docs/adr/` directory with the first architecture decision records.
 - ADR-0002 captures the subtraction-first scope policy.
@@ -16,6 +19,8 @@ semver pre-1.0 (every release is `0.x.y`; minor bumps may break API).
 - `dependency-scan` CI workflow: `osv-scanner` on `Cargo.lock` (fails the build on Rust-crate advisories) plus a best-effort OSV query of the bundled C-library versions (libcurl / OpenSSL / zlib) surfaced in the job summary; runs on PR, push to `main`, a weekly cron, and manual dispatch. (audit H5)
 
 ### Changed
+- runlog record field order is now `seq, ts_ms, run_id, [request_id], kind, data` (consumers matching on a `{"ts_ms":` line prefix must update).
+- runlog `drain` `fdatasync`s after each terminal record (`done`/`cancelled`/`error`), so a returned `final_event` implies the terminal record is durable.
 - Metrics now emitted across `agent run`, `agent serve`, and subagents (subagents inherit the parent's emitter); opt-in via `--metrics`/`DOGSTATSD_ADDR`, no-op when unset.
 - **`agent serve` default bind moved from `0.0.0.0:3583` to `127.0.0.1:3583`**, and it now refuses to start on a non-loopback address unless a token is configured. Behavior change: off-host serving now requires an explicit `--addr` *and* a `--token`/`AGENT_API_TOKEN`. (audit H2)
 
@@ -25,6 +30,10 @@ semver pre-1.0 (every release is `0.x.y`; minor bumps may break API).
 - HTTP server rejects a duplicate `Content-Length`, and non-numeric / sign-prefixed values, with `400` instead of last-wins overwrite (a request-smuggling primitive when fronted by another proxy). Note: `usize::parse` does *not* reject a leading `+`, so an explicit digits-only guard was added. (audit L1)
 - `openai` HTTP client now runs `curl_global_init` behind a `Once` before `curl_easy_init`, matching the `anthropic`/`mcp` clients — removes a first-request/startup data race in libcurl/OpenSSL one-time init. (audit M1)
 - `git` ref/path operands are separated from options with `--`, and externally-supplied ref names are validated (rejecting leading `-`, `..`, `@{`, whitespace/control chars, `~^:?*[\`, `/`-edges, `.lock`) before any git process runs — closes an argument-injection vector where a ref like `--upload-pack=…` could be parsed as a git flag. (audit L4)
+
+### Fixed
+- `agent serve --runlog`: a client-supplied `X-Request-ID` containing `/` or `..` was used verbatim as the runlog filename, letting a request write `<id>.jsonl` outside the runlog dir. Unsafe ids now get a minted `req-<ms>-<n>` filename; the original id is still recorded in `request_id`.
+- runlog re-open after a crash mid-write newline-terminates the torn fragment so later records are not glued onto it.
 
 ### Removed (round 7 — staff-eng cut pass)
 - `cluster` crate: distributed actor refs with no callers.

@@ -2,6 +2,7 @@
 name = "compact"
 version = "0.0.1"
 edition = "2024"
+license.workspace = true
 publish = false
 description = "Message-history compaction. Char-budget split that respects tool_use/tool_result pairing, plus a model-driven summariser for the head."
 

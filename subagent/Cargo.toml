@@ -2,6 +2,7 @@
 name = "subagent"
 version = "0.0.1"
 edition = "2024"
+license.workspace = true
 publish = false
 description = "Flue-style session.task(): focused one-shot child agents sharing parent's sandbox + tools but with their own message history."
 

@@ -1,4 +1,7 @@
 //! Instance actor: owns the sandbox; serialises shell access.
+//! Actor cancellation stops subsequent mailbox work. Sandbox::execute is
+//! synchronous and has no cancellation method: an in-flight execution remains
+//! owned and Pending until it actually returns. Keep its retirement handle.
 
 use std::sync::mpsc::SyncSender;
 

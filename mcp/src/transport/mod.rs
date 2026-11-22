@@ -28,7 +28,20 @@ pub trait Transport: Send + Sync {
     /// Block until the next frame is available. Returns the payload
     /// without the trailing `\n`. EOF/closed channel becomes an error.
     fn recv_line(&self) -> Result<Vec<u8>, String>;
+
+    /// Deadline-aware routes are additive. Legacy/custom transports retain
+    /// their synchronous behavior and cannot promise interruption in flight.
+    fn send_line_until(&self, line: &[u8], _deadline: std::time::Instant) -> Result<(), String> {
+        self.send_line(line)
+    }
+    fn recv_line_until(&self, _deadline: std::time::Instant) -> Result<Vec<u8>, String> {
+        self.recv_line()
+    }
+
+    /// Cooperative request only. Legacy transports may remain in-flight; the
+    /// containing owner must separately prove retirement.
+    fn request_stop(&self) {}
 }
 
 pub use http::HttpTransport;
-pub use stdio::StdioTransport;
+pub use stdio::{OwnedStdioTransport, StdioTransport};

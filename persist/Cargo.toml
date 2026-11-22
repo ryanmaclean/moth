@@ -2,6 +2,7 @@
 name = "persist"
 version = "0.0.1"
 edition = "2024"
+license.workspace = true
 publish = false
 description = "File-backed harness::SessionStore. Atomic writes via tmp + rename, JSON wire format."
 

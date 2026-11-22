@@ -2,6 +2,7 @@
 name = "harness"
 version = "0.0.1"
 edition = "2024"
+license.workspace = true
 publish = false
 description = "Orchestration layer: Instance + Session actors, model + sandbox traits, iteration loop."
 

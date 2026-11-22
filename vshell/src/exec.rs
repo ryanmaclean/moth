@@ -31,6 +31,7 @@ pub struct VShell {
     last_exit: i32,
     timeout: Duration,
     cancel: Option<Arc<AtomicBool>>,
+    owner_registry: Option<Arc<crate::ownership::OwnerRegistry>>,
 }
 
 pub struct ExecResult {
@@ -54,6 +55,7 @@ impl VShell {
             last_exit: 0,
             timeout: DEFAULT_TIMEOUT,
             cancel: None,
+            owner_registry: None,
         }
     }
 
@@ -68,6 +70,14 @@ impl VShell {
     /// external child (SIGTERM, then SIGKILL after a grace period).
     pub fn with_cancel(mut self, cancel: Arc<AtomicBool>) -> Self {
         self.cancel = Some(cancel);
+        self
+    }
+
+    /// Select the CLI-owned native retirement barrier for external commands.
+    /// The CLI must retain its Arc through explicit retirement; construction
+    /// of this registry rejects unsupported targets before strict execution.
+    pub fn with_owner_registry(mut self, registry: Arc<crate::ownership::OwnerRegistry>) -> Self {
+        self.owner_registry = Some(registry);
         self
     }
 
@@ -209,17 +219,19 @@ impl VShell {
             argv.push(self.expand_word(w, io.stderr)?);
         }
 
-        // Resolve redirects: open files now.
-        let mut rio = ResolvedIo::default();
-        for r in &cmd.redirects {
-            self.resolve_redirect(r, &mut rio, io.stderr)?;
-        }
-
         let name = argv[0].clone();
         if let Some(b) = Builtin::lookup(&name) {
             return self.run_builtin(b, &argv, &local_env, &cmd.redirects, &mut io);
         }
-        // External — spawn.
+        if let Some(registry) = self.owner_registry.clone() {
+            let redirects = self.resolve_owned_redirects(&cmd.redirects, io.stderr)?;
+            return self.run_owned_external(&registry, &argv, &local_env, &redirects, &mut io);
+        }
+        let mut rio = ResolvedIo::default();
+        for r in &cmd.redirects {
+            self.resolve_redirect(r, &mut rio, io.stderr)?;
+        }
+        // External — legacy route for callers that did not select strict ownership.
         let mut child_cmd = Command::new(&name);
         child_cmd.args(&argv[1..]);
         child_cmd.current_dir(&self.cwd);
@@ -364,6 +376,244 @@ impl VShell {
         }
     }
 
+    fn redirect_deadline(&self) -> Instant {
+        Instant::now().checked_add(self.timeout).unwrap_or_else(Instant::now)
+    }
+    fn poll_redirect(&self, deadline: Instant) -> std::io::Result<()> {
+        if self.cancel.as_ref().is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+            return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "redirect cancelled"));
+        }
+        if let Some(registry) = &self.owner_registry {
+            registry.poll();
+            if registry.admission_closed() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "owner admission closed during redirect",
+                ));
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "redirect deadline expired",
+            ));
+        }
+        Ok(())
+    }
+    fn open_redirect(
+        &self,
+        path: &Path,
+        read: bool,
+        append: bool,
+        deadline: Instant,
+    ) -> std::io::Result<File> {
+        loop {
+            if self.owner_registry.is_some() {
+                self.poll_redirect(deadline)?;
+            }
+            let mut options = OpenOptions::new();
+            options.read(read).write(!read).create(!read).append(append).truncate(!read && !append);
+            if self.owner_registry.is_some() {
+                #[cfg(target_os = "freebsd")]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
+                }
+                #[cfg(not(target_os = "freebsd"))]
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        "owned redirects require FreeBSD",
+                    ));
+                }
+            }
+            match options.open(path) {
+                Ok(file) => return Ok(file),
+                Err(error)
+                    if self.owner_registry.is_some()
+                        && !read
+                        && error.raw_os_error() == Some(libc::ENXIO) =>
+                {
+                    // Nonblocking FIFO writer open waits for an actual reader;
+                    // no blocking open can strand the actor before cancellation.
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    fn write_redirect(
+        &self,
+        file: &mut File,
+        bytes: &[u8],
+        deadline: Instant,
+    ) -> std::io::Result<()> {
+        if self.owner_registry.is_none() {
+            return file.write_all(bytes);
+        }
+        let mut offset = 0;
+        while offset < bytes.len() {
+            self.poll_redirect(deadline)?;
+            match file.write(&bytes[offset..]) {
+                Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+                Ok(n) => offset += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    fn resolve_owned_redirects(
+        &mut self,
+        redirects: &[Redirect],
+        stderr: &mut Vec<u8>,
+    ) -> Result<Vec<crate::ownership::OwnedRedirect>, ShellError> {
+        use crate::ownership::OwnedRedirect as R;
+        let mut result = Vec::new();
+        for redirect in redirects {
+            if matches!(redirect, Redirect::Err2Out) {
+                result.push(R::ErrorToOutput);
+                continue;
+            }
+            let word = match redirect {
+                Redirect::Stdin(word)
+                | Redirect::StdoutTrunc(word)
+                | Redirect::StdoutAppend(word)
+                | Redirect::StderrTrunc(word)
+                | Redirect::StderrAppend(word) => word,
+                Redirect::Err2Out => unreachable!(),
+            };
+            let expanded = self.expand_word(word, stderr)?;
+            let path = self.path_for(&expanded);
+            result.push(match redirect {
+                Redirect::Stdin(_) => R::Input(path),
+                Redirect::StdoutTrunc(_) => R::Output { path, append: false },
+                Redirect::StdoutAppend(_) => R::Output { path, append: true },
+                Redirect::StderrTrunc(_) => R::Error { path, append: false },
+                Redirect::StderrAppend(_) => R::Error { path, append: true },
+                Redirect::Err2Out => unreachable!(),
+            });
+        }
+        Ok(result)
+    }
+    fn run_owned_external(
+        &self,
+        registry: &Arc<crate::ownership::OwnerRegistry>,
+        argv: &[String],
+        local_env: &[(String, String)],
+        redirects: &[crate::ownership::OwnedRedirect],
+        io: &mut Io<'_>,
+    ) -> Result<Flow, ShellError> {
+        use crate::ownership::{CommandSpec, Limits, OwnedRedirect, RunState};
+        use std::ffi::OsString;
+        // File/FIFO redirect setup belongs to a fresh payload-launch child
+        // beneath the acquired owner. The shared actor never opens, waits on,
+        // or relays these endpoints. A stdin redirect overrides pipeline data.
+        let input = if redirects.iter().any(|r| matches!(r, OwnedRedirect::Input(_))) {
+            io.stdin.take();
+            Vec::new()
+        } else {
+            io.stdin.take().unwrap_or_default()
+        };
+        let mut env = Vec::new();
+        for key in &self.exported {
+            if let Some(value) = self.env.get(key) {
+                env.push((OsString::from(key), OsString::from(value)));
+            }
+        }
+        env.extend(
+            local_env.iter().map(|(key, value)| (OsString::from(key), OsString::from(value))),
+        );
+        let mut run = registry
+            .spawn_redirected(
+                CommandSpec {
+                    program: OsString::from(&argv[0]),
+                    args: argv[1..].iter().map(OsString::from).collect(),
+                    cwd: Some(self.cwd.clone()),
+                    env,
+                    limits: Limits {
+                        deadline: self.timeout,
+                        capture_bytes: OUTPUT_CAP_BYTES as u64,
+                        input_bytes: input.len() as u64,
+                    },
+                },
+                redirects,
+            )
+            .map_err(ShellError::Io)?;
+        let stop_waiting =
+            Instant::now().checked_add(self.timeout.saturating_add(Duration::from_secs(10)));
+        let mut sent = 0;
+        let mut input_stopped = false;
+        let mut out_eof = false;
+        let mut err_eof = false;
+        let mut output = [0u8; 16_384];
+        loop {
+            if self.cancel.as_ref().is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+                run.cancel();
+            }
+            if matches!(run.poll(), RunState::Running) && !input_stopped && sent < input.len() {
+                match run.write(&input[sent..]) {
+                    Ok(n) => sent += n,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {
+                        // A terminal event can arrive inside write polling.
+                        // Stop supplying shell input, then require the actual
+                        // retirement receipt and preserve the payload status.
+                        input_stopped = true;
+                    }
+                    Err(error) => return Err(ShellError::Io(error)),
+                }
+            }
+            for error_stream in [false, true] {
+                let eof = if error_stream { &mut err_eof } else { &mut out_eof };
+                if !*eof {
+                    match if error_stream {
+                        run.read_stderr(&mut output)
+                    } else {
+                        run.read(&mut output)
+                    } {
+                        Ok(0) => *eof = true,
+                        Ok(n) => {
+                            if error_stream {
+                                io.stderr.extend_from_slice(&output[..n]);
+                            } else {
+                                io.stdout.extend_from_slice(&output[..n]);
+                            }
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(error) => return Err(ShellError::Io(error)),
+                    }
+                }
+            }
+            if let RunState::Retired(result) = run.poll()
+                && out_eof
+                && err_eof
+            {
+                return Ok(Flow::Done(match result.reason {
+                    0 => result
+                        .payload_exit_code
+                        .unwrap_or_else(|| 128 + result.payload_signal.unwrap_or(0)),
+                    1 => 130,
+                    2 => 124,
+                    _ => 1,
+                }));
+            }
+            if stop_waiting.is_none_or(|deadline| Instant::now() >= deadline) {
+                run.cancel();
+                let _ = writeln!(
+                    io.stderr,
+                    "vshell: owned completion remains unconfirmed; registry retains owner"
+                );
+                return Ok(Flow::Done(125));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     fn run_builtin(
         &mut self,
         b: Builtin,
@@ -447,13 +697,15 @@ impl VShell {
             }
         };
 
+        let redirect_deadline = self.redirect_deadline();
         // Route outputs to file or to io.
         // stdout
         if let Some(mut f) = rio.stdout_file.take() {
-            let _ = f.write_all(&out_local);
+            self.write_redirect(&mut f, &out_local, redirect_deadline).map_err(ShellError::Io)?;
             // If merging and stdout went to file, route stderr to same file too.
             if want_stderr_to_stdout {
-                let _ = f.write_all(&err_local);
+                self.write_redirect(&mut f, &err_local, redirect_deadline)
+                    .map_err(ShellError::Io)?;
                 err_local.clear();
             }
         } else {
@@ -465,7 +717,7 @@ impl VShell {
         }
         // stderr (if not already routed)
         if let Some(mut f) = rio.stderr_file.take() {
-            let _ = f.write_all(&err_local);
+            self.write_redirect(&mut f, &err_local, redirect_deadline).map_err(ShellError::Io)?;
         } else if !err_local.is_empty() {
             io.stderr.extend_from_slice(&err_local);
         }
@@ -481,11 +733,13 @@ impl VShell {
         match r {
             Redirect::StdoutTrunc(w) | Redirect::StderrTrunc(w) => {
                 let p = self.expand_word_to_path(w)?;
-                File::create(&p).map_err(ShellError::Io)?;
+                self.open_redirect(&p, false, false, self.redirect_deadline())
+                    .map_err(ShellError::Io)?;
             }
             Redirect::StdoutAppend(w) | Redirect::StderrAppend(w) => {
                 let p = self.expand_word_to_path(w)?;
-                OpenOptions::new().create(true).append(true).open(&p).map_err(ShellError::Io)?;
+                self.open_redirect(&p, false, true, self.redirect_deadline())
+                    .map_err(ShellError::Io)?;
             }
             Redirect::Stdin(_) | Redirect::Err2Out => {}
         }
@@ -502,16 +756,16 @@ impl VShell {
             Redirect::StdoutTrunc(w) => {
                 let p = self.expand_word(w, stderr)?;
                 let p = self.path_for(&p);
-                rio.stdout_file = Some(File::create(&p).map_err(ShellError::Io)?);
+                rio.stdout_file = Some(
+                    self.open_redirect(&p, false, false, self.redirect_deadline())
+                        .map_err(ShellError::Io)?,
+                );
             }
             Redirect::StdoutAppend(w) => {
                 let p = self.expand_word(w, stderr)?;
                 let p = self.path_for(&p);
                 rio.stdout_file = Some(
-                    OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(&p)
+                    self.open_redirect(&p, false, true, self.redirect_deadline())
                         .map_err(ShellError::Io)?,
                 );
             }
@@ -523,16 +777,16 @@ impl VShell {
             Redirect::StderrTrunc(w) => {
                 let p = self.expand_word(w, stderr)?;
                 let p = self.path_for(&p);
-                rio.stderr_file = Some(File::create(&p).map_err(ShellError::Io)?);
+                rio.stderr_file = Some(
+                    self.open_redirect(&p, false, false, self.redirect_deadline())
+                        .map_err(ShellError::Io)?,
+                );
             }
             Redirect::StderrAppend(w) => {
                 let p = self.expand_word(w, stderr)?;
                 let p = self.path_for(&p);
                 rio.stderr_file = Some(
-                    OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(&p)
+                    self.open_redirect(&p, false, true, self.redirect_deadline())
                         .map_err(ShellError::Io)?,
                 );
             }
@@ -910,5 +1164,286 @@ fn send_signal(pid: libc::pid_t, sig: libc::c_int) {
     // exited and was reaped) are benign here.
     unsafe {
         libc::kill(pid, sig);
+    }
+}
+
+#[cfg(all(test, target_os = "freebsd"))]
+mod owned_redirect_tests {
+    use super::*;
+    use std::ffi::CString;
+    use std::os::unix::fs::OpenOptionsExt;
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    fn shell(timeout: Duration) -> VShell {
+        let agent = PathBuf::from(
+            std::env::var_os("MOTH_OWNER_TEST_AGENT").expect("explicit admitted agent required"),
+        );
+        VShell::new()
+            .with_timeout(timeout)
+            .with_owner_registry(crate::ownership::OwnerRegistry::new(agent).unwrap())
+    }
+    fn fifo() -> (PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "moth-owned-fifo-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("channel");
+        let name = CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        (root, path)
+    }
+    fn clean(root: PathBuf, path: PathBuf) {
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "admitted FreeBSD target and explicit outer owner required; unrun"]
+    fn fifo_writer_open_waits_for_reader_but_observes_cancel() {
+        let (root, path) = fifo();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let sh = shell(Duration::from_secs(2)).with_cancel(cancel.clone());
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(50));
+                cancel.store(true, Ordering::SeqCst);
+            });
+            let error = sh.open_redirect(&path, false, false, sh.redirect_deadline()).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+        });
+        assert!(
+            sh.owner_registry
+                .as_ref()
+                .unwrap()
+                .retire_until(Instant::now() + Duration::from_secs(1))
+        );
+        clean(root, path);
+    }
+
+    #[test]
+    #[ignore = "admitted FreeBSD target and explicit outer owner required; unrun"]
+    fn owned_fifo_open_precedes_real_payload_and_overrides_pipeline_input() {
+        let (root, path) = fifo();
+        let marker = root.join("payload-started");
+        let sh = shell(Duration::from_secs(5));
+        let registry = sh.owner_registry.as_ref().unwrap().clone();
+        std::thread::scope(|scope| {
+            let reader = scope.spawn(|| {
+                let program = std::env::current_exe().unwrap().to_str().unwrap().to_owned();
+                let argv = vec![
+                    program,
+                    "--ignored".into(),
+                    "--exact".into(),
+                    "native_owner_tests::owner_fixture_entry".into(),
+                    "--nocapture".into(),
+                    "--test-threads=1".into(),
+                ];
+                let mut out = Vec::new();
+                let mut err = Vec::new();
+                let mut io = Io {
+                    stdout: &mut out,
+                    stderr: &mut err,
+                    stdin: Some(b"IGNORED-PIPELINE".to_vec()),
+                };
+                let result = sh
+                    .run_owned_external(
+                        &registry,
+                        &argv,
+                        &[
+                            ("MOTH_OWNER_FIXTURE_MODE".into(), "announce-echo".into()),
+                            ("MOTH_OWNER_MARKER".into(), marker.to_str().unwrap().into()),
+                        ],
+                        &[crate::ownership::OwnedRedirect::Input(path.clone())],
+                        &mut io,
+                    )
+                    .unwrap();
+                assert!(matches!(result, Flow::Done(0)));
+                out
+            });
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(!reader.is_finished());
+            assert!(!marker.exists(), "payload started before FIFO writer connected");
+            let mut writer = sh.open_redirect(&path, false, false, sh.redirect_deadline()).unwrap();
+            // Keep the connected writer empty: payload startup must not wait
+            // for data or writer EOF to prove the ordinary open handshake.
+            let marker_deadline = Instant::now() + Duration::from_secs(2);
+            while !marker.exists() && Instant::now() < marker_deadline {
+                registry.poll();
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(marker.exists(), "empty connected writer did not release payload startup");
+            sh.write_redirect(&mut writer, b"complete-fifo-data", sh.redirect_deadline()).unwrap();
+            drop(writer);
+            let out = reader.join().unwrap();
+            assert!(out.windows(b"complete-fifo-data".len()).any(|w| w == b"complete-fifo-data"));
+            assert!(!out.windows(b"IGNORED-PIPELINE".len()).any(|w| w == b"IGNORED-PIPELINE"));
+        });
+        assert!(marker.exists());
+        std::fs::remove_file(marker).unwrap();
+        assert!(registry.retire_until(Instant::now() + Duration::from_secs(1)));
+        clean(root, path);
+    }
+
+    #[test]
+    #[ignore = "admitted FreeBSD target and explicit outer owner required; unrun"]
+    fn fifo_writer_retains_partial_data_while_reader_progresses() {
+        let (root, path) = fifo();
+        let sh = shell(Duration::from_secs(10));
+        let expected = vec![0x61u8; 2 * 1024 * 1024];
+        std::thread::scope(|scope| {
+            let reader = scope.spawn(|| {
+                let mut file = OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+                    .open(&path)
+                    .unwrap();
+                let deadline = sh.redirect_deadline();
+                let mut received = Vec::new();
+                let mut bytes = [0u8; 1024];
+                while received.len() < expected.len() {
+                    sh.poll_redirect(deadline).unwrap();
+                    match file.read(&mut bytes) {
+                        Ok(n) => received.extend_from_slice(&bytes[..n]),
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(e) => panic!("{e}"),
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                received
+            });
+            let mut writer = sh.open_redirect(&path, false, false, sh.redirect_deadline()).unwrap();
+            sh.write_redirect(&mut writer, &expected, sh.redirect_deadline()).unwrap();
+            drop(writer);
+            assert_eq!(reader.join().unwrap(), expected);
+        });
+        assert!(
+            sh.owner_registry
+                .as_ref()
+                .unwrap()
+                .retire_until(Instant::now() + Duration::from_secs(1))
+        );
+        clean(root, path);
+    }
+
+    #[test]
+    #[ignore = "admitted FreeBSD target and explicit outer owner required; unrun"]
+    fn fifo_full_output_pipe_observes_deadline_without_blocking_write_all() {
+        let (root, path) = fifo();
+        let sh = shell(Duration::from_millis(100));
+        let mut reader = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(&path)
+            .unwrap();
+        let mut writer = sh.open_redirect(&path, false, false, sh.redirect_deadline()).unwrap();
+        let error = sh
+            .write_redirect(&mut writer, &vec![0x62; 2 * 1024 * 1024], sh.redirect_deadline())
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        let mut prefix = [0u8; 32];
+        assert!(reader.read(&mut prefix).unwrap() > 0);
+        assert!(prefix.iter().all(|b| *b == 0x62));
+        drop(writer);
+        drop(reader);
+        assert!(
+            sh.owner_registry
+                .as_ref()
+                .unwrap()
+                .retire_until(Instant::now() + Duration::from_secs(1))
+        );
+        clean(root, path);
+    }
+    #[test]
+    #[ignore = "admitted FreeBSD target and explicit outer owner required; unrun"]
+    fn external_fifo_stdout_backpressure_does_not_starve_stderr_or_input() {
+        let (out_root, out_path) = fifo();
+        let (err_root, err_path) = fifo();
+        let sh = shell(Duration::from_secs(15));
+        let registry = sh.owner_registry.as_ref().unwrap().clone();
+        std::thread::scope(|scope| {
+            let consumer = scope.spawn(|| {
+                let mut out = OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+                    .open(&out_path)
+                    .unwrap();
+                let mut err = OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+                    .open(&err_path)
+                    .unwrap();
+                let deadline = Instant::now() + Duration::from_secs(20);
+                let mut errors = Vec::new();
+                let mut body_bytes = 0;
+                let mut ready = false;
+                let mut bytes = [0u8; 16_384];
+                loop {
+                    assert!(Instant::now() < deadline, "full duplex redirect stalled");
+                    match err.read(&mut bytes) {
+                        Ok(n) => errors.extend_from_slice(&bytes[..n]),
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(e) => panic!("{e}"),
+                    }
+                    ready |= errors
+                        .windows(b"DUPLEX-STDERR-READY".len())
+                        .any(|w| w == b"DUPLEX-STDERR-READY");
+                    // Deliberately withhold stdout reads until stderr proves
+                    // readiness. The payload also waits for complete stdin.
+                    if ready {
+                        match out.read(&mut bytes) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                body_bytes += bytes[..n].iter().filter(|b| **b == 0xff).count()
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                            Err(e) => panic!("{e}"),
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                assert!(ready);
+                assert_eq!(body_bytes, 2 * 1024 * 1024);
+            });
+            let program = std::env::current_exe().unwrap().to_str().unwrap().to_owned();
+            let argv = vec![
+                program,
+                "--ignored".into(),
+                "--exact".into(),
+                "native_owner_tests::owner_fixture_entry".into(),
+                "--nocapture".into(),
+                "--test-threads=1".into(),
+            ];
+            let mut captured_out = Vec::new();
+            let mut captured_err = Vec::new();
+            let mut io = Io {
+                stdout: &mut captured_out,
+                stderr: &mut captured_err,
+                stdin: Some(b"duplex-input".to_vec()),
+            };
+            let result = sh
+                .run_owned_external(
+                    &registry,
+                    &argv,
+                    &[("MOTH_OWNER_FIXTURE_MODE".into(), "duplex".into())],
+                    &[
+                        crate::ownership::OwnedRedirect::Output {
+                            path: out_path.clone(),
+                            append: false,
+                        },
+                        crate::ownership::OwnedRedirect::Error {
+                            path: err_path.clone(),
+                            append: false,
+                        },
+                    ],
+                    &mut io,
+                )
+                .unwrap();
+            assert!(matches!(result, Flow::Done(0)));
+            consumer.join().unwrap();
+        });
+        assert!(registry.retire_until(Instant::now() + Duration::from_secs(2)));
+        clean(out_root, out_path);
+        clean(err_root, err_path);
     }
 }
