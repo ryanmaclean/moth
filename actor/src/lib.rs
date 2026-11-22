@@ -397,7 +397,7 @@ mod tests {
     fn spawn_bounded_applies_backpressure() {
         use std::sync::mpsc::TrySendError;
 
-        // Capacity 2: third try_send returns Full while the actor is busy.
+        // Capacity 2: the mailbox fills while the actor is busy.
         struct Slow;
         impl Actor for Slow {
             type Msg = ();
@@ -409,9 +409,12 @@ mod tests {
         // First two queue immediately.
         s.addr.try_send(()).unwrap();
         s.addr.try_send(()).unwrap();
-        // Third hits the capacity wall right away (worker is sleeping on #1).
-        let third = s.addr.try_send(());
-        assert!(matches!(third, Err(TrySendError::Full(_))));
+        // At most one message is in the handler plus two queued, so by the
+        // fourth send the mailbox is full whether or not the worker has
+        // dequeued the first message yet.
+        let _ = s.addr.try_send(());
+        let fourth = s.addr.try_send(());
+        assert!(matches!(fourth, Err(TrySendError::Full(_))));
         s.join().unwrap();
     }
 
