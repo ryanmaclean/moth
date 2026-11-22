@@ -51,6 +51,21 @@ FROM builder AS build
 
 COPY . .
 
+RUN set -eu; \
+    test "$(wc -l < packaging/native-notice-files.txt)" -eq 14; \
+    test "$(sort -u packaging/native-notice-files.txt | wc -l)" -eq 14; \
+    mkdir -p /src/native-notices; \
+    while IFS= read -r source; do \
+      case "$source" in vendor/*) ;; *) exit 1 ;; esac; \
+      case "$source" in *..*|*//*) exit 1 ;; esac; \
+      test -f "$source" && test ! -L "$source"; \
+      target="/src/native-notices/$source"; \
+      mkdir -p "$(dirname "$target")"; \
+      cp "$source" "$target"; \
+      cmp -s "$source" "$target"; \
+    done < packaging/native-notice-files.txt; \
+    cp packaging/native-notice-files.txt /src/native-notices/FILES.txt
+
 RUN cargo build --release --locked --offline --frozen -p cli \
     && strip target/release/agent
 
@@ -61,9 +76,10 @@ FROM gcr.io/distroless/cc-debian12 AS runtime
 ARG REPO_SOURCE="https://github.com/ryanmaclean/moth"
 LABEL org.opencontainers.image.source="${REPO_SOURCE}"
 LABEL org.opencontainers.image.description="Minimal Rust agent harness; vendored deps, libcurl + OpenSSL via curl-sys."
-LABEL org.opencontainers.image.licenses="MIT"
 
 COPY --from=build /src/target/release/agent /usr/local/bin/agent
+COPY --from=build /src/LICENSE /usr/share/licenses/moth/LICENSE
+COPY --from=build /src/native-notices/ /usr/share/doc/moth/THIRD_PARTY_NOTICES/native/
 
 ENTRYPOINT ["/usr/local/bin/agent"]
 CMD ["--help"]
